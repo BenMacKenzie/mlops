@@ -250,10 +250,7 @@ class MLflowWorkspaceService:
                 experiment_ids=[experiment_id],
                 max_results=10 #don't chane this to 1000...it creates an error
             )
-            
-            # Debug: Print response structure
-            print(f"DEBUG: Response type: {type(logged_models_response)}")
-            print(f"DEBUG: Response attributes: {dir(logged_models_response)}")
+   
             
             models_data = []
             all_metric_names = set()
@@ -268,9 +265,7 @@ class MLflowWorkspaceService:
                 model_info = model.info
                 
                 # Debug: Print model structure
-                print(f"DEBUG: Model type: {type(model)}")
-                print(f"DEBUG: Model info type: {type(model_info)}")
-                print(f"DEBUG: Model info attributes: {dir(model_info)}")
+                
                 
                 # Collect metric names and dataset names
                 if hasattr(model_info, 'metrics') and model_info.metrics:
@@ -285,8 +280,8 @@ class MLflowWorkspaceService:
                                 dataset_metric_combinations.add((dataset_name, metric_key))
                             else:
                                 dataset_metric_combinations.add((None, metric_key))
-                else:
-                    print(f"DEBUG: No metrics found for model")
+                
+                    
                 
                 # Collect parameter names
                 if hasattr(model_info, 'parameters') and model_info.parameters:
@@ -294,12 +289,9 @@ class MLflowWorkspaceService:
                     for param in model_info.parameters:
                         if hasattr(param, 'key'):
                             all_param_names.add(str(param.key))
-                else:
-                    print(f"DEBUG: No parameters found for model")
+                
             
-            print(f"DEBUG: All metric names: {all_metric_names}")
-            print(f"DEBUG: All param names: {all_param_names}")
-            print(f"DEBUG: Dataset combinations: {dataset_metric_combinations}")
+            
             
             # Second pass: create data with only existing metric-dataset combinations as columns
             for model in logged_models_response.models:  #don't change this to logged_models...it creates an error
@@ -318,8 +310,7 @@ class MLflowWorkspaceService:
                     'description': getattr(model_info_obj, 'description', '') or ''
                 }
                 
-                # Debug: Print what we're extracting
-                print(f"DEBUG: Extracted model_info: {model_info}")
+            
                 
                 # Add metric columns organized by dataset
                 metrics_by_dataset = {}
@@ -358,8 +349,7 @@ class MLflowWorkspaceService:
                 models_data.append(model_info)
             
             result_df = pd.DataFrame(models_data)
-            print(f"DEBUG: Final DataFrame columns: {list(result_df.columns)}")
-            print(f"DEBUG: Final DataFrame shape: {result_df.shape}")
+           
             
             return result_df
                 
