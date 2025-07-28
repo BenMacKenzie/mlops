@@ -9,19 +9,8 @@ import dash_ag_grid as dag
 from databricks.sdk.core import Config
 from databricks.sdk import WorkspaceClient
 from mlflow_service import mlflow_workspace_service as mlflow_service
-from dataclasses import dataclass
-from typing import List
+from feature_lookup import FeatureLookup, feature_lookups
 
-
-# FeatureLookup class for storing feature lookup configurations
-@dataclass
-class FeatureLookup:
-    table_name: str
-    feature_names: List[str]
-    lookup_key: str
-    
-    def __repr__(self):
-        return f"FeatureLookup(\n  table_name='{self.table_name}',\n  feature_names={self.feature_names},\n  lookup_key='{self.lookup_key}'\n)"
 
 # Check environment variable but don't fail if not set
 warehouse_id = os.getenv('DATABRICKS_WAREHOUSE_ID')
@@ -206,9 +195,6 @@ def get_table_columns(table_name):
 
 # Fetch jobs data
 jobs_data = get_jobs_data()
-
-# Global variable to store feature lookups
-feature_lookups = []
 
 # Initialize the Dash app with Bootstrap styling
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
@@ -450,13 +436,23 @@ def load_feature_form(n_clicks, table_name):
             ], className='mt-3'),
             dbc.Row([
                 dbc.Col([
-                    dbc.Label("Lookup Keys (Multi-select)"),
-                    dcc.Dropdown(
-                        id='lookup-keys-dropdown',
-                        options=column_options,
-                        placeholder="Choose lookup key columns...",
-                        multi=True,
-                        value=[]
+                    dbc.Label("Lookup Key (Single column name)"),
+                    dbc.Input(
+                        id='lookup-key-input',
+                        type='text',
+                        placeholder="Enter lookup key column...",
+                        value=""
+                    )
+                ], width=12)
+            ], className='mt-3'),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Timestamp Key (Optional)"),
+                    dbc.Input(
+                        id='timestamp-key-input',
+                        type='text',
+                        placeholder="Enter timestamp key column (optional)...",
+                        value=""
                     )
                 ], width=12)
             ], className='mt-3'),
@@ -480,23 +476,23 @@ def load_feature_form(n_clicks, table_name):
      Output('python-code-output', 'children')],
     Input('add-feature-lookup-button', 'n_clicks'),
     [State('feature-table-name-input', 'value'),
-     State('lookup-keys-dropdown', 'value'),
+     State('lookup-key-input', 'value'),
+     State('timestamp-key-input', 'value'),
      State('feature-columns-dropdown', 'value')]
 )
-def add_feature_lookup(n_clicks, table_name, lookup_keys, feature_columns):
+def add_feature_lookup(n_clicks, table_name, lookup_key, timestamp_key, feature_columns):
     """Add a feature lookup to the global list and update displays."""
-    global feature_lookups
     
-    if not n_clicks or not table_name or not lookup_keys or not feature_columns:
+    if not n_clicks or not table_name or not lookup_key or not feature_columns:
         return html.Div("Fill out the form and click 'Add Feature Lookup' to add configurations."), ""
     
     try:
-        # Create new feature lookup - use first lookup key for now
-        # In the future, we could modify FeatureLookup to support multiple lookup keys
+        # Create new feature lookup - support optional timestamp_key
         new_lookup = FeatureLookup(
             table_name=table_name,
             feature_names=feature_columns,
-            lookup_key=lookup_keys[0] if lookup_keys else ""
+            lookup_key=lookup_key,
+            timestamp_key=timestamp_key if timestamp_key else None
         )
         
         # Add to global list
@@ -509,7 +505,8 @@ def add_feature_lookup(n_clicks, table_name, lookup_keys, feature_columns):
                 html.Div([
                     html.H6(f"Feature Lookup {i+1}:"),
                     html.P(f"Table: {lookup.table_name}"),
-                    html.P(f"Lookup Keys: {lookup.lookup_key}"),
+                    html.P(f"Lookup Key: {lookup.lookup_key}"),
+                    html.P(f"Timestamp Key: {getattr(lookup, 'timestamp_key', '')}" if getattr(lookup, 'timestamp_key', None) else None),
                     html.P(f"Features: {', '.join(lookup.feature_names)}"),
                     dbc.Button("Remove", id=f'remove-lookup-{i}', color='danger', size='sm', className='mt-2'),
                     html.Hr()
@@ -523,7 +520,9 @@ def add_feature_lookup(n_clicks, table_name, lookup_keys, feature_columns):
             python_code += f"      table_name='{lookup.table_name}',\n"
             python_code += f"      feature_names={lookup.feature_names},\n"
             python_code += f"      lookup_key='{lookup.lookup_key}'\n"
-            python_code += f"    ),\n"
+            if getattr(lookup, 'timestamp_key', None):
+                python_code += f",\n      timestamp_key='{lookup.timestamp_key}'"
+            python_code += f"\n    ),\n"
         python_code += "]"
         
         return html.Div(lookup_items), html.Div([
