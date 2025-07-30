@@ -7,3 +7,4 @@ databricks-sdk==0.57.0
 python-dotenv
 dash-ag-grid
 mlflow
+PyYAML

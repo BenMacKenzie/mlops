@@ -1,0 +1,3 @@
+database:
+  catalog: mlops_demo
+  schema: app 
