@@ -3,6 +3,8 @@ from dash import html, dcc, Input, Output, State, no_update, ALL, callback_conte
 import dash_bootstrap_components as dbc
 from feature_lookup import FeatureLookup
 from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
+import yaml, json
+import yaml
 import dash
 
 # Global variables to store current selections and features
@@ -61,6 +63,18 @@ def create_feature_lookup_builder_layout():
             
             # Features Section
             html.H5("Feature Tables", className='mt-4'),
+            # Select EOL Definition for feature lookups
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("EOL Definition"),
+                    dcc.Dropdown(
+                        id='eol-definition-dropdown',
+                        options=[],
+                        placeholder="Select EOL definition...",
+                        value=None
+                    )
+                ], width=12)
+            ], className='mt-2'),
             # Select feature table by catalog, schema, table
             dbc.Row([
                 dbc.Col([
@@ -93,17 +107,8 @@ def create_feature_lookup_builder_layout():
                     )
                 ], width=4)
             ], className='mt-3'),
-            # Existing EOL Definition & Feature Columns
+            # Select feature columns from chosen table
             dbc.Row([
-                dbc.Col([
-                    dbc.Label("EOL Definition"),
-                    dcc.Dropdown(
-                        id='eol-definition-dropdown',
-                        options=[],
-                        placeholder="Select EOL definition...",
-                        value=None
-                    )
-                ], width=6),
                 dbc.Col([
                     dbc.Label("Feature Columns"),
                     dcc.Dropdown(
@@ -113,9 +118,7 @@ def create_feature_lookup_builder_layout():
                         value=[],
                         multi=True
                     )
-                ], width=6)
-            ], className='mt-3'),
-            dbc.Row([
+                ], width=6),
                 dbc.Col([
                     dbc.Label("Lookup Key"),
                     dcc.Dropdown(
@@ -124,7 +127,7 @@ def create_feature_lookup_builder_layout():
                         placeholder="Select lookup key...",
                         value=None
                     )
-                ], width=6),
+                ], width=3),
                 dbc.Col([
                     dbc.Label("Timestamp Key (Optional)"),
                     dcc.Dropdown(
@@ -133,22 +136,31 @@ def create_feature_lookup_builder_layout():
                         placeholder="Select timestamp key...",
                         value=None
                     )
-                ], width=6)
+                ], width=3)
             ], className='mt-3'),
             dbc.Row([
                 dbc.Col([
                     dbc.Button("Add to Features", id='add-features-button', color='primary', className='mt-3', disabled=True)
                 ], width=12)
             ]),
+            # List of selected features
             dbc.Row([
                 dbc.Col([
                     html.H5("Selected Features"),
                     html.Div(id='selected-features-list', className='mt-2')
                 ], width=12)
             ]),
+            # Save all features to DB
             dbc.Row([
                 dbc.Col([
-                    dbc.Button("Generate Python Code", id='generate-code-button', color='success', className='mt-3')
+                    dbc.Button("Save Features", id='save-features-button', color='success', className='mt-3')
+                ], width=12)
+            ]),
+            html.Div(id='features-save-alert', className='mt-2'),
+            # Generate Python code representation
+            dbc.Row([
+                dbc.Col([
+                    dbc.Button("Generate Python Code", id='generate-code-button', color='secondary', className='mt-3')
                 ], width=12)
             ]),
             html.Div(id='python-code-output', className='mt-3')
@@ -354,33 +366,44 @@ def register_feature_lookup_callbacks(app, sqlQuery):
         State('list-store', 'data')
     )
     def update_lookup_keys_dropdown(eol_name, store_data):
-        """Update lookup key and timestamp key dropdowns based on selected EOL definition."""
+        """Populate lookup key and timestamp key dropdowns from the selected EOL view."""
         if not eol_name:
             return [], None, True, [], None, True
-        
-        # Get current project ID from store
+        # Determine project ID
         if isinstance(store_data, dict):
-            current_project_id = store_data.get('active_project_id')
+            project_id = store_data.get('active_project_id')
         else:
-            current_project_id = store_data[0]['id'] if store_data else None
-        
-        if not current_project_id:
+            project_id = store_data[0]['id'] if store_data else None
+        if not project_id:
             return [], None, True, [], None, True
-        
-        eol_def = get_eol_definition_by_name(eol_name, current_project_id)
-        # If no definition found, disable lookup fields
-        if eol_def is None:
+        # Fetch project to locate the view
+        proj = get_project_by_id(project_id)
+        if proj is None:
             return [], None, True, [], None, True
-        
-        # Common lookup keys
-        lookup_keys = ['id', 'user_id', 'customer_id', 'order_id', 'transaction_id']
-        lookup_options = [{'label': key, 'value': key} for key in lookup_keys]
-        
-        # Timestamp keys
-        timestamp_keys = ['created_at', 'updated_at', 'timestamp', 'date', 'datetime']
-        timestamp_options = [{'label': key, 'value': key} for key in timestamp_keys]
-        
-        return lookup_options, None, False, timestamp_options, None, False
+        catalog = proj.get('catalog')
+        schema = proj.get('schema')
+        view = eol_name
+        full_view = f"{catalog}.{schema}.{view}"
+        try:
+            # Describe the view to get column info
+            desc = sqlQuery(f"DESCRIBE {full_view}")
+            name_col = desc.columns[0]
+            type_col = desc.columns[1] if len(desc.columns) > 1 else None
+            cols = desc[name_col].tolist()
+            # All columns for lookup key
+            lookup_opts = [{'label': c, 'value': c} for c in cols]
+            # Filter date/time columns for timestamp key
+            ts_opts = []
+            if type_col:
+                for _, row in desc.iterrows():
+                    col = row[name_col]
+                    t = str(row[type_col]).lower()
+                    if 'date' in t or 'time' in t:
+                        ts_opts.append({'label': col, 'value': col})
+            return lookup_opts, None, False, ts_opts, None, False
+        except Exception as e:
+            print(f"Error describing EOL view {full_view}: {e}")
+            return [], None, True, [], None, True
 
     @app.callback(
         Output('add-features-button', 'disabled'),
@@ -411,22 +434,25 @@ def register_feature_lookup_callbacks(app, sqlQuery):
     @app.callback(
         Output('selected-features-list', 'children'),
         Input('add-features-button', 'n_clicks'),
+        State('feature-catalog-dropdown', 'value'),
+        State('feature-schema-dropdown', 'value'),
+        State('feature-table-dropdown', 'value'),
         State('feature-columns-dropdown', 'value'),
         State('lookup-key-dropdown', 'value'),
         State('timestamp-key-dropdown', 'value'),
         State('eol-definition-dropdown', 'value'),
         State('list-store', 'data')
     )
-    def add_features_to_list(n_clicks, columns_value, lookup_key, timestamp_key, eol_name, store_data):
+    def add_features_to_list(n_clicks, catalog, schema, table, columns_value, lookup_key, timestamp_key, eol_name, store_data):
         """Add selected features to the features list."""
         global selected_features
-        
-        if not n_clicks or not columns_value or not eol_name:
+        # If no click or missing required selection, just display existing list
+        if not n_clicks or not columns_value or not catalog or not schema or not table or not eol_name:
             # Return existing features if no new ones to add
             if selected_features:
                 # Create table header
                 table_header = html.Thead(html.Tr([
-                    html.Th("EOL Definition"),
+                    html.Th("Feature Table"),
                     html.Th("Features"),
                     html.Th("Lookup Key"),
                     html.Th("Timestamp Key"),
@@ -438,12 +464,11 @@ def register_feature_lookup_callbacks(app, sqlQuery):
                 for i, feature in enumerate(selected_features):
                     table_rows.append(
                         html.Tr([
-                            html.Td(feature['eol_name']),
-                            html.Td(', '.join(feature['features'])),
+                            html.Td(feature['table_name']),
+                            html.Td(', '.join(feature['feature_names'])),
                             html.Td(feature['lookup_key']),
                             html.Td(feature.get('timestamp_key', '')),
-                            html.Td(dbc.Button("Remove", id={'type': 'remove-feature', 'index': i}, 
-                                             color='danger', size='sm'))
+                            html.Td(dbc.Button("Remove", id={'type': 'remove-feature', 'index': i}, color='danger', size='sm'))
                         ])
                     )
                 
@@ -463,23 +488,23 @@ def register_feature_lookup_callbacks(app, sqlQuery):
         if not current_project_id:
             return [html.P("No project selected.")]
         
-        # Add new features if button was clicked
-        if n_clicks and columns_value and eol_name:
-            eol_def = get_eol_definition_by_name(eol_name, current_project_id)
-            if eol_def:
-                new_feature = {
-                    'eol_name': eol_name,
-                    'features': columns_value,
-                    'lookup_key': lookup_key or '',
-                    'timestamp_key': timestamp_key or None
-                }
-                selected_features.append(new_feature)
+        # Add new features for selected table
+        if n_clicks and columns_value and catalog and schema and table and eol_name:
+            # Build FeatureLookup entry
+            full_table = f"{catalog}.{schema}.{table}"
+            new_feature = {
+                'table_name': full_table,
+                'feature_names': columns_value,
+                'lookup_key': lookup_key or '',
+                'timestamp_key': timestamp_key or None
+            }
+            selected_features.append(new_feature)
         
         # Update display
         if selected_features:
             # Create table header
             table_header = html.Thead(html.Tr([
-                html.Th("EOL Definition"),
+                html.Th("Feature Table"),
                 html.Th("Features"),
                 html.Th("Lookup Key"),
                 html.Th("Timestamp Key"),
@@ -491,8 +516,8 @@ def register_feature_lookup_callbacks(app, sqlQuery):
             for i, feature in enumerate(selected_features):
                 table_rows.append(
                     html.Tr([
-                        html.Td(feature['eol_name']),
-                        html.Td(', '.join(feature['features'])),
+                        html.Td(feature['table_name']),
+                        html.Td(', '.join(feature['feature_names'])),
                         html.Td(feature['lookup_key']),
                         html.Td(feature.get('timestamp_key', '')),
                         html.Td(dbc.Button("Remove", id={'type': 'remove-feature', 'index': i}, 
@@ -586,6 +611,66 @@ def register_feature_lookup_callbacks(app, sqlQuery):
         except Exception as e:
             print(f"Error loading tables in {catalog}.{schema}: {e}")
             return [], True
+    
+    # Save selected features to the feature_lookups table
+    @app.callback(
+        Output('features-save-alert', 'children'),
+        Input('save-features-button', 'n_clicks'),
+        [State('list-store', 'data'),
+         State('eol-definition-dropdown', 'value')],
+        prevent_initial_call=True
+    )
+    def save_features(n_clicks, store_data, eol_name):
+        """Persist the selected features list to the feature_lookups table defined in db_config.yaml."""
+        global selected_features
+        if not n_clicks or not selected_features:
+            return ""
+        # Determine project ID
+        if isinstance(store_data, dict):
+            project_id = store_data.get('active_project_id')
+        else:
+            project_id = store_data[0]['id'] if store_data else None
+        if not project_id or not eol_name:
+            return html.Div("No project or EOL definition selected.", className='text-danger')
+        # Get EOL definition ID
+        eol_def = get_eol_definition_by_name(eol_name, project_id)
+        if eol_def is None:
+            return html.Div(f"EOL definition '{eol_name}' not found.", className='text-danger')
+        eol_id = int(eol_def['id'])
+        # Read DB config for feature_lookups table location
+        try:
+            with open('db_config.yaml', 'r') as f:
+                db_cfg = yaml.safe_load(f)
+            catalog = db_cfg['database']['catalog']
+            schema = db_cfg['database']['schema']
+        except Exception as e:
+            print(f"Error reading DB config: {e}")
+            return html.Div("Error reading DB config.", className='text-danger')
+        # Serialize selected features into JSON strings
+        try:
+            json_list = []
+            for feature in selected_features:
+                obj = {
+                    'table_name': feature['table_name'],
+                    'feature_names': feature['feature_names'],
+                    'lookup_key': feature['lookup_key'],
+                    'timestamp_key': feature.get('timestamp_key')
+                }
+                json_list.append(json.dumps(obj))
+            # Build array literal of JSON strings
+            arr_items = ",".join([f"'{item}'" for item in json_list])
+            arr_literal = f"array({arr_items})"
+            # Insert single row
+            sqlQuery(
+                f"INSERT INTO {catalog}.{schema}.feature_lookups "
+                f"(project_id, eol_id, features) VALUES ({project_id}, {eol_id}, {arr_literal})"
+            )
+            # Clear in-memory list
+            clear_selected_features()
+            return html.Div("✅ Features saved successfully.", className='text-success')
+        except Exception as e:
+            print(f"Error saving features: {e}")
+            return html.Div(f"Error saving features: {e}", className='text-danger')
 
 def get_selected_features():
     """Get the currently selected features."""

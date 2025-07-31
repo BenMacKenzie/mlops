@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.project (
     training_notebook string not null
 );
 
-drop table if exists {catalog}.{schema}.eol_definition;
+-- drop table if exists {catalog}.{schema}.eol_definition;
 
 create table if not exists {catalog}.{schema}.eol_definition (
     id BIGINT GENERATED ALWAYS AS IDENTITY,
@@ -30,6 +30,12 @@ create table if not exists {catalog}.{schema}.eol_definition (
     sql_definition STRING NOT NULL
 );
 
+create table if not exists {catalog}.{schema}.feature_lookups (
+    id BIGINT GENERATED ALWAYS AS IDENTITY,
+    project_id BIGINT NOT NULL,
+    eol_id BIGINT NOT NULL,
+    features array<string> NOT NULL
+);
 -- CREATE TABLE IF NOT EXISTS datasets (
 --     id BIGINT GENERATED ALWAYS AS IDENTITY,
 --     project_id BIGINT NOT NULL,
