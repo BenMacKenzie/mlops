@@ -2,7 +2,7 @@ import pandas as pd
 from dash import html, dcc, Input, Output, State, no_update, ALL, callback_context
 import dash_bootstrap_components as dbc
 from feature_lookup import FeatureLookup
-from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition
+from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
 import dash
 
 # Global variables to store current selections and features
@@ -61,6 +61,39 @@ def create_feature_lookup_builder_layout():
             
             # Features Section
             html.H5("Feature Tables", className='mt-4'),
+            # Select feature table by catalog, schema, table
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Catalog"),
+                    dcc.Dropdown(
+                        id='feature-catalog-dropdown',
+                        options=[],
+                        placeholder="Select catalog...",
+                        value=None
+                    )
+                ], width=4),
+                dbc.Col([
+                    dbc.Label("Schema"),
+                    dcc.Dropdown(
+                        id='feature-schema-dropdown',
+                        options=[],
+                        placeholder="Select schema...",
+                        value=None,
+                        disabled=True
+                    )
+                ], width=4),
+                dbc.Col([
+                    dbc.Label("Table"),
+                    dcc.Dropdown(
+                        id='feature-table-dropdown',
+                        options=[],
+                        placeholder="Select table...",
+                        value=None,
+                        disabled=True
+                    )
+                ], width=4)
+            ], className='mt-3'),
+            # Existing EOL Definition & Feature Columns
             dbc.Row([
                 dbc.Col([
                     dbc.Label("EOL Definition"),
@@ -159,18 +192,28 @@ def register_feature_lookup_callbacks(app, sqlQuery):
             # Save: create new or update existing
             if trigger_id == 'save-eol-button' and name and sql_def:
                 old_name = new_form_store.get('old_name')
+                # Persist to DB
                 if old_name:
-                    # Update existing definition
                     update_eol_definition(old_name, name, sql_def, current_project_id)
                 else:
-                    # Create new definition
                     create_eol_definition(name, sql_def, current_project_id)
+                # Also create or replace the view in the project schema
+                try:
+                    proj = get_project_by_id(current_project_id)
+                    if proj is not None:
+                        catalog = proj.get('catalog')
+                        schema = proj.get('schema')
+                        view_name = name
+                        # Build and execute DDL for view
+                        ddl = f"CREATE OR REPLACE VIEW {catalog}.{schema}.{view_name} AS {sql_def}"
+                        sqlQuery(ddl)
+                except Exception as e:
+                    print(f"Error creating view for EOL '{name}': {e}")
                 # Reset form store after save
                 new_form_store = {'old_name': None}
             # Delete
             elif trigger_id == 'delete-eol-button' and name:
                 delete_eol_definition(name, current_project_id)
-                # Reset form store after delete
                 new_form_store = {'old_name': None}
         # Fetch updated EOL definitions
         print(f"DEBUG: Fetching EOL definitions for project_id = {current_project_id}")
@@ -280,37 +323,25 @@ def register_feature_lookup_callbacks(app, sqlQuery):
         [Output('feature-columns-dropdown', 'options'),
          Output('feature-columns-dropdown', 'value'),
          Output('feature-columns-dropdown', 'disabled')],
-        Input('eol-definition-dropdown', 'value'),
-        State('list-store', 'data')
+        [Input('feature-catalog-dropdown', 'value'),
+         Input('feature-schema-dropdown', 'value'),
+         Input('feature-table-dropdown', 'value')]
     )
-    def update_feature_columns_dropdown(eol_name, store_data):
-        """Update feature columns dropdown based on selected EOL definition."""
-        if not eol_name:
+    def update_feature_columns_dropdown(catalog, schema, table):
+        """Update feature columns dropdown based on selected feature table."""
+        if not catalog or not schema or not table:
             return [], [], True
-        
-        # Get current project ID from store
-        if isinstance(store_data, dict):
-            current_project_id = store_data.get('active_project_id')
-        else:
-            current_project_id = store_data[0]['id'] if store_data else None
-        
-        if not current_project_id:
+        try:
+            # Describe table to fetch column names
+            df = sqlQuery(f"DESCRIBE {catalog}.{schema}.{table}")
+            # The first column of the describe result is the column name
+            col_label = df.columns[0]
+            cols = df[col_label].tolist()
+            options = [{'label': c, 'value': c} for c in cols]
+            return options, [], False
+        except Exception as e:
+            print(f"Error fetching columns for {catalog}.{schema}.{table}: {e}")
             return [], [], True
-        
-        eol_def = get_eol_definition_by_name(eol_name, current_project_id)
-        if not eol_def:
-            return [], [], True
-        
-        # For now, we'll provide a generic list of common feature columns
-        # In a real implementation, you might want to parse the SQL definition
-        # or provide a way to specify columns manually
-        common_columns = [
-            'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5',
-            'numeric_feature', 'categorical_feature', 'boolean_feature'
-        ]
-        
-        column_options = [{'label': col, 'value': col} for col in common_columns]
-        return column_options, [], False
 
     @app.callback(
         [Output('lookup-key-dropdown', 'options'),
@@ -337,7 +368,8 @@ def register_feature_lookup_callbacks(app, sqlQuery):
             return [], None, True, [], None, True
         
         eol_def = get_eol_definition_by_name(eol_name, current_project_id)
-        if not eol_def:
+        # If no definition found, disable lookup fields
+        if eol_def is None:
             return [], None, True, [], None, True
         
         # Common lookup keys
@@ -501,6 +533,59 @@ def register_feature_lookup_callbacks(app, sqlQuery):
             html.H5("Generated Python Code:"),
             html.Pre(python_code, style={'background-color': '#f8f9fa', 'padding': '10px', 'border-radius': '5px'})
         ])
+    # ---------------------------------------------
+    # Catalog, Schema, Table dropdown callbacks
+    # Load catalogs on initial page load
+    @app.callback(
+        Output('feature-catalog-dropdown', 'options'),
+        Input('dummy-trigger', 'children')
+    )
+    def load_catalogs(_):
+        try:
+            df = sqlQuery("SHOW CATALOGS")
+            col = df.columns[0]
+            opts = [{'label': v, 'value': v} for v in df[col].tolist()]
+            return opts
+        except Exception as e:
+            print(f"Error loading catalogs: {e}")
+            return []
+
+    # Load schemas when a catalog is selected
+    @app.callback(
+        [Output('feature-schema-dropdown', 'options'),
+         Output('feature-schema-dropdown', 'disabled')],
+        Input('feature-catalog-dropdown', 'value')
+    )
+    def load_schemas(catalog):
+        if not catalog:
+            return [], True
+        try:
+            df = sqlQuery(f"SHOW SCHEMAS IN {catalog}")
+            col = df.columns[0]
+            opts = [{'label': v, 'value': v} for v in df[col].tolist()]
+            return opts, False
+        except Exception as e:
+            print(f"Error loading schemas for {catalog}: {e}")
+            return [], True
+
+    # Load tables when a schema is selected
+    @app.callback(
+        [Output('feature-table-dropdown', 'options'),
+         Output('feature-table-dropdown', 'disabled')],
+        [Input('feature-catalog-dropdown', 'value'),
+         Input('feature-schema-dropdown', 'value')]
+    )
+    def load_tables(catalog, schema):
+        if not catalog or not schema:
+            return [], True
+        try:
+            df = sqlQuery(f"SHOW TABLES IN {catalog}.{schema}")
+            tbl_col = next((c for c in df.columns if 'table' in c.lower()), df.columns[0])
+            opts = [{'label': row[tbl_col], 'value': row[tbl_col]} for _, row in df.iterrows()]
+            return opts, False
+        except Exception as e:
+            print(f"Error loading tables in {catalog}.{schema}: {e}")
+            return [], True
 
 def get_selected_features():
     """Get the currently selected features."""
