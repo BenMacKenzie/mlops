@@ -399,4 +399,45 @@ def register_new_project_callbacks(app):
             print(f"Error fetching notebook files: {str(e)}")
             return []
 
+    @app.callback(
+        Output("list-store", "data", allow_duplicate=True),
+        Input("delete-project-button", "n_clicks"),
+        State("list-store", "data"),
+        prevent_initial_call=True
+    )
+    def delete_project_callback(n_clicks, store_data):
+        if not n_clicks:
+            raise PreventUpdate
+        if isinstance(store_data, dict):
+            active_project_id = store_data.get("active_project_id")
+            items = store_data.get("items", []) or []
+        elif isinstance(store_data, list):
+            items = store_data
+            active_project_id = items[0].get("id") if items else None
+        else:
+            raise PreventUpdate
+        if not active_project_id:
+            raise PreventUpdate
+        success = delete_project(active_project_id)
+        if not success:
+            return no_update
+        df = get_projects()
+        items = []
+        if not df.empty:
+            records = df.to_dict(orient="records")
+            items = [
+                {
+                    "id": int(rec["id"]),
+                    "text": rec.get("name"),
+                    "description": rec.get("description"),
+                    "catalog": rec.get("catalog"),
+                    "schema": rec.get("schema"),
+                    "git_url": rec.get("git_url"),
+                    "training_notebook": rec.get("training_notebook"),
+                }
+                for rec in records
+            ]
+        new_active_id = items[0]["id"] if items else None
+        return {"items": items, "active_project_id": new_active_id}
+
  

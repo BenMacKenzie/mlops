@@ -30,11 +30,14 @@ create table if not exists {catalog}.{schema}.eol_definition (
     sql_definition STRING NOT NULL
 );
 
+drop table if exists {catalog}.{schema}.feature_lookups;
+
 create table if not exists {catalog}.{schema}.feature_lookups (
     id BIGINT GENERATED ALWAYS AS IDENTITY,
     project_id BIGINT NOT NULL,
-    eol_id BIGINT NOT NULL,
-    features array<string> NOT NULL
+    eol_id BIGINT,
+    name STRING NOT NULL,
+    features array<string>
 );
 -- CREATE TABLE IF NOT EXISTS datasets (
 --     id BIGINT GENERATED ALWAYS AS IDENTITY,
