@@ -198,6 +198,10 @@ def register_feature_lookup_callbacks(app):
 
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),
+        Output('feature-lookup-name', 'value', allow_duplicate=True),
+        Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-table-store', 'data', allow_duplicate=True),
+        Output('feature-lookup-table-dropdown', 'value', allow_duplicate=True),
         Input('create-feature-lookup-button', 'n_clicks'),
         State('feature-lookup-name', 'value'),
         State('feature-lookup-eol-dropdown', 'value'),
@@ -209,14 +213,17 @@ def register_feature_lookup_callbacks(app):
         # Determine current project
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
         if project_id is None:
-            return dash.no_update
+            # Nothing to do: no update to store or form
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         # Set default name if none provided
-        lookup_name = name if name else 'new feature lookup'
+        lookup_name = 'new feature lookup'
+
+        eol_id = None
         # Prepare feature list from selected tables
-        feats = [str(t).strip() for t in (tables or []) if t and str(t).strip()]
+        feats = []
         # Create feature lookup in DB
         if not create_feature_lookup(project_id, eol_id, lookup_name, feats):
-            return dash.no_update
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         # Refresh the list of feature lookups
         df = get_feature_lookups(project_id)
         records = df.to_dict('records') if not df.empty else []
@@ -224,8 +231,9 @@ def register_feature_lookup_callbacks(app):
             {'id': int(rec['id']), 'name': rec.get('name'), 'eol_id': rec.get('eol_id'), 'features': rec.get('features')}
             for rec in records
         ]
-        active_id = items[-1]['id'] if items else None
-        return {'items': items, 'active_id': active_id}
+        
+        # After creation, clear form inputs (no selection)
+        return {'items': items, 'active_id': None}, '', None, [], None
 
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),
@@ -279,10 +287,10 @@ def register_feature_lookup_callbacks(app):
     
     @app.callback(
         [
-            Output('feature-lookup-name', 'value'),
-            Output('feature-lookup-eol-dropdown', 'value'),
+            Output('feature-lookup-name', 'value', allow_duplicate=True),
+            Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
             Output('feature-lookup-table-store', 'data', allow_duplicate=True),
-            Output('feature-lookup-table-dropdown', 'value')
+            Output('feature-lookup-table-dropdown', 'value', allow_duplicate=True)
         ],
         Input('feature-lookup-store', 'data'),
         prevent_initial_call='initial_duplicate'
