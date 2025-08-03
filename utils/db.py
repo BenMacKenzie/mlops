@@ -323,3 +323,23 @@ def get_tables(catalog: str = None, schema: str = None) -> list:
     except Exception as e:
         print(f"Error fetching tables: {e}")
         return []
+  
+def get_columns(catalog: str = None, schema: str = None, table: str = None) -> list:
+    """Fetch all column names from the specified catalog.schema.table."""
+    cat = catalog or CATALOG_NAME
+    sch = schema or SCHEMA_NAME
+    if not table or not cat or not sch:
+        return []
+    try:
+        # Describe table to get column metadata
+        query = f"DESCRIBE TABLE {cat}.{sch}.{table}"
+        df = sqlQuery(query)
+        if df.empty:
+            return []
+        # Determine column containing column names
+        cols = [c for c in df.columns if 'col' in c.lower()]
+        col = cols[0] if cols else df.columns[0]
+        return [str(v) for v in df[col].tolist()]
+    except Exception as e:
+        print(f"Error fetching columns for {cat}.{sch}.{table}: {e}")
+        return []

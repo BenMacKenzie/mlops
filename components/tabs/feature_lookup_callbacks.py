@@ -1,4 +1,5 @@
 import dash
+import json
 from dash import Input, Output, State, callback_context, ALL, html
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
@@ -12,7 +13,8 @@ from utils.db import (
     get_eol_definitions,
     get_catalogs,
     get_schemas,
-    get_tables
+    get_tables,
+    get_columns
 )
 
 def register_feature_lookup_callbacks(app):
@@ -74,6 +76,20 @@ def register_feature_lookup_callbacks(app):
         tables = get_tables(catalog, schema)
         return [{'label': t, 'value': t} for t in tables]
 
+    # Populate column dropdown based on selected catalog, schema, and table
+    @app.callback(
+        Output('feature-lookup-column-dropdown', 'options'),
+        Input('feature-lookup-catalog-dropdown', 'value'),
+        Input('feature-lookup-schema-dropdown', 'value'),
+        Input('feature-lookup-table-dropdown', 'value')
+    )
+    def update_columns_dropdown(catalog, schema, table):
+        if not catalog or not schema or not table:
+            return []
+        cols = get_columns(catalog, schema, table)
+        print(f"cols: {cols}")
+        return [{'label': c, 'value': c} for c in cols]
+
     # Combined callback to add or delete tables in the table store
     @app.callback(
         Output('feature-lookup-table-store', 'data', allow_duplicate=True),
@@ -82,48 +98,41 @@ def register_feature_lookup_callbacks(app):
         State('feature-lookup-catalog-dropdown', 'value'),
         State('feature-lookup-schema-dropdown', 'value'),
         State('feature-lookup-table-dropdown', 'value'),
+        State('feature-lookup-column-dropdown', 'value'),
         State('feature-lookup-table-store', 'data'),
         prevent_initial_call=True
     )
-    def modify_table_list(add_clicks, delete_clicks, catalog, schema, selected_table, current_tables):
+    def modify_table_list(add_clicks, delete_clicks, catalog, schema, selected_table, selected_columns, current_items):
         """Handle adding a new table or deleting an existing one based on which button was clicked."""
+        # Determine which input triggered this callback
+        trig = callback_context.triggered[0]['prop_id']
+        if not trig or trig == '.':
+            raise PreventUpdate
 
-        print(f"***** curent_tables: {current_tables}")
-        print(f"***** selected_table: {selected_table}")
-        ctx = callback_context
-        triggered = ctx.triggered_id
-        if not triggered:
-            raise PreventUpdate
-        # Ensure tables is a list
-        # Normalize current_tables to a mutable Python list
-        raw = current_tables
-        if raw is None:
-            tables = []
-        elif isinstance(raw, list):
-            tables = raw.copy()
-        elif isinstance(raw, str):
-            tables = [raw]
-        else:
+        items = current_items or []
+        # Delete action: remove selected index
+        if 'feature-lookup-delete-table-button' in trig:
+            id_str = trig.split('.')[0]
             try:
-                tables = list(raw)
+                idx = json.loads(id_str).get('index')
             except Exception:
-                tables = []
-        # Delete case: a delete button was clicked
-        if isinstance(triggered, dict) and triggered.get('type') == 'feature-lookup-delete-table-button':
-            idx = triggered.get('index')
-            if idx is None or idx >= len(tables):
                 raise PreventUpdate
-            tables = [t for i, t in enumerate(tables) if i != idx]
-            return tables
-        # Add case: add-table button clicked
-        if not selected_table or not catalog or not schema:
-            raise PreventUpdate
-        fq = f"{catalog}.{schema}.{selected_table}"
-        print(f"size of list before: {len(tables)}")
-        if fq not in tables:
-            tables.append(fq)
-        print(f"size of list after: {len(tables)}")
-        return tables
+            if idx is None or idx >= len(items):
+                raise PreventUpdate
+            return [it for i, it in enumerate(items) if i != idx]
+
+        # Add action: append new table with selected columns
+        if 'feature-lookup-add-table-button' in trig:
+            if not (catalog and schema and selected_table):
+                raise PreventUpdate
+            fq = f"{catalog}.{schema}.{selected_table}"
+            features = selected_columns or []
+            new_item = {'table': fq, 'features': features}
+            if not any(it.get('table') == fq for it in items):
+                items.append(new_item)
+            return items
+
+        raise PreventUpdate
     
     # Callback to render selected tables list
     @app.callback(
@@ -135,10 +144,17 @@ def register_feature_lookup_callbacks(app):
         if not tables:
             return html.P("No tables selected.", className="text-muted")
         children = []
-        for idx, fq in enumerate(tables):
+        for idx, entry in enumerate(tables):
+            # entry may be a dict with table and features, or a raw string
+            if isinstance(entry, dict):
+                tbl = entry.get('table') or ''
+                feats = entry.get('features') or []
+                display = f"table:  {tbl}: features: {', '.join(feats)}" if feats else tbl
+            else:
+                display = str(entry)
             children.append(
                 dbc.Row([
-                    dbc.Col(html.Span(fq), width=10),
+                    dbc.Col(html.Span(display), width=10),
                     dbc.Col(
                         dbc.Button(
                             "Delete",
@@ -307,20 +323,18 @@ def register_feature_lookup_callbacks(app):
                 eol_id = rec.get('eol_id') if rec.get('eol_id') is not None else ''
                 # Initialize table store with existing features, normalize to Python list
                 raw_feats = rec.get('features')
-                # Determine table list
-                if raw_feats is None:
-                    tables = []
-                elif isinstance(raw_feats, list):
-                    tables = raw_feats.copy()
+                # Build items list: each entry is dict with table and its features
+                if isinstance(raw_feats, list):
+                    tables = [{'table': str(t), 'features': []} for t in raw_feats]
                 else:
-                    # Try common array -> list conversion
                     try:
-                        # numpy, pandas, or pyarrow objects
-                        tables = raw_feats.tolist()
+                        seq = raw_feats.tolist()
+                        tables = [{'table': str(t), 'features': []} for t in seq]
                     except Exception:
                         try:
-                            tables = list(raw_feats)
+                            seq = list(raw_feats)
+                            tables = [{'table': str(t), 'features': []} for t in seq]
                         except Exception:
-                            tables = [raw_feats]
+                            tables = []
                 return name, eol_id, tables, None
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update

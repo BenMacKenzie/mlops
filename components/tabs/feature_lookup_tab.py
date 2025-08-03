@@ -104,6 +104,19 @@ def create_feature_lookup_tab():
                 dbc.Button("Add Table", id="feature-lookup-add-table-button", color="secondary", className="mt-4")
             ], width=3)
         ], className="mb-3"),
+        # Column selection dropdown for chosen table
+        dbc.Row([
+            dbc.Col([
+                dbc.Label("Columns", html_for="feature-lookup-column-dropdown"),
+                dcc.Dropdown(
+                    id="feature-lookup-column-dropdown",
+                    options=[],  # Populated dynamically based on selected table
+                    multi=True,
+                    placeholder="Select columns",
+                    clearable=True
+                )
+            ], width=12)
+        ], className="mb-3"),
         # List of selected tables with delete buttons
         dbc.Row([
             dbc.Col([
