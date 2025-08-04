@@ -19,10 +19,47 @@ def create_feature_lookup_tab():
             for rec in records
         ]
     active_id = items[0]['id'] if items else None
+    
+    # Load initial tables if there's an active feature lookup
+    initial_tables = []
+    if active_id and items:
+        for item in items:
+            if item['id'] == active_id:
+                raw_feats = item.get('features') or []
+                for feat in raw_feats:
+                    if isinstance(feat, dict):
+                        initial_tables.append(feat)
+                    elif isinstance(feat, str):
+                        # Try to parse the non-standard format
+                        import re
+                        table_match = re.search(r'{table:\s*([^,}]+),\s*features:\s*\[([^\]]*)\]}', feat)
+                        if table_match:
+                            table_name = table_match.group(1).strip()
+                            features_str = table_match.group(2).strip()
+                            if features_str:
+                                features = [f.strip() for f in features_str.split(',')]
+                            else:
+                                features = []
+                            initial_tables.append({'table': table_name, 'features': features})
+                        else:
+                            # Try JSON parsing
+                            try:
+                                import json
+                                parsed = json.loads(feat)
+                                if isinstance(parsed, dict) and 'table' in parsed:
+                                    initial_tables.append(parsed)
+                                else:
+                                    initial_tables.append({'table': str(feat), 'features': []})
+                            except:
+                                initial_tables.append({'table': str(feat), 'features': []})
+                break
+    
     # Store to maintain list of feature lookups and active selection
     store = dcc.Store(id='feature-lookup-store', data={'items': items, 'active_id': active_id})
     # Store to maintain list of selected tables for current feature lookup form
-    table_store = dcc.Store(id='feature-lookup-table-store', data=[])
+    table_store = dcc.Store(id='feature-lookup-table-store', data=initial_tables)
+    # Store to track if tables have been modified (to prevent reload)
+    table_modified_store = dcc.Store(id='feature-lookup-table-modified', data=False)
 
     # List group of feature lookups
     list_items = []
@@ -100,9 +137,7 @@ def create_feature_lookup_tab():
                     clearable=True
                 )
             ], width=9),
-            dbc.Col([
-                dbc.Button("Add Table", id="feature-lookup-add-table-button", color="secondary", className="mt-4")
-            ], width=3)
+            
         ], className="mb-3"),
         # Column selection dropdown for chosen table
         dbc.Row([
@@ -117,7 +152,13 @@ def create_feature_lookup_tab():
                 )
             ], width=12)
         ], className="mb-3"),
-        # List of selected tables with delete buttons
+        dbc.Row([
+            
+            dbc.Col([
+                dbc.Button("Add Table", id="feature-lookup-add-table-button", color="secondary", className="mt-4")
+            ], width=3)
+        ], className="mb-3"),    # List o
+            # f selected tables with delete buttons
         dbc.Row([
             dbc.Col([
                 dbc.Label("Selected Tables"),
@@ -137,6 +178,7 @@ def create_feature_lookup_tab():
     # Combine list, form, and table store side by side
     layout = dbc.Container([
         table_store,
+        table_modified_store,
         dbc.Row([
             dbc.Col(list_group, width=6),
             dbc.Col(form, width=6)

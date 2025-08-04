@@ -90,11 +90,12 @@ def register_feature_lookup_callbacks(app):
         print(f"cols: {cols}")
         return [{'label': c, 'value': c} for c in cols]
 
-    # Combined callback to add or delete tables in the table store
+    # Store for pending table operations (add/delete requests)
     @app.callback(
-        Output('feature-lookup-table-store', 'data', allow_duplicate=True),
+        Output('feature-lookup-table-store', 'data'),
         Input('feature-lookup-add-table-button', 'n_clicks'),
         Input({'type': 'feature-lookup-delete-table-button', 'index': ALL}, 'n_clicks'),
+        Input('feature-lookup-store', 'data'),  # Also listen to store changes to load initial tables
         State('feature-lookup-catalog-dropdown', 'value'),
         State('feature-lookup-schema-dropdown', 'value'),
         State('feature-lookup-table-dropdown', 'value'),
@@ -102,37 +103,113 @@ def register_feature_lookup_callbacks(app):
         State('feature-lookup-table-store', 'data'),
         prevent_initial_call=True
     )
-    def modify_table_list(add_clicks, delete_clicks, catalog, schema, selected_table, selected_columns, current_items):
-        """Handle adding a new table or deleting an existing one based on which button was clicked."""
-        # Determine which input triggered this callback
-        trig = callback_context.triggered[0]['prop_id']
-        if not trig or trig == '.':
-            raise PreventUpdate
-
-        items = current_items or []
-        # Delete action: remove selected index
+    def manage_table_store(add_clicks, delete_clicks, feature_store_data, catalog, schema, selected_table, selected_columns, current_items):
+        """Central manager for all table store operations."""
+        ctx = callback_context
+        trig = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
+        
+        print(f"manage_table_store - trigger: {trig}")
+        print(f"manage_table_store - current items: {current_items}")
+        
+        # Handle feature lookup selection (load tables from DB)
+        if trig == 'feature-lookup-store.data':
+            active_id = feature_store_data.get('active_id') if isinstance(feature_store_data, dict) else None
+            items = feature_store_data.get('items', []) if isinstance(feature_store_data, dict) else []
+            
+            # Track the previously loaded ID to avoid unnecessary reloads
+            if not hasattr(manage_table_store, 'previous_active_id'):
+                manage_table_store.previous_active_id = None
+            
+            if active_id == manage_table_store.previous_active_id:
+                print(f"manage_table_store - Same active_id, keeping current tables")
+                return current_items if current_items is not None else []
+            
+            manage_table_store.previous_active_id = active_id
+            
+            if active_id is None:
+                print(f"manage_table_store - No active_id, returning empty")
+                return []
+            
+            # Load tables from database
+            tables = []
+            for rec in items:
+                if rec.get('id') == active_id:
+                    raw_feats = rec.get('features') or []
+                    print(f"manage_table_store - Loading features from DB: {raw_feats}")
+                    
+                    for feat in raw_feats:
+                        if isinstance(feat, dict):
+                            tables.append(feat)
+                        elif isinstance(feat, str):
+                            # Parse string representations
+                            try:
+                                import json
+                                parsed = json.loads(feat)
+                                if isinstance(parsed, dict) and 'table' in parsed:
+                                    tables.append(parsed)
+                                    continue
+                            except Exception:
+                                pass
+                            
+                            # Try regex for non-standard format
+                            import re
+                            table_match = re.search(r'{table:\s*([^,}]+),\s*features:\s*\[([^\]]*)\]}', feat)
+                            if table_match:
+                                table_name = table_match.group(1).strip()
+                                features_str = table_match.group(2).strip()
+                                if features_str:
+                                    features = [f.strip() for f in features_str.split(',')]
+                                else:
+                                    features = []
+                                tables.append({'table': table_name, 'features': features})
+                                continue
+                            
+                            # Fallback
+                            tables.append({'table': str(feat), 'features': []})
+                    break
+            
+            print(f"manage_table_store - Loaded {len(tables)} tables from DB")
+            return tables
+        
+        # Handle delete table button
         if 'feature-lookup-delete-table-button' in trig:
+            items = current_items if current_items is not None else []
             id_str = trig.split('.')[0]
             try:
                 idx = json.loads(id_str).get('index')
             except Exception:
-                raise PreventUpdate
+                return items
             if idx is None or idx >= len(items):
-                raise PreventUpdate
-            return [it for i, it in enumerate(items) if i != idx]
+                return items
+            result = [it for i, it in enumerate(items) if i != idx]
+            print(f"manage_table_store - After delete: {result}")
+            return result
 
-        # Add action: append new table with selected columns
-        if 'feature-lookup-add-table-button' in trig:
+        # Handle add table button
+        if trig == 'feature-lookup-add-table-button.n_clicks':
+            items = current_items if current_items is not None else []
             if not (catalog and schema and selected_table):
-                raise PreventUpdate
+                print(f"manage_table_store - Missing dropdown values for add")
+                return items
+            
             fq = f"{catalog}.{schema}.{selected_table}"
             features = selected_columns or []
             new_item = {'table': fq, 'features': features}
-            if not any(it.get('table') == fq for it in items):
+            
+            # Check if table already exists
+            exists = False
+            for item in items:
+                if isinstance(item, dict) and item.get('table') == fq:
+                    exists = True
+                    break
+            
+            if not exists:
                 items.append(new_item)
+            print(f"manage_table_store - After add: {items}")
             return items
 
-        raise PreventUpdate
+        # Default: return current items
+        return current_items if current_items is not None else []
     
     # Callback to render selected tables list
     @app.callback(
@@ -140,6 +217,7 @@ def register_feature_lookup_callbacks(app):
         Input('feature-lookup-table-store', 'data')
     )
     def render_table_list(tables):
+        print(f"render_table_list - Rendering {len(tables) if tables else 0} tables: {tables}")
         
         if not tables:
             return html.P("No tables selected.", className="text-muted")
@@ -210,6 +288,9 @@ def register_feature_lookup_callbacks(app):
         if fl_id == -1:
             raise PreventUpdate
         items = store_data.get('items', []) if isinstance(store_data, dict) else []
+        
+        print(f"select_feature_lookup - Selected feature lookup id: {fl_id}")
+        
         return {'items': items, 'active_id': fl_id}
 
     @app.callback(
@@ -232,11 +313,22 @@ def register_feature_lookup_callbacks(app):
             # Nothing to do: no update to store or form
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         # Set default name if none provided
-        lookup_name = 'new feature lookup'
-
-        eol_id = None
+        lookup_name = name if name else 'new feature lookup'
+        
         # Prepare feature list from selected tables
         feats = []
+        if tables:
+            for tbl_entry in tables:
+                if isinstance(tbl_entry, dict):
+                    table_name = tbl_entry.get('table', '')
+                    cols = tbl_entry.get('features', [])
+                    # Store as properly formatted JSON string
+                    import json
+                    feats.append(json.dumps({'table': table_name, 'features': cols}))
+                else:
+                    # Store as simple string (backward compatibility)
+                    feats.append(str(tbl_entry))
+        
         # Create feature lookup in DB
         if not create_feature_lookup(project_id, eol_id, lookup_name, feats):
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
@@ -263,10 +355,23 @@ def register_feature_lookup_callbacks(app):
     )
     def update_fl_callback(n_clicks, store_data, name, eol_id, tables, project_store):
         fl_id = store_data.get('active_id') if isinstance(store_data, dict) else None
-        if fl_id is None or not name or eol_id is None:
+        if fl_id is None or not name:
             return dash.no_update
+        
         # Prepare feature list from selected tables
-        feats = [str(t).strip() for t in (tables or []) if t and str(t).strip()]
+        feats = []
+        if tables:
+            for tbl_entry in tables:
+                if isinstance(tbl_entry, dict):
+                    table_name = tbl_entry.get('table', '')
+                    cols = tbl_entry.get('features', [])
+                    # Store as properly formatted Python dict string
+                    import json
+                    feats.append(json.dumps({'table': table_name, 'features': cols}))
+                else:
+                    # Store as simple string (backward compatibility)
+                    feats.append(str(tbl_entry))
+        
         if not update_feature_lookup(fl_id, name, eol_id, feats):
             return dash.no_update
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
@@ -302,39 +407,23 @@ def register_feature_lookup_callbacks(app):
         return {'items': items, 'active_id': active_id}
     
     @app.callback(
-        [
-            Output('feature-lookup-name', 'value', allow_duplicate=True),
-            Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
-            Output('feature-lookup-table-store', 'data', allow_duplicate=True),
-            Output('feature-lookup-table-dropdown', 'value', allow_duplicate=True)
-        ],
+        Output('feature-lookup-name', 'value', allow_duplicate=True),
+        Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
         Input('feature-lookup-store', 'data'),
-        prevent_initial_call='initial_duplicate'
+        prevent_initial_call=True
     )
     def populate_feature_lookup_form(store_data):
         """Populate form inputs when the feature lookup store updates."""
         active_id = store_data.get('active_id') if isinstance(store_data, dict) else None
         items = store_data.get('items', []) if isinstance(store_data, dict) else []
+        
         if active_id is None:
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            return dash.no_update, dash.no_update
+            
         for rec in items:
             if rec.get('id') == active_id:
                 name = rec.get('name') or ''
                 eol_id = rec.get('eol_id') if rec.get('eol_id') is not None else ''
-                # Initialize table store with existing features, normalize to Python list
-                raw_feats = rec.get('features')
-                # Build items list: each entry is dict with table and its features
-                if isinstance(raw_feats, list):
-                    tables = [{'table': str(t), 'features': []} for t in raw_feats]
-                else:
-                    try:
-                        seq = raw_feats.tolist()
-                        tables = [{'table': str(t), 'features': []} for t in seq]
-                    except Exception:
-                        try:
-                            seq = list(raw_feats)
-                            tables = [{'table': str(t), 'features': []} for t in seq]
-                        except Exception:
-                            tables = []
-                return name, eol_id, tables, None
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+                return name, eol_id
+        
+        return dash.no_update, dash.no_update
