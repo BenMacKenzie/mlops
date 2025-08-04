@@ -3,7 +3,7 @@ from dash import html
 import pandas as pd
 from dash import html, dcc, Input, Output, State, no_update, ALL, callback_context
 import dash_bootstrap_components as dbc
-from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
+from utils.db import sqlQuery, get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
 import yaml, json
 import yaml
 

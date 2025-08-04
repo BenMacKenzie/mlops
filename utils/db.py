@@ -184,6 +184,161 @@ def get_eol_definition_by_name(name: str, project_id: int):
     except Exception as e:
         print(f"Error fetching EOL definition: {e}")
         return None
+
+def get_eol_definition_by_id(eol_id: int):
+    """Get a specific EOL definition by ID."""
+    print(f"get_eol_definition_by_id called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, eol_id={eol_id}")
+    try:
+        query = f"SELECT * FROM {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition WHERE id = {eol_id}"
+        result = sqlQuery(query)
+        if not result.empty:
+            return result.iloc[0]
+        return None
+    except Exception as e:
+        print(f"Error fetching EOL definition: {e}")
+        return None
+
+def get_eol_view_columns(eol_id: int) -> list:
+    """Get columns from the EOL definition view."""
+    print(f"get_eol_view_columns called with eol_id={eol_id}")
+    try:
+        # Get the EOL definition
+        eol_def = get_eol_definition_by_id(eol_id)
+        if eol_def is None:
+            print(f"No EOL definition found for eol_id={eol_id}")
+            return []
+        
+        sql_definition = eol_def.get('sql_definition')
+        if not sql_definition:
+            print(f"No SQL definition found for eol_id={eol_id}")
+            return []
+        
+        print(f"EOL SQL definition: {sql_definition}")
+        
+        # Try different approaches to get column information
+        try:
+            # First, try DESCRIBE with subquery
+            describe_query = f"DESCRIBE ({sql_definition})"
+            print(f"Trying DESCRIBE query: {describe_query}")
+            result = sqlQuery(describe_query)
+        except Exception as e1:
+            print(f"DESCRIBE subquery failed: {e1}")
+            try:
+                # Try creating a temporary view and describing it
+                temp_view_name = f"temp_eol_view_{eol_id}"
+                create_view_query = f"CREATE OR REPLACE TEMPORARY VIEW {temp_view_name} AS {sql_definition}"
+                print(f"Creating temp view: {create_view_query}")
+                sqlQuery(create_view_query)
+                
+                describe_query = f"DESCRIBE {temp_view_name}"
+                print(f"Describing temp view: {describe_query}")
+                result = sqlQuery(describe_query)
+                
+                # Clean up the temporary view
+                try:
+                    sqlQuery(f"DROP VIEW {temp_view_name}")
+                except:
+                    pass
+            except Exception as e2:
+                print(f"Temporary view approach failed: {e2}")
+                try:
+                    # Last resort: try LIMIT 0 to get schema
+                    schema_query = f"SELECT * FROM ({sql_definition}) LIMIT 0"
+                    print(f"Trying schema query: {schema_query}")
+                    result = sqlQuery(schema_query)
+                    # Convert result columns to a DataFrame that looks like DESCRIBE output
+                    if not result.empty or result.columns.tolist():
+                        column_names = [str(col) for col in result.columns.tolist()]
+                        print(f"Found columns from schema query: {column_names}")
+                        return column_names
+                    return []
+                except Exception as e3:
+                    print(f"Schema query approach failed: {e3}")
+                    return []
+        
+        if result.empty:
+            return []
+        
+        # Extract column names from the describe result
+        column_names = []
+        for _, row in result.iterrows():
+            col_name = row.get('col_name') or row.get('column_name') or row.get('name')
+            if col_name:
+                column_names.append(str(col_name))
+        
+        print(f"Found EOL view columns: {column_names}")
+        return column_names
+        
+    except Exception as e:
+        print(f"Error getting EOL view columns: {e}")
+        return []
+
+def get_eol_view_timestamp_columns(eol_id: int) -> list:
+    """Get timestamp/date columns from the EOL definition view."""
+    print(f"get_eol_view_timestamp_columns called with eol_id={eol_id}")
+    try:
+        # Get the EOL definition
+        eol_def = get_eol_definition_by_id(eol_id)
+        if eol_def is None:
+            print(f"No EOL definition found for eol_id={eol_id}")
+            return []
+        
+        sql_definition = eol_def.get('sql_definition')
+        if not sql_definition:
+            print(f"No SQL definition found for eol_id={eol_id}")
+            return []
+        
+        # Try different approaches to get column information with data types
+        try:
+            # First, try DESCRIBE with subquery
+            describe_query = f"DESCRIBE ({sql_definition})"
+            print(f"Trying DESCRIBE query for timestamps: {describe_query}")
+            result = sqlQuery(describe_query)
+        except Exception as e1:
+            print(f"DESCRIBE subquery failed for timestamps: {e1}")
+            try:
+                # Try creating a temporary view and describing it
+                temp_view_name = f"temp_eol_view_{eol_id}_ts"
+                create_view_query = f"CREATE OR REPLACE TEMPORARY VIEW {temp_view_name} AS {sql_definition}"
+                print(f"Creating temp view for timestamps: {create_view_query}")
+                sqlQuery(create_view_query)
+                
+                describe_query = f"DESCRIBE {temp_view_name}"
+                print(f"Describing temp view for timestamps: {describe_query}")
+                result = sqlQuery(describe_query)
+                
+                # Clean up the temporary view
+                try:
+                    sqlQuery(f"DROP VIEW {temp_view_name}")
+                except:
+                    pass
+            except Exception as e2:
+                print(f"Temporary view approach failed for timestamps: {e2}")
+                # For timestamps, we need data types, so if we can't get DESCRIBE to work,
+                # we'll return an empty list rather than trying LIMIT 0 (which doesn't give types)
+                return []
+        
+        if result.empty:
+            return []
+        
+        # Filter for timestamp/date columns
+        timestamp_columns = []
+        for _, row in result.iterrows():
+            col_name = row.get('col_name') or row.get('column_name') or row.get('name')
+            data_type = row.get('data_type') or row.get('type') or ''
+            
+            if col_name and data_type:
+                data_type_lower = str(data_type).lower()
+                # Check if the data type indicates a timestamp or date column
+                if any(ts_type in data_type_lower for ts_type in ['timestamp', 'date', 'datetime', 'time']):
+                    timestamp_columns.append(str(col_name))
+        
+        print(f"Found EOL view timestamp columns: {timestamp_columns}")
+        return timestamp_columns
+        
+    except Exception as e:
+        print(f"Error getting EOL view timestamp columns: {e}")
+        return []
 ## Feature Lookup CRUD operations
 def get_feature_lookups(project_id: int = None) -> pd.DataFrame:
     """Fetch feature lookups, optionally filtered by project_id."""

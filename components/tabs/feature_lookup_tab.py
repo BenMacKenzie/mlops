@@ -152,6 +152,27 @@ def create_feature_lookup_tab():
                 )
             ], width=12)
         ], className="mb-3"),
+        # Lookup key and timestamp key dropdowns
+        dbc.Row([
+            dbc.Col([
+                dbc.Label("Lookup Key", html_for="feature-lookup-lookup-key-dropdown"),
+                dcc.Dropdown(
+                    id="feature-lookup-lookup-key-dropdown",
+                    options=[],  # Populated from EOL view columns
+                    placeholder="Select lookup key",
+                    clearable=True
+                )
+            ], width=6),
+            dbc.Col([
+                dbc.Label("Timestamp Key (Optional)", html_for="feature-lookup-timestamp-key-dropdown"),
+                dcc.Dropdown(
+                    id="feature-lookup-timestamp-key-dropdown",
+                    options=[],  # Populated from EOL view date/time columns
+                    placeholder="Select timestamp key",
+                    clearable=True
+                )
+            ], width=6)
+        ], className="mb-3"),
         dbc.Row([
             
             dbc.Col([

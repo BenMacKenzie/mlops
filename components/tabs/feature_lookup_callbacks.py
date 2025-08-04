@@ -11,6 +11,9 @@ from utils.db import (
     update_feature_lookup,
     delete_feature_lookup,
     get_eol_definitions,
+    get_eol_definition_by_id,
+    get_eol_view_columns,
+    get_eol_view_timestamp_columns,
     get_catalogs,
     get_schemas,
     get_tables,
@@ -90,6 +93,38 @@ def register_feature_lookup_callbacks(app):
         print(f"cols: {cols}")
         return [{'label': c, 'value': c} for c in cols]
 
+    # Populate lookup key dropdown based on selected EOL definition
+    @app.callback(
+        Output('feature-lookup-lookup-key-dropdown', 'options'),
+        Input('feature-lookup-eol-dropdown', 'value')
+    )
+    def update_lookup_key_dropdown(eol_id):
+        if not eol_id:
+            return []
+        try:
+            eol_id_int = int(eol_id)
+            cols = get_eol_view_columns(eol_id_int)
+            return [{'label': c, 'value': c} for c in cols]
+        except Exception as e:
+            print(f"Error populating lookup key dropdown: {e}")
+            return []
+
+    # Populate timestamp key dropdown based on selected EOL definition
+    @app.callback(
+        Output('feature-lookup-timestamp-key-dropdown', 'options'),
+        Input('feature-lookup-eol-dropdown', 'value')
+    )
+    def update_timestamp_key_dropdown(eol_id):
+        if not eol_id:
+            return []
+        try:
+            eol_id_int = int(eol_id)
+            cols = get_eol_view_timestamp_columns(eol_id_int)
+            return [{'label': c, 'value': c} for c in cols]
+        except Exception as e:
+            print(f"Error populating timestamp key dropdown: {e}")
+            return []
+
     # Store for pending table operations (add/delete requests)
     @app.callback(
         Output('feature-lookup-table-store', 'data'),
@@ -100,10 +135,12 @@ def register_feature_lookup_callbacks(app):
         State('feature-lookup-schema-dropdown', 'value'),
         State('feature-lookup-table-dropdown', 'value'),
         State('feature-lookup-column-dropdown', 'value'),
+        State('feature-lookup-lookup-key-dropdown', 'value'),
+        State('feature-lookup-timestamp-key-dropdown', 'value'),
         State('feature-lookup-table-store', 'data'),
         prevent_initial_call=True
     )
-    def manage_table_store(add_clicks, delete_clicks, feature_store_data, catalog, schema, selected_table, selected_columns, current_items):
+    def manage_table_store(add_clicks, delete_clicks, feature_store_data, catalog, schema, selected_table, selected_columns, lookup_key, timestamp_key, current_items):
         """Central manager for all table store operations."""
         ctx = callback_context
         trig = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
@@ -139,13 +176,24 @@ def register_feature_lookup_callbacks(app):
                     
                     for feat in raw_feats:
                         if isinstance(feat, dict):
-                            tables.append(feat)
+                            # Ensure backwards compatibility - add missing keys
+                            table_entry = feat.copy()
+                            if 'lookup_key' not in table_entry:
+                                table_entry['lookup_key'] = None
+                            if 'timestamp_key' not in table_entry:
+                                table_entry['timestamp_key'] = None
+                            tables.append(table_entry)
                         elif isinstance(feat, str):
                             # Parse string representations
                             try:
                                 import json
                                 parsed = json.loads(feat)
                                 if isinstance(parsed, dict) and 'table' in parsed:
+                                    # Ensure backwards compatibility
+                                    if 'lookup_key' not in parsed:
+                                        parsed['lookup_key'] = None
+                                    if 'timestamp_key' not in parsed:
+                                        parsed['timestamp_key'] = None
                                     tables.append(parsed)
                                     continue
                             except Exception:
@@ -161,11 +209,21 @@ def register_feature_lookup_callbacks(app):
                                     features = [f.strip() for f in features_str.split(',')]
                                 else:
                                     features = []
-                                tables.append({'table': table_name, 'features': features})
+                                tables.append({
+                                    'table': table_name, 
+                                    'features': features,
+                                    'lookup_key': None,
+                                    'timestamp_key': None
+                                })
                                 continue
                             
                             # Fallback
-                            tables.append({'table': str(feat), 'features': []})
+                            tables.append({
+                                'table': str(feat), 
+                                'features': [],
+                                'lookup_key': None,
+                                'timestamp_key': None
+                            })
                     break
             
             print(f"manage_table_store - Loaded {len(tables)} tables from DB")
@@ -192,9 +250,18 @@ def register_feature_lookup_callbacks(app):
                 print(f"manage_table_store - Missing dropdown values for add")
                 return items
             
+            if not lookup_key:
+                print(f"manage_table_store - Missing required lookup key")
+                return items
+            
             fq = f"{catalog}.{schema}.{selected_table}"
             features = selected_columns or []
-            new_item = {'table': fq, 'features': features}
+            new_item = {
+                'table': fq, 
+                'features': features,
+                'lookup_key': lookup_key,
+                'timestamp_key': timestamp_key  # Optional, can be None
+            }
             
             # Check if table already exists
             exists = False
@@ -227,7 +294,19 @@ def register_feature_lookup_callbacks(app):
             if isinstance(entry, dict):
                 tbl = entry.get('table') or ''
                 feats = entry.get('features') or []
-                display = f"table:  {tbl}: features: {', '.join(feats)}" if feats else tbl
+                lookup_key = entry.get('lookup_key')
+                timestamp_key = entry.get('timestamp_key')
+                
+                # Build display string with all information
+                display_parts = [f"Table: {tbl}"]
+                if feats:
+                    display_parts.append(f"Features: {', '.join(feats)}")
+                if lookup_key:
+                    display_parts.append(f"Lookup Key: {lookup_key}")
+                if timestamp_key:
+                    display_parts.append(f"Timestamp Key: {timestamp_key}")
+                
+                display = " | ".join(display_parts)
             else:
                 display = str(entry)
             children.append(
@@ -322,9 +401,17 @@ def register_feature_lookup_callbacks(app):
                 if isinstance(tbl_entry, dict):
                     table_name = tbl_entry.get('table', '')
                     cols = tbl_entry.get('features', [])
-                    # Store as properly formatted JSON string
+                    lookup_key = tbl_entry.get('lookup_key')
+                    timestamp_key = tbl_entry.get('timestamp_key')
+                    # Store as properly formatted JSON string with all fields
                     import json
-                    feats.append(json.dumps({'table': table_name, 'features': cols}))
+                    entry_dict = {
+                        'table': table_name, 
+                        'features': cols,
+                        'lookup_key': lookup_key,
+                        'timestamp_key': timestamp_key
+                    }
+                    feats.append(json.dumps(entry_dict))
                 else:
                     # Store as simple string (backward compatibility)
                     feats.append(str(tbl_entry))
@@ -365,9 +452,17 @@ def register_feature_lookup_callbacks(app):
                 if isinstance(tbl_entry, dict):
                     table_name = tbl_entry.get('table', '')
                     cols = tbl_entry.get('features', [])
-                    # Store as properly formatted Python dict string
+                    lookup_key = tbl_entry.get('lookup_key')
+                    timestamp_key = tbl_entry.get('timestamp_key')
+                    # Store as properly formatted JSON string with all fields
                     import json
-                    feats.append(json.dumps({'table': table_name, 'features': cols}))
+                    entry_dict = {
+                        'table': table_name, 
+                        'features': cols,
+                        'lookup_key': lookup_key,
+                        'timestamp_key': timestamp_key
+                    }
+                    feats.append(json.dumps(entry_dict))
                 else:
                     # Store as simple string (backward compatibility)
                     feats.append(str(tbl_entry))
