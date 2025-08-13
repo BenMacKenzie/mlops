@@ -5,12 +5,12 @@ This script demonstrates the usage of the new service and compares it with the o
 """
 
 import pandas as pd
-from mlflow_service import mlflow_service
-from mlflow_service import MLflowWorkspaceService
+from utils.mlflow_service import mlflow_service
+from utils.mlflow_service import MLflowWorkspaceService
 
 # Initialize workspace service if global instance is not available
 try:
-    from mlflow_service import mlflow_workspace_service
+    from utils.mlflow_service import mlflow_workspace_service
     if mlflow_workspace_service is None:
         mlflow_workspace_service = MLflowWorkspaceService()
 except ImportError:

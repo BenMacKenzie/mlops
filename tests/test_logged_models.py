@@ -4,7 +4,7 @@ Test script to verify logged models functionality in MLflow service.
 """
 
 import pandas as pd
-from mlflow_service import MLflowService
+from utils.mlflow_service import MLflowService
 from mlflow import MlflowClient
 from mlflow.entities.metric import Metric
 

@@ -422,6 +422,119 @@ def delete_feature_lookup(feature_lookup_id: int) -> bool:
     except Exception as e:
         print(f"Error deleting feature lookup: {e}")
         return False
+
+## Dataset CRUD operations
+def get_datasets(project_id: int = None) -> pd.DataFrame:
+    """Fetch datasets, optionally filtered by project_id."""
+    print(f"get_datasets called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, project_id={project_id}")
+    try:
+        if project_id is not None:
+            query = f"SELECT * FROM {CATALOG_NAME}.{SCHEMA_NAME}.datasets WHERE project_id = {project_id} ORDER BY name"
+        else:
+            query = f"SELECT * FROM {CATALOG_NAME}.{SCHEMA_NAME}.datasets ORDER BY name"
+        return sqlQuery(query)
+    except Exception as e:
+        print(f"Error fetching datasets: {e}")
+        return pd.DataFrame()
+
+def create_dataset(project_id: int, feature_lookup_id: int, name: str, evaluation_type: str, percentage: float, materialized: bool) -> bool:
+    """Create a new dataset in the database."""
+    print(f"create_dataset called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, project_id={project_id}")
+    try:
+        name_escaped = name.replace("'", "''") if name else ''
+        evaluation_type_escaped = evaluation_type.replace("'", "''") if evaluation_type else ''
+        
+        # Don't set table names until materialization - they include timestamps
+        query = f"""
+        INSERT INTO {CATALOG_NAME}.{SCHEMA_NAME}.datasets 
+        (project_id, feature_lookup_id, name, evaluation_type, percentage, materialized, training_table_name, eval_table_name)
+        VALUES ({project_id}, {feature_lookup_id}, '{name_escaped}', '{evaluation_type_escaped}', {percentage}, {materialized}, NULL, NULL)
+        """
+        sqlQuery(query)
+        return True
+    except Exception as e:
+        print(f"Error creating dataset: {e}")
+        return False
+
+def get_dataset_by_id(dataset_id: int):
+    """Get a specific dataset by ID."""
+    print(f"get_dataset_by_id called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, id={dataset_id}")
+    try:
+        query = f"SELECT * FROM {CATALOG_NAME}.{SCHEMA_NAME}.datasets WHERE id = {dataset_id}"
+        result = sqlQuery(query)
+        if not result.empty:
+            return result.iloc[0]
+        return None
+    except Exception as e:
+        print(f"Error fetching dataset: {e}")
+        return None
+
+def update_dataset(dataset_id: int, name: str, feature_lookup_id: int, evaluation_type: str, percentage: float, materialized: bool) -> bool:
+    """Update an existing dataset in the database."""
+    print(f"update_dataset called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, id={dataset_id}")
+    try:
+        name_escaped = name.replace("'", "''") if name else ''
+        evaluation_type_escaped = evaluation_type.replace("'", "''") if evaluation_type else ''
+        
+        # Don't update table names - they're set during materialization
+        query = f"""
+        UPDATE {CATALOG_NAME}.{SCHEMA_NAME}.datasets SET 
+        name = '{name_escaped}', 
+        feature_lookup_id = {feature_lookup_id}, 
+        evaluation_type = '{evaluation_type_escaped}', 
+        percentage = {percentage}, 
+        materialized = {materialized}
+        WHERE id = {dataset_id}
+        """
+        sqlQuery(query)
+        return True
+    except Exception as e:
+        print(f"Error updating dataset: {e}")
+        return False
+
+def delete_dataset(dataset_id: int) -> bool:
+    """Delete a dataset from the database."""
+    print(f"delete_dataset called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, id={dataset_id}")
+    try:
+        query = f"DELETE FROM {CATALOG_NAME}.{SCHEMA_NAME}.datasets WHERE id = {dataset_id}"
+        sqlQuery(query)
+        return True
+    except Exception as e:
+        print(f"Error deleting dataset: {e}")
+        return False
+
+def update_dataset_run_info(dataset_id: int, run_id: str, run_url: str, training_table_name: str = None, eval_table_name: str = None) -> bool:
+    """Update dataset with run information after materialization."""
+    print(f"update_dataset_run_info called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, id={dataset_id}, run_id={run_id}")
+    try:
+        run_id_escaped = run_id.replace("'", "''") if run_id else ''
+        run_url_escaped = run_url.replace("'", "''") if run_url else ''
+        
+        # Build update query
+        update_parts = [
+            f"run_id = '{run_id_escaped}'",
+            f"run_url = '{run_url_escaped}'",
+            f"materialized = true"
+        ]
+        
+        if training_table_name:
+            training_table_escaped = training_table_name.replace("'", "''")
+            update_parts.append(f"training_table_name = '{training_table_escaped}'")
+        
+        if eval_table_name:
+            eval_table_escaped = eval_table_name.replace("'", "''")
+            update_parts.append(f"eval_table_name = '{eval_table_escaped}'")
+        
+        query = f"""
+        UPDATE {CATALOG_NAME}.{SCHEMA_NAME}.datasets SET 
+        {', '.join(update_parts)}
+        WHERE id = {dataset_id}
+        """
+        sqlQuery(query)
+        return True
+    except Exception as e:
+        print(f"Error updating dataset run info: {e}")
+        return False
   
 # -----------------------------------------------------------------------------
 # Fetch all table names from the configured catalog and schema

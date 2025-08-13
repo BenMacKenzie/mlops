@@ -22,6 +22,33 @@ from utils.db import (
 
 def register_feature_lookup_callbacks(app):
     """Register callbacks for the Feature Lookups tab."""
+    
+    # Refresh feature lookup list when project changes
+    @app.callback(
+        Output('feature-lookup-store', 'data', allow_duplicate=True),
+        Input('list-store', 'data'),
+        prevent_initial_call=True
+    )
+    def refresh_feature_lookup_store_on_project_change(project_store):
+        """Refresh feature lookup store when project selection changes."""
+        project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
+        
+        # Fetch feature lookups for the current project
+        df = get_feature_lookups(project_id)
+        items = []
+        if not df.empty:
+            records = df.to_dict('records')
+            items = [
+                {'id': int(rec['id']), 'name': rec.get('name'), 'eol_id': rec.get('eol_id'), 'features': rec.get('features')}
+                for rec in records
+            ]
+        
+        # Set first item as active, or None if no items
+        active_id = items[0]['id'] if items else None
+        print(f"refresh_feature_lookup_store_on_project_change - project_id: {project_id}, found {len(items)} feature lookups")
+        
+        return {'items': items, 'active_id': active_id}
+    
     # Populate EOL definitions dropdown based on selected project
     @app.callback(
         Output('feature-lookup-eol-dropdown', 'options'),
@@ -128,7 +155,9 @@ def register_feature_lookup_callbacks(app):
     # Store for pending table operations (add/delete requests)
     @app.callback(
         Output('feature-lookup-table-store', 'data'),
+        Output('feature-lookup-selected-table', 'data', allow_duplicate=True),
         Input('feature-lookup-add-table-button', 'n_clicks'),
+        Input('feature-lookup-update-table-button', 'n_clicks'),
         Input({'type': 'feature-lookup-delete-table-button', 'index': ALL}, 'n_clicks'),
         Input('feature-lookup-store', 'data'),  # Also listen to store changes to load initial tables
         State('feature-lookup-catalog-dropdown', 'value'),
@@ -138,9 +167,10 @@ def register_feature_lookup_callbacks(app):
         State('feature-lookup-lookup-key-dropdown', 'value'),
         State('feature-lookup-timestamp-key-dropdown', 'value'),
         State('feature-lookup-table-store', 'data'),
+        State('feature-lookup-selected-table', 'data'),
         prevent_initial_call=True
     )
-    def manage_table_store(add_clicks, delete_clicks, feature_store_data, catalog, schema, selected_table, selected_columns, lookup_key, timestamp_key, current_items):
+    def manage_table_store(add_clicks, update_clicks, delete_clicks, feature_store_data, catalog, schema, selected_table, selected_columns, lookup_key, timestamp_key, current_items, selected_table_idx):
         """Central manager for all table store operations."""
         ctx = callback_context
         trig = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
@@ -159,13 +189,13 @@ def register_feature_lookup_callbacks(app):
             
             if active_id == manage_table_store.previous_active_id:
                 print(f"manage_table_store - Same active_id, keeping current tables")
-                return current_items if current_items is not None else []
+                return current_items if current_items is not None else [], selected_table_idx
             
             manage_table_store.previous_active_id = active_id
             
             if active_id is None:
                 print(f"manage_table_store - No active_id, returning empty")
-                return []
+                return [], None
             
             # Load tables from database
             tables = []
@@ -227,7 +257,7 @@ def register_feature_lookup_callbacks(app):
                     break
             
             print(f"manage_table_store - Loaded {len(tables)} tables from DB")
-            return tables
+            return tables, None  # Clear selection when loading new data
         
         # Handle delete table button
         if 'feature-lookup-delete-table-button' in trig:
@@ -236,23 +266,25 @@ def register_feature_lookup_callbacks(app):
             try:
                 idx = json.loads(id_str).get('index')
             except Exception:
-                return items
+                return items, selected_table_idx
             if idx is None or idx >= len(items):
-                return items
+                return items, selected_table_idx
             result = [it for i, it in enumerate(items) if i != idx]
+            # Clear selection if we deleted the selected table
+            new_selected = None if selected_table_idx == idx else (selected_table_idx - 1 if selected_table_idx is not None and selected_table_idx > idx else selected_table_idx)
             print(f"manage_table_store - After delete: {result}")
-            return result
+            return result, new_selected
 
         # Handle add table button
         if trig == 'feature-lookup-add-table-button.n_clicks':
             items = current_items if current_items is not None else []
             if not (catalog and schema and selected_table):
                 print(f"manage_table_store - Missing dropdown values for add")
-                return items
+                return items, selected_table_idx
             
             if not lookup_key:
                 print(f"manage_table_store - Missing required lookup key")
-                return items
+                return items, selected_table_idx
             
             fq = f"{catalog}.{schema}.{selected_table}"
             features = selected_columns or []
@@ -273,17 +305,47 @@ def register_feature_lookup_callbacks(app):
             if not exists:
                 items.append(new_item)
             print(f"manage_table_store - After add: {items}")
-            return items
+            return items, None  # Clear selection after adding
+
+        # Handle update table button
+        if trig == 'feature-lookup-update-table-button.n_clicks':
+            items = current_items if current_items is not None else []
+            if selected_table_idx is None or selected_table_idx >= len(items):
+                print(f"manage_table_store - No table selected for update")
+                return items, selected_table_idx
+            
+            if not (catalog and schema and selected_table):
+                print(f"manage_table_store - Missing dropdown values for update")
+                return items, selected_table_idx
+            
+            if not lookup_key:
+                print(f"manage_table_store - Missing required lookup key for update")
+                return items, selected_table_idx
+            
+            fq = f"{catalog}.{schema}.{selected_table}"
+            features = selected_columns or []
+            updated_item = {
+                'table': fq, 
+                'features': features,
+                'lookup_key': lookup_key,
+                'timestamp_key': timestamp_key  # Optional, can be None
+            }
+            
+            # Update the selected table
+            items[selected_table_idx] = updated_item
+            print(f"manage_table_store - After update: {items}")
+            return items, None  # Clear selection after updating
 
         # Default: return current items
-        return current_items if current_items is not None else []
+        return current_items if current_items is not None else [], selected_table_idx
     
     # Callback to render selected tables list
     @app.callback(
         Output('feature-lookup-table-list', 'children'),
-        Input('feature-lookup-table-store', 'data')
+        Input('feature-lookup-table-store', 'data'),
+        Input('feature-lookup-selected-table', 'data')
     )
-    def render_table_list(tables):
+    def render_table_list(tables, selected_table_index):
         print(f"render_table_list - Rendering {len(tables) if tables else 0} tables: {tables}")
         
         if not tables:
@@ -309,9 +371,23 @@ def register_feature_lookup_callbacks(app):
                 display = " | ".join(display_parts)
             else:
                 display = str(entry)
+            
+            # Determine if this table is selected
+            is_selected = (selected_table_index == idx)
+            
             children.append(
                 dbc.Row([
-                    dbc.Col(html.Span(display), width=10),
+                    dbc.Col(
+                        dbc.Button(
+                            display,
+                            id={'type': 'feature-lookup-table-item', 'index': idx},
+                            color="primary" if is_selected else "secondary",
+                            outline=not is_selected,
+                            className="text-start w-100 text-dark" if not is_selected else "text-start w-100",
+                            size="sm"
+                        ), 
+                        width=10
+                    ),
                     dbc.Col(
                         dbc.Button(
                             "Delete",
@@ -324,6 +400,106 @@ def register_feature_lookup_callbacks(app):
                 ], className="mb-1")
             )
         return children
+
+    # Handle table selection
+    @app.callback(
+        Output('feature-lookup-selected-table', 'data'),
+        Output('feature-lookup-catalog-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-schema-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-table-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-column-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-lookup-key-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-timestamp-key-dropdown', 'value', allow_duplicate=True),
+        Input({'type': 'feature-lookup-table-item', 'index': ALL}, 'n_clicks'),
+        State('feature-lookup-table-store', 'data'),
+        State('feature-lookup-selected-table', 'data'),
+        prevent_initial_call=True
+    )
+    def select_table_for_editing(n_clicks, tables, current_selected):
+        ctx = callback_context
+        if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict) or ctx.triggered_id.get('type') != 'feature-lookup-table-item':
+            raise PreventUpdate
+        
+        table_idx = ctx.triggered_id['index']
+        if not tables or table_idx >= len(tables):
+            raise PreventUpdate
+        
+        # If clicking the same table, deselect it
+        if current_selected == table_idx:
+            return None, None, None, None, None, None, None
+        
+        # Get the selected table data
+        selected_table = tables[table_idx]
+        if not isinstance(selected_table, dict):
+            return table_idx, None, None, None, None, None, None
+        
+        # Parse the table name to get catalog, schema, table
+        table_name = selected_table.get('table', '')
+        features = selected_table.get('features', [])
+        lookup_key = selected_table.get('lookup_key')
+        timestamp_key = selected_table.get('timestamp_key')
+        
+        # Parse catalog.schema.table format
+        catalog, schema, table = None, None, None
+        if '.' in table_name:
+            parts = table_name.split('.')
+            if len(parts) == 3:
+                catalog, schema, table = parts
+            elif len(parts) == 2:
+                schema, table = parts
+        
+        print(f"Selected table for editing: {table_name} -> catalog={catalog}, schema={schema}, table={table}")
+        print(f"Features: {features}, Lookup Key: {lookup_key}, Timestamp Key: {timestamp_key}")
+        
+        return table_idx, catalog, schema, table, features, lookup_key, timestamp_key
+
+    # Secondary callback to populate lookup/timestamp key dropdowns when table is selected
+    # This runs after the EOL dropdown options are populated
+    @app.callback(
+        Output('feature-lookup-lookup-key-dropdown', 'value', allow_duplicate=True),
+        Output('feature-lookup-timestamp-key-dropdown', 'value', allow_duplicate=True),
+        Input('feature-lookup-selected-table', 'data'),
+        Input('feature-lookup-lookup-key-dropdown', 'options'),  # Wait for options to be available
+        Input('feature-lookup-timestamp-key-dropdown', 'options'),  # Wait for options to be available
+        State('feature-lookup-table-store', 'data'),
+        prevent_initial_call=True
+    )
+    def populate_keys_for_selected_table(selected_table_idx, lookup_options, timestamp_options, tables):
+        ctx = callback_context
+        if not ctx.triggered:
+            return dash.no_update, dash.no_update
+        
+        # Only react to table selection changes, not option changes
+        if ctx.triggered[0]['prop_id'] != 'feature-lookup-selected-table.data':
+            return dash.no_update, dash.no_update
+        
+        if selected_table_idx is None or not tables or selected_table_idx >= len(tables):
+            return dash.no_update, dash.no_update
+        
+        # Need options to be available before setting values
+        if not lookup_options and not timestamp_options:
+            return dash.no_update, dash.no_update
+        
+        selected_table = tables[selected_table_idx]
+        if not isinstance(selected_table, dict):
+            return dash.no_update, dash.no_update
+        
+        lookup_key = selected_table.get('lookup_key')
+        timestamp_key = selected_table.get('timestamp_key')
+        
+        print(f"populate_keys_for_selected_table - EOL options available, setting lookup_key: {lookup_key}, timestamp_key: {timestamp_key}")
+        print(f"Available lookup options: {[opt['value'] for opt in lookup_options] if lookup_options else []}")
+        print(f"Available timestamp options: {[opt['value'] for opt in timestamp_options] if timestamp_options else []}")
+        
+        return lookup_key, timestamp_key
+
+    # Enable/disable Update Table button based on selection
+    @app.callback(
+        Output('feature-lookup-update-table-button', 'disabled'),
+        Input('feature-lookup-selected-table', 'data')
+    )
+    def toggle_update_button(selected_table):
+        return selected_table is None
 
     @app.callback(
         Output('feature-lookup-list', 'children'),
@@ -370,56 +546,32 @@ def register_feature_lookup_callbacks(app):
         
         print(f"select_feature_lookup - Selected feature lookup id: {fl_id}")
         
+        # Just update the store - form population will be handled by populate_feature_lookup_form
         return {'items': items, 'active_id': fl_id}
 
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),
-        Output('feature-lookup-name', 'value', allow_duplicate=True),
-        Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
-        Output('feature-lookup-table-store', 'data', allow_duplicate=True),
-        Output('feature-lookup-table-dropdown', 'value', allow_duplicate=True),
         Input('create-feature-lookup-button', 'n_clicks'),
-        State('feature-lookup-name', 'value'),
-        State('feature-lookup-eol-dropdown', 'value'),
-        State('feature-lookup-table-store', 'data'),
         State('list-store', 'data'),
         prevent_initial_call=True
     )
-    def create_fl_callback(n_clicks, name, eol_id, tables, project_store):
+    def create_fl_callback(n_clicks, project_store):
         # Determine current project
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
         if project_id is None:
-            # Nothing to do: no update to store or form
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-        # Set default name if none provided
-        lookup_name = name if name else 'new feature lookup'
+            # Nothing to do if no project selected
+            return dash.no_update
+            
+        # Create feature lookup with default values (like projects tab)
+        default_name = "New Feature Lookup"
+        default_eol_id = None  # No EOL definition selected by default
+        default_features = []  # No tables/features by default
         
-        # Prepare feature list from selected tables
-        feats = []
-        if tables:
-            for tbl_entry in tables:
-                if isinstance(tbl_entry, dict):
-                    table_name = tbl_entry.get('table', '')
-                    cols = tbl_entry.get('features', [])
-                    lookup_key = tbl_entry.get('lookup_key')
-                    timestamp_key = tbl_entry.get('timestamp_key')
-                    # Store as properly formatted JSON string with all fields
-                    import json
-                    entry_dict = {
-                        'table': table_name, 
-                        'features': cols,
-                        'lookup_key': lookup_key,
-                        'timestamp_key': timestamp_key
-                    }
-                    feats.append(json.dumps(entry_dict))
-                else:
-                    # Store as simple string (backward compatibility)
-                    feats.append(str(tbl_entry))
-        
-        # Create feature lookup in DB
-        if not create_feature_lookup(project_id, eol_id, lookup_name, feats):
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-        # Refresh the list of feature lookups
+        # Create feature lookup in DB with defaults
+        if not create_feature_lookup(project_id, default_eol_id, default_name, default_features):
+            return dash.no_update
+            
+        # Refresh the list of feature lookups from database
         df = get_feature_lookups(project_id)
         records = df.to_dict('records') if not df.empty else []
         items = [
@@ -427,8 +579,48 @@ def register_feature_lookup_callbacks(app):
             for rec in records
         ]
         
-        # After creation, clear form inputs (no selection)
-        return {'items': items, 'active_id': None}, '', None, [], None
+        # Find the newly created feature lookup (should be the last one)
+        new_feature_lookup_id = items[-1]['id'] if items else None
+        
+        # Set the newly created feature lookup as active (like projects tab)
+        return {'items': items, 'active_id': new_feature_lookup_id}
+
+    @app.callback(
+        Output('feature-lookup-name', 'value', allow_duplicate=True),
+        Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
+        Input('feature-lookup-store', 'data'),
+        prevent_initial_call=True
+    )
+    def populate_feature_lookup_form(store_data):
+        """Populate form inputs when the feature lookup store updates (like projects tab)."""
+        if not isinstance(store_data, dict):
+            return '', None
+            
+        active_id = store_data.get('active_id')
+        items = store_data.get('items', [])
+        
+        # If no active selection, clear the form
+        if active_id is None or not items:
+            return '', None
+            
+        # Find the selected feature lookup
+        for rec in items:
+            if rec.get('id') == active_id:
+                name = rec.get('name') or ''
+                eol_id = rec.get('eol_id')
+                
+                # Convert eol_id to proper format
+                eol_id_value = None
+                if eol_id is not None and eol_id != '' and str(eol_id).lower() != 'none':
+                    try:
+                        eol_id_value = int(eol_id)
+                    except (ValueError, TypeError):
+                        eol_id_value = eol_id
+                
+                return name, eol_id_value
+        
+        # If no matching record found, clear the form
+        return '', None
 
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),
@@ -500,25 +692,3 @@ def register_feature_lookup_callbacks(app):
         ]
         active_id = items[0]['id'] if items else None
         return {'items': items, 'active_id': active_id}
-    
-    @app.callback(
-        Output('feature-lookup-name', 'value', allow_duplicate=True),
-        Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
-        Input('feature-lookup-store', 'data'),
-        prevent_initial_call=True
-    )
-    def populate_feature_lookup_form(store_data):
-        """Populate form inputs when the feature lookup store updates."""
-        active_id = store_data.get('active_id') if isinstance(store_data, dict) else None
-        items = store_data.get('items', []) if isinstance(store_data, dict) else []
-        
-        if active_id is None:
-            return dash.no_update, dash.no_update
-            
-        for rec in items:
-            if rec.get('id') == active_id:
-                name = rec.get('name') or ''
-                eol_id = rec.get('eol_id') if rec.get('eol_id') is not None else ''
-                return name, eol_id
-        
-        return dash.no_update, dash.no_update

@@ -3,7 +3,7 @@ from dash import html, dcc, Input, Output
 import dash_bootstrap_components as dbc
 import dash_ag_grid as dag
 from databricks.sdk import WorkspaceClient
-from mlflow_service import mlflow_workspace_service as mlflow_service
+from utils.mlflow_service import mlflow_workspace_service as mlflow_service
 
 def create_logged_models_column_defs(columns):
     """Create column definitions for logged models with special handling for metrics and parameters."""

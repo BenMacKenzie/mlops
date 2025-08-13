@@ -4,7 +4,7 @@ Test script to compare MLflow client service vs REST API service.
 """
 
 import pandas as pd
-from mlflow_service import mlflow_service
+from utils.mlflow_service import mlflow_service
 from mlflow_rest_service import mlflow_rest_service
 import time
 

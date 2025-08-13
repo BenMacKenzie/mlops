@@ -9,7 +9,7 @@ import dash_bootstrap_components as dbc
 import dash_ag_grid as dag
 from databricks.sdk.core import Config
 from databricks.sdk import WorkspaceClient
-from mlflow_service import mlflow_workspace_service as mlflow_service
+from utils.mlflow_service import mlflow_workspace_service as mlflow_service
 
 from components.tabs.eol_table_tab import create_eol_tab
 
@@ -18,6 +18,8 @@ from components.tabs.project_tab import create_project_tab
 from components.tabs.project_callbacks import register_new_project_callbacks
 from components.tabs.feature_lookup_tab import create_feature_lookup_tab
 from components.tabs.feature_lookup_callbacks import register_feature_lookup_callbacks
+from components.tabs.dataset_tab import create_dataset_tab
+from components.tabs.dataset_callbacks import register_dataset_callbacks
 from components.tabs.eol_table_callbacks import register_eol_callbacks
 
 # Check environment variable but don't fail if not set
@@ -45,6 +47,8 @@ project_tab, project_store = create_project_tab()
 eol_tab = create_eol_tab()
 # Feature lookups tab
 feature_lookup_tab, feature_lookup_store = create_feature_lookup_tab()
+# Dataset tab
+dataset_tab = create_dataset_tab()
 mlops_tab = create_mlops_tab()
 
 # Define the app layout
@@ -61,6 +65,7 @@ app.layout = dbc.Container([
         project_tab,
         eol_tab,
         feature_lookup_tab,
+        dataset_tab,
         mlops_tab
     ],
     id="tabs",
@@ -71,6 +76,7 @@ app.layout = dbc.Container([
 
 register_new_project_callbacks(app)
 register_feature_lookup_callbacks(app)
+register_dataset_callbacks(app)
 register_mlops_callbacks(app)
 register_eol_callbacks(app)
 
