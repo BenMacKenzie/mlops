@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main script to run the materialize table job on Databricks.
+Script to run the materialize table job on Databricks.
 
 This script reads the job ID from db_config.yaml and runs it with specified parameters.
 """

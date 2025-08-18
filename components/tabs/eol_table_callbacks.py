@@ -3,7 +3,7 @@ from dash import html
 import pandas as pd
 from dash import html, dcc, Input, Output, State, no_update, ALL, callback_context
 import dash_bootstrap_components as dbc
-from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
+from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id, sqlQuery
 import yaml, json
 import yaml
 
@@ -19,11 +19,12 @@ def register_eol_callbacks(app):
             Input('tabs', 'active_tab')],
         [State('eol-name-input', 'value'),
             State('eol-sql-definition-input', 'value'),
+            State('eol-label-input', 'value'),
             State('eol-form-store', 'data')],
         prevent_initial_call='initial_duplicate'
     )
     def update_eol_definitions(store_data, save_clicks, delete_clicks, active_tab,
-                                name, sql_def, form_store):
+                                name, sql_def, label, form_store):
         """Update the EOL definitions list, dropdown, and form store on save/delete."""
         # Only refresh when EOL Definitions tab is active
         if active_tab != 'tab-eol':
@@ -50,9 +51,9 @@ def register_eol_callbacks(app):
                 old_name = new_form_store.get('old_name')
                 # Persist to DB
                 if old_name:
-                    update_eol_definition(old_name, name, sql_def, current_project_id)
+                    update_eol_definition(old_name, name, sql_def, current_project_id, label)
                 else:
-                    create_eol_definition(name, sql_def, current_project_id)
+                    create_eol_definition(name, sql_def, current_project_id, label)
                 # Also create or replace the view in the project schema
                 try:
                     proj = get_project_by_id(current_project_id)
@@ -96,6 +97,7 @@ def register_eol_callbacks(app):
     @app.callback(
         [Output('eol-name-input', 'value', allow_duplicate=True),
             Output('eol-sql-definition-input', 'value', allow_duplicate=True),
+            Output('eol-label-input', 'value', allow_duplicate=True),
             Output('eol-form-store', 'data', allow_duplicate=True)],
         [Input({'type': 'eol-list-item', 'index': ALL}, 'n_clicks')],
         [State('list-store', 'data'),
@@ -110,7 +112,7 @@ def register_eol_callbacks(app):
         
         if not ctx.triggered:
             print("DEBUG: No trigger, returning no_update")
-            return no_update, no_update
+            return no_update, no_update, no_update, no_update
         
         # Get current project ID from store
         if isinstance(store_data, dict):
@@ -122,7 +124,7 @@ def register_eol_callbacks(app):
         
         if not current_project_id:
             print("DEBUG: No current_project_id, returning no_update")
-            return no_update, no_update
+            return no_update, no_update, no_update, no_update
         
         # Identify which EOL list item was clicked
         trigger = ctx.triggered[0]['prop_id']
@@ -132,7 +134,7 @@ def register_eol_callbacks(app):
             trigger_obj = json.loads(clean_id)
         except Exception as e:
             print(f"DEBUG: Could not parse trigger id '{clean_id}' as JSON: {e}")
-            return no_update, no_update, form_store
+            return no_update, no_update, no_update, form_store
         # Only handle clicks on eol-list-item entries
         if trigger_obj.get('type') == 'eol-list-item':
             eol_name = trigger_obj.get('index')
@@ -142,28 +144,31 @@ def register_eol_callbacks(app):
                 # Populate form fields and update store with old_name
                 name_val = eol_def.get('name', '') if hasattr(eol_def, 'get') else eol_def['name']
                 sql_val = eol_def.get('sql_definition', '') if hasattr(eol_def, 'get') else eol_def['sql_definition']
-                print(f"DEBUG: Returning name='{name_val}', sql_definition={sql_val[:50]}...")
-                return name_val, sql_val, {'old_name': eol_name}
+                label_val = eol_def.get('label', '') if hasattr(eol_def, 'get') else eol_def.get('label', '')
+                print(f"DEBUG: Returning name='{name_val}', sql_definition={sql_val[:50]}..., label='{label_val}'")
+                return name_val, sql_val, label_val, {'old_name': eol_name}
         # Fallback: do not update
         print("DEBUG: No valid EOL item selected or definition not found, no_update")
-        return no_update, no_update, form_store
+        return no_update, no_update, no_update, form_store
 
     @app.callback(
         [Output('eol-name-input', 'value', allow_duplicate=True),
-            Output('eol-sql-definition-input', 'value', allow_duplicate=True)],
+            Output('eol-sql-definition-input', 'value', allow_duplicate=True),
+            Output('eol-label-input', 'value', allow_duplicate=True)],
         Input('save-eol-button', 'n_clicks'),
         prevent_initial_call=True
     )
     def clear_eol_form_after_save(n_clicks):
         """Reset the EOL form to initial state after saving."""
         if n_clicks:
-            # Set name back to 'new' and clear SQL definition
-            return 'new', ''
-        return no_update, no_update
+            # Set name back to 'new' and clear SQL definition and label
+            return 'new', '', ''
+        return no_update, no_update, no_update
 
     @app.callback(
         [Output('eol-name-input', 'value', allow_duplicate=True),
             Output('eol-sql-definition-input', 'value', allow_duplicate=True),
+            Output('eol-label-input', 'value', allow_duplicate=True),
             Output('eol-form-store', 'data', allow_duplicate=True)],
         Input('new-eol-button', 'n_clicks'),
         prevent_initial_call=True
@@ -172,5 +177,5 @@ def register_eol_callbacks(app):
         """Reset form for creating a new EOL definition."""
         if n_clicks:
             # Reset inputs and clear old_name
-            return 'new', '', {'old_name': None}
-        return no_update, no_update, no_update
+            return 'new', '', '', {'old_name': None}
+        return no_update, no_update, no_update, no_update

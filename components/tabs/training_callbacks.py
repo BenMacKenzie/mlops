@@ -96,26 +96,36 @@ def register_training_callbacks(app):
             return dbc.Alert("Error: Could not retrieve project details.", color="danger")
             
         project_name = project_details.get('name')
+        project_catalog = project_details.get('catalog')
+        project_schema = project_details.get('schema')
         git_url = project_details.get('git_url')
         training_notebook = project_details.get('training_notebook')
         
-        # Get target variable from feature lookup
+        # Get target variable from EOL definition associated with feature lookup
         from utils.db import sqlQuery, CATALOG_NAME, SCHEMA_NAME
         feature_lookup_query = f"""
-            SELECT name 
-            FROM {CATALOG_NAME}.{SCHEMA_NAME}.feature_lookups 
-            WHERE id = {feature_lookup_id}
+            SELECT fl.name as feature_lookup_name, fl.eol_id, eol.label 
+            FROM {CATALOG_NAME}.{SCHEMA_NAME}.feature_lookups fl
+            LEFT JOIN {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition eol ON fl.eol_id = eol.id
+            WHERE fl.id = {feature_lookup_id}
         """
         feature_lookup_df = sqlQuery(feature_lookup_query)
         
         if feature_lookup_df.empty:
             return dbc.Alert("Error: Could not find feature lookup configuration.", color="danger")
             
-        target_variable = feature_lookup_df.iloc[0]['name']
+        # Use label from EOL definition if available, otherwise fall back to feature lookup name
+        target_variable = feature_lookup_df.iloc[0]['label']
+        if not target_variable or pd.isna(target_variable):
+            target_variable = feature_lookup_df.iloc[0]['feature_lookup_name']
         
         # Create job name and experiment name
         job_name = f"{project_name}_{dataset_name}_training"
-        experiment_name = f"/{project_name}/{dataset_name}"
+        experiment_name = f"{project_name}"
+        
+        # Construct full table paths with catalog.schema.table format
+        full_training_table = f"{project_catalog}.{project_schema}.{training_table}"
+        full_eval_table = f"{project_catalog}.{project_schema}.{eval_table}" if eval_table else ""
         
         try:
             # Default git settings if not specified
@@ -125,8 +135,8 @@ def register_training_callbacks(app):
             print(f"Creating training job: {job_name}")
             print(f"Experiment: {experiment_name}")
             print(f"Target: {target_variable}")
-            print(f"Training table: {training_table}")
-            print(f"Eval table: {eval_table}")
+            print(f"Training table: {full_training_table}")
+            print(f"Eval table: {full_eval_table}")
             print(f"Git URL: {git_url}")
             print(f"Notebook: {training_notebook}")
             
@@ -135,8 +145,8 @@ def register_training_callbacks(app):
                 job_name=job_name,
                 experiment_name=experiment_name,
                 target=target_variable,
-                training_table_name=training_table,
-                eval_table_name=eval_table if eval_table else "",
+                training_table_name=full_training_table,
+                eval_table_name=full_eval_table,
                 git_url=git_url,
                 git_provider=git_provider,
                 git_branch=git_branch,
@@ -226,6 +236,9 @@ def register_training_callbacks(app):
                         host = os.getenv("DATABRICKS_HOST")
                         if host and not host.startswith('https://'):
                             host = 'https://' + host
+                        # Remove trailing slash if present
+                        if host and host.endswith('/'):
+                            host = host.rstrip('/')
                         
                         run_link = "#"
                         if host and run.run_id:

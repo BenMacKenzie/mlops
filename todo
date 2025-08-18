@@ -1,2 +1,6 @@
 1. fix devops per David Hurley's demo.
-2. secure database in
+2. get access to postgres database or create two versions of backend.
+3. fix exerpiment problem in training.
+4. add in new feature calculation api
+5. build mlops capability (integrate with deployment jobs?)
+6. the ui is terrible.  convert to react.  See https://github.com/databricks-solutions/claude-databricks-app-template

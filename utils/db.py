@@ -121,16 +121,17 @@ def get_eol_definitions(project_id: int = None):
         print(f"Error fetching EOL definitions: {e}")
         return pd.DataFrame()
 
-def create_eol_definition(name: str, sql_definition: str, project_id: int):
+def create_eol_definition(name: str, sql_definition: str, project_id: int, label: str = None):
     """Create a new EOL definition in the database."""
     print(f"create_eol_definition called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, project_id={project_id}")
     try:
         # Escape single quotes in strings
         name_escaped = name.replace("'", "''") if name else ""
         sql_def_escaped = sql_definition.replace("'", "''") if sql_definition else ""
+        label_escaped = label.replace("'", "''") if label else ""
         query = f"""
-        INSERT INTO {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition (name, sql_definition, project_id)
-        VALUES ('{name_escaped}', '{sql_def_escaped}', {project_id})
+        INSERT INTO {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition (name, sql_definition, project_id, label)
+        VALUES ('{name_escaped}', '{sql_def_escaped}', {project_id}, '{label_escaped}')
         """
         sqlQuery(query)
         return True
@@ -138,7 +139,7 @@ def create_eol_definition(name: str, sql_definition: str, project_id: int):
         print(f"Error creating EOL definition: {e}")
         return False
 
-def update_eol_definition(old_name: str, name: str, sql_definition: str, project_id: int):
+def update_eol_definition(old_name: str, name: str, sql_definition: str, project_id: int, label: str = None):
     """Update an existing EOL definition in the database."""
     print(f"update_eol_definition called with catalog={CATALOG_NAME}, schema={SCHEMA_NAME}, project_id={project_id}")
     try:
@@ -146,9 +147,10 @@ def update_eol_definition(old_name: str, name: str, sql_definition: str, project
         old_name_escaped = old_name.replace("'", "''") if old_name else ""
         name_escaped = name.replace("'", "''") if name else ""
         sql_def_escaped = sql_definition.replace("'", "''") if sql_definition else ""
+        label_escaped = label.replace("'", "''") if label else ""
         query = f"""
         UPDATE {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition
-        SET name = '{name_escaped}', sql_definition = '{sql_def_escaped}'
+        SET name = '{name_escaped}', sql_definition = '{sql_def_escaped}', label = '{label_escaped}'
         WHERE name = '{old_name_escaped}' AND project_id = {project_id}
         """
         sqlQuery(query)

@@ -29,6 +29,15 @@ def create_eol_definition_layout():
                         ),
                     ], className="mb-3"),
                     html.Div([
+                        dbc.Label("Label Column", html_for="eol-label-input"),
+                        dbc.Input(
+                            id='eol-label-input',
+                            type="text",
+                            placeholder="Enter the target/label column name...",
+                            value=''
+                        ),
+                    ], className="mb-3"),
+                    html.Div([
                         dbc.Label("SQL Definition", html_for="eol-sql-definition-input"),
                         dbc.Textarea(
                             id='eol-sql-definition-input',
