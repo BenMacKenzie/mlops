@@ -4,3 +4,10 @@
 4. add in new feature calculation api
 5. build mlops capability (integrate with deployment jobs?)
 6. the ui is terrible.  convert to react.  See https://github.com/databricks-solutions/claude-databricks-app-template
+7. need different schema for materialized tables...
+8. something wrong with seletion list functionality... (also create vs update nes)
+9. I think async updates are fragile...get rid of.  
+
+longer term:
+
+1. there are a lot of holes in the data.  e.g., you should not be able to delete a dataset that is associated with a registered model...etc....

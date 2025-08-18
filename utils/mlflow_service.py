@@ -233,13 +233,16 @@ class MLflowWorkspaceService:
         
         return summary
     
-    def get_logged_models(self):
+    def get_logged_models(self, experiment_name=None):
         """Get all logged models from MLflow using search_logged_models API."""
         try:
-            # Get the experiment ID for the default experiment
-            experiment = self.workspace_client.experiments.get_by_name('/ML/mlflow_workshop/mlflow3-ml-example')
+            # Use provided experiment name or default
+            exp_name = experiment_name or '/ML/mlflow_workshop/mlflow3-ml-example'
+            
+            # Get the experiment ID for the specified experiment
+            experiment = self.workspace_client.experiments.get_by_name(exp_name)
             if experiment is None:
-                print("Default experiment not found")
+                print(f"Experiment '{exp_name}' not found")
                 return pd.DataFrame()
             
             experiment_id = experiment.experiment.experiment_id

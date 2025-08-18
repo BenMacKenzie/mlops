@@ -178,6 +178,7 @@ def get_eol_definition_by_name(name: str, project_id: int):
     try:
         # Escape single quotes in name
         name_escaped = name.replace("'", "''") if name else ""
+        # Simplified query - name should be unique within project, so no need for both filters
         query = f"SELECT * FROM {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition WHERE name = '{name_escaped}' AND project_id = {project_id}"
         result = sqlQuery(query)
         if not result.empty:
@@ -199,6 +200,38 @@ def get_eol_definition_by_id(eol_id: int):
     except Exception as e:
         print(f"Error fetching EOL definition: {e}")
         return None
+
+def check_eol_view_exists(eol_id: int) -> bool:
+    """Check if the EOL view exists for the given EOL definition."""
+    print(f"check_eol_view_exists called with eol_id={eol_id}")
+    try:
+        # Get the EOL definition
+        eol_def = get_eol_definition_by_id(eol_id)
+        if eol_def is None:
+            print(f"No EOL definition found for eol_id={eol_id}")
+            return False
+            
+        # Get the project details to construct view name
+        project_id = eol_def.get('project_id')
+        project = get_project_by_id(project_id)
+        if project is None:
+            print(f"No project found for project_id={project_id}")
+            return False
+            
+        catalog = project.get('catalog')
+        schema = project.get('schema')
+        view_name = eol_def.get('name')
+        
+        # Check if view exists
+        check_query = f"SHOW TABLES IN {catalog}.{schema} LIKE '{view_name}'"
+        result = sqlQuery(check_query)
+        exists = not result.empty
+        print(f"View {catalog}.{schema}.{view_name} exists: {exists}")
+        return exists
+        
+    except Exception as e:
+        print(f"Error checking if EOL view exists: {e}")
+        return False
 
 def get_eol_view_columns(eol_id: int) -> list:
     """Get columns from the EOL definition view."""

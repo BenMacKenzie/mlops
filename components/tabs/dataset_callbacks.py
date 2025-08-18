@@ -26,9 +26,10 @@ def register_dataset_callbacks(app):
     @app.callback(
         Output('dataset-store', 'data', allow_duplicate=True),
         Input('list-store', 'data'),
+        State('dataset-store', 'data'),
         prevent_initial_call='initial_duplicate'  # Allow initial call with duplicate output
     )
-    def refresh_dataset_store_on_project_change(project_store):
+    def refresh_dataset_store_on_project_change(project_store, current_dataset_store):
         """Refresh dataset store when project selection changes or on initial load."""
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
         
@@ -53,9 +54,16 @@ def register_dataset_callbacks(app):
                 for rec in records
             ]
         
-        # Set first item as active, or None if no items
-        active_id = items[0]['id'] if items else None
-        print(f"refresh_dataset_store_on_project_change - project_id: {project_id}, found {len(items)} datasets")
+        # Preserve current selection if it exists and is still valid, otherwise auto-select first item
+        current_active_id = current_dataset_store.get('active_id') if current_dataset_store else None
+        
+        # Check if current selection is still valid in the new items list
+        if current_active_id and any(item['id'] == current_active_id for item in items):
+            active_id = current_active_id  # Preserve existing selection
+        else:
+            active_id = items[0]['id'] if items else None  # Auto-select only when necessary
+        
+        print(f"refresh_dataset_store_on_project_change - project_id: {project_id}, found {len(items)} datasets, preserving active_id: {active_id}")
         
         return {'items': items, 'active_id': active_id}
     
@@ -65,23 +73,41 @@ def register_dataset_callbacks(app):
         Input('list-store', 'data')
     )
     def update_feature_lookup_dropdown(store_data):
+        print(f"DEBUG: update_feature_lookup_dropdown called with store_data: {store_data}")
         project_id = None
         if isinstance(store_data, dict):
             project_id = store_data.get('active_project_id')
+        elif isinstance(store_data, list) and len(store_data) > 0:
+            # Handle list format (happens on initial load sometimes)
+            project_id = store_data[0].get('id') if store_data[0] else None
+        
+        print(f"DEBUG: update_feature_lookup_dropdown project_id: {project_id}")
+        
         # Fetch feature lookups for project
         if not project_id:
+            print("DEBUG: No project_id found, returning empty options")
             return []
+        
         df = get_feature_lookups(project_id)
+        print(f"DEBUG: get_feature_lookups returned {len(df)} rows")
+        
         if df.empty:
+            print("DEBUG: No feature lookups found for project")
             return []
+        
         # Build dropdown options: label=name, value=id
         opts = []
         for _, row in df.iterrows():
             try:
                 val = int(row['id'])
-            except Exception:
+                name = row.get('name')
+                print(f"DEBUG: Adding feature lookup option: {name} (id={val})")
+                opts.append({'label': name, 'value': val})
+            except Exception as e:
+                print(f"DEBUG: Error processing row {row}: {e}")
                 continue
-            opts.append({'label': row.get('name'), 'value': val})
+        
+        print(f"DEBUG: Returning {len(opts)} feature lookup dropdown options")
         return opts
 
     @app.callback(
@@ -92,6 +118,7 @@ def register_dataset_callbacks(app):
     def refresh_dataset_list(store_data):
         items = store_data.get('items', []) if isinstance(store_data, dict) else []
         active_id = store_data.get('active_id') if isinstance(store_data, dict) else None
+        print(f"DEBUG: refresh_dataset_list - active_id={active_id}, items count={len(items)}")
         list_items = []
         for itm in items:
             list_items.append(
@@ -199,20 +226,21 @@ def register_dataset_callbacks(app):
         Output('dataset-run-url-placeholder', 'style'),
         Output('dataset-training-table', 'value'),
         Output('dataset-eval-table', 'value'),
+        Output('materialize-dataset-button', 'disabled'),
         Input('dataset-store', 'data'),
         prevent_initial_call=False  # Allow initial call to populate form on first load
     )
     def populate_dataset_form(store_data):
         """Populate form inputs when the dataset store updates (like projects tab)."""
         if not isinstance(store_data, dict):
-            return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', ''
+            return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
             
         active_id = store_data.get('active_id')
         items = store_data.get('items', [])
         
         # If no active selection, clear the form
         if active_id is None or not items:
-            return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', ''
+            return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
             
         # Find the selected dataset
         for rec in items:
@@ -235,10 +263,13 @@ def register_dataset_callbacks(app):
                     link_style = {'display': 'none'}
                     placeholder_style = {'display': 'inline'}
                 
-                return name, feature_lookup_id, evaluation_type, percentage, materialized, run_id, run_url, run_url, link_style, placeholder_style, training_table, eval_table
+                # Disable materialize button if dataset is already materialized
+                materialize_disabled = materialized
+                
+                return name, feature_lookup_id, evaluation_type, percentage, materialized, run_id, run_url, run_url, link_style, placeholder_style, training_table, eval_table, materialize_disabled
         
         # If no matching record found, clear the form
-        return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', ''
+        return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
 
     @app.callback(
         Output('dataset-store', 'data', allow_duplicate=True),
@@ -310,6 +341,7 @@ def register_dataset_callbacks(app):
             }
             for rec in records
         ]
+        # After deletion, auto-select first item if any exist
         new_active_id = items[0]['id'] if items else None
         return {'items': items, 'active_id': new_active_id}
     
@@ -331,6 +363,15 @@ def register_dataset_callbacks(app):
         dataset = get_dataset_by_id(dataset_id)
         if dataset is None:
             return dash.no_update, dbc.Alert("Dataset not found", color="danger", dismissable=True)
+        
+        # Check if dataset is already materialized
+        if dataset.get('materialized', False):
+            dataset_name = dataset.get('name', f'ID {dataset_id}')
+            return dash.no_update, dbc.Alert(
+                f"Dataset '{dataset_name}' is already materialized.", 
+                color="warning", 
+                dismissable=True
+            )
         
         # Get project info
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
@@ -377,6 +418,13 @@ def register_dataset_callbacks(app):
         except Exception as e:
             return dash.no_update, dbc.Alert(f"Error initializing Databricks client: {e}", color="danger", dismissable=True)
         
+        # Get the label from EOL definition
+        label_column = eol_def.get('label', '')
+        
+        # Debug: print the EOL definition and label value
+        print(f"DEBUG: EOL definition: {eol_def}")
+        print(f"DEBUG: Label column extracted: '{label_column}' (type: {type(label_column)})")
+        
         # Define job parameters
         parameters = {
             "app_catalog_name": app_catalog_name,
@@ -385,8 +433,11 @@ def register_dataset_callbacks(app):
             "project_schema_name": project_schema_name,
             "feature_lookup_id": str(feature_lookup_id),
             "eol_view": eol_view,
-            "dataset_id": str(dataset_id)
+            "dataset_id": str(dataset_id),
+            "label": label_column
         }
+        
+        print(f"DEBUG: Materialize job parameters: {parameters}")
         
         try:
             # Run the job with notebook_params
@@ -398,267 +449,188 @@ def register_dataset_callbacks(app):
             print(f"Materialize job initiated for dataset {dataset_id}")
             print(f"Run ID: {run.run_id}")
             
-            # Wait for run completion
-            result = client.jobs.wait_get_run_job_terminated_or_skipped(
-                run_id=run.run_id
-            )
+            # Update dataset record with run information
+            import os
+            databricks_host = os.getenv("DATABRICKS_HOST", "https://dbc-ce343e89-af12.cloud.databricks.com")
+            if databricks_host and not databricks_host.startswith('https://'):
+                databricks_host = 'https://' + databricks_host
+            # Remove trailing slash if present
+            if databricks_host and databricks_host.endswith('/'):
+                databricks_host = databricks_host.rstrip('/')
             
-            print(f"Materialize job finished: {result.run_page_url}")
+            run_url = f"{databricks_host}/jobs/{job_id}/runs/{run.run_id}"
             
-            # Extract table names from task outputs
-            training_table_name = None
-            eval_table_name = None
-            
-            # Get the detailed run information to find task run IDs
-            try:
-                print(f"\n=== EXTRACTING TABLE NAMES FROM RUN ===")
-                print(f"Result object type: {type(result)}")
-                print(f"Result attributes: {[attr for attr in dir(result) if not attr.startswith('_')]}")
-                
-                # Task values are stored differently - they're in the run's state
-                # Try to get task values using the Databricks SDK
-                if hasattr(result, 'state') and result.state:
-                    print(f"Run state: {result.state}")
-                    if hasattr(result.state, 'state_message'):
-                        print(f"State message: {result.state.state_message}")
-                
-                # Get the run details which should include task values
-                try:
-                    # Get the full run details
-                    run_details = client.jobs.get_run(run_id=run.run_id)
-                    print(f"Run details type: {type(run_details)}")
-                    
-                    # Check for task outputs in the run details
-                    if hasattr(run_details, 'tasks') and run_details.tasks:
-                        print(f"Found {len(run_details.tasks)} tasks in run details")
-                        for task in run_details.tasks:
-                            print(f"\nTask key: {getattr(task, 'task_key', 'N/A')}")
-                            print(f"Task attributes: {[attr for attr in dir(task) if not attr.startswith('_')]}")
-                            
-                            # Check multiple possible locations for task values
-                            # 1. Direct values attribute
-                            if hasattr(task, 'values'):
-                                task_values = task.values
-                                print(f"Task.values found: {task_values}")
-                                if isinstance(task_values, dict):
-                                    training_table_name = task_values.get('train_table_name', training_table_name)
-                                    eval_table_name = task_values.get('eval_table_name', eval_table_name)
-                                    print(f"Extracted from task.values - train: {training_table_name}, eval: {eval_table_name}")
-                            
-                            # 2. Check output attribute
-                            if hasattr(task, 'output'):
-                                task_output = task.output
-                                print(f"Task.output found: {task_output}")
-                                if isinstance(task_output, dict):
-                                    training_table_name = task_output.get('train_table_name', training_table_name)
-                                    eval_table_name = task_output.get('eval_table_name', eval_table_name)
-                                    print(f"Extracted from task.output - train: {training_table_name}, eval: {eval_table_name}")
-                            
-                            # 3. Check outputs attribute (plural)
-                            if hasattr(task, 'outputs'):
-                                task_outputs = task.outputs
-                                print(f"Task.outputs found: {task_outputs}")
-                                if isinstance(task_outputs, dict):
-                                    training_table_name = task_outputs.get('train_table_name', training_table_name)
-                                    eval_table_name = task_outputs.get('eval_table_name', eval_table_name)
-                                    print(f"Extracted from task.outputs - train: {training_table_name}, eval: {eval_table_name}")
-                            
-                            # 4. Check state for values
-                            if hasattr(task, 'state') and task.state:
-                                print(f"Task.state attributes: {[attr for attr in dir(task.state) if not attr.startswith('_')]}")
-                                if hasattr(task.state, 'result_state'):
-                                    print(f"Task result state: {task.state.result_state}")
-                                
-                    # Alternative: Try to get values from the job run output
-                    run_output = client.jobs.get_run_output(run_id=run.run_id)
-                    
-                    # Check if task values are in metadata
-                    if hasattr(run_output, 'metadata') and run_output.metadata:
-                        print(f"Run output metadata: {run_output.metadata}")
-                        if isinstance(run_output.metadata, dict):
-                            task_values = run_output.metadata.get('task_values', {})
-                            if task_values:
-                                training_table_name = task_values.get('train_table_name', training_table_name)
-                                eval_table_name = task_values.get('eval_table_name', eval_table_name)
-                                print(f"Extracted from metadata task values - train: {training_table_name}, eval: {eval_table_name}")
-                    
-                    # Try getting task values through task run outputs
-                    if hasattr(run_output, 'tasks') and run_output.tasks:
-                        print(f"Found tasks in run output")
-                        # Task values might be in a specific format when set with dbutils.jobs.taskValues.set
-                        
-                except Exception as e:
-                    print(f"Error getting run details: {e}")
-                
-                # Also check if the result has tasks with run_ids (keeping existing logic as fallback)
-                if hasattr(result, 'tasks') and result.tasks:
-                    print(f"Found {len(result.tasks)} tasks in the result")
-                    for i, task in enumerate(result.tasks):
-                        print(f"\n--- Task {i} ---")
-                        print(f"Task object type: {type(task)}")
-                        print(f"Task attributes: {[attr for attr in dir(task) if not attr.startswith('_')]}")
-                        print(f"Task key: {getattr(task, 'task_key', 'N/A')}")
-                        print(f"Task run_id: {getattr(task, 'run_id', 'N/A')}")
-                        
-                        # Print all task attributes that might contain output
-                        for attr in ['state', 'notebook_output', 'outputs', 'run_id']:
-                            if hasattr(task, attr):
-                                value = getattr(task, attr)
-                                print(f"Task.{attr}: {value}")
-                        
-                        # Get the task-specific output using its run_id
-                        if hasattr(task, 'run_id'):
-                            task_run_id = task.run_id
-                            print(f"\nGetting detailed output for task run_id: {task_run_id}")
-                            
-                            try:
-                                # Get the task output
-                                task_output = client.jobs.get_run_output(run_id=task_run_id)
-                                print(f"Task output type: {type(task_output)}")
-                                print(f"Task output attributes: {[attr for attr in dir(task_output) if not attr.startswith('_')]}")
-                                
-                                # Print all output attributes
-                                for attr in ['notebook_output', 'error', 'error_trace', 'logs', 'metadata']:
-                                    if hasattr(task_output, attr):
-                                        value = getattr(task_output, attr)
-                                        if value:
-                                            print(f"Task output.{attr}: {value}")
-                                
-                                # Check for notebook output with task values
-                                if hasattr(task_output, 'notebook_output') and task_output.notebook_output:
-                                    nb_output = task_output.notebook_output
-                                    print(f"Notebook output type: {type(nb_output)}")
-                                    print(f"Notebook output attributes: {[attr for attr in dir(nb_output) if not attr.startswith('_')]}")
-                                    
-                                    if hasattr(nb_output, 'result'):
-                                        output_str = nb_output.result
-                                        print(f"Notebook result string length: {len(output_str) if output_str else 0}")
-                                        print(f"Notebook result (first 500 chars): {output_str[:500] if output_str else 'None'}")
-                                        
-                                        # Only try to parse if we have actual content
-                                        if output_str:
-                                            # Try to parse as JSON
-                                            try:
-                                                import json
-                                                output_data = json.loads(output_str)
-                                                print(f"Successfully parsed JSON. Keys: {list(output_data.keys())}")
-                                                
-                                                # Look for table names in the output
-                                                for key in ['train_table_name', 'training_table_name']:
-                                                    if key in output_data:
-                                                        training_table_name = output_data[key]
-                                                        print(f"Found {key}: {training_table_name}")
-                                                
-                                                for key in ['eval_table_name', 'evaluation_table_name']:
-                                                    if key in output_data:
-                                                        eval_table_name = output_data[key]
-                                                        print(f"Found {key}: {eval_table_name}")
-                                                        
-                                            except (json.JSONDecodeError, TypeError) as e:
-                                                print(f"Could not parse as JSON: {e}")
-                                                # Try regex extraction as fallback
-                                                import re
-                                                # More flexible patterns
-                                                train_patterns = [
-                                                    r'"train_table_name"\s*:\s*"([^"]+)"',
-                                                    r'"training_table_name"\s*:\s*"([^"]+)"',
-                                                    r'train_table_name\s*=\s*"([^"]+)"',
-                                                    r'training_table_name\s*=\s*"([^"]+)"'
-                                                ]
-                                                eval_patterns = [
-                                                    r'"eval_table_name"\s*:\s*"([^"]+)"',
-                                                    r'"evaluation_table_name"\s*:\s*"([^"]+)"',
-                                                    r'eval_table_name\s*=\s*"([^"]+)"',
-                                                    r'evaluation_table_name\s*=\s*"([^"]+)"'
-                                                ]
-                                                
-                                                for pattern in train_patterns:
-                                                    match = re.search(pattern, output_str, re.IGNORECASE)
-                                                    if match:
-                                                        training_table_name = match.group(1)
-                                                        print(f"Extracted training table via regex pattern '{pattern}': {training_table_name}")
-                                                        break
-                                                
-                                                for pattern in eval_patterns:
-                                                    match = re.search(pattern, output_str, re.IGNORECASE)
-                                                    if match:
-                                                        eval_table_name = match.group(1)
-                                                        print(f"Extracted eval table via regex pattern '{pattern}': {eval_table_name}")
-                                                        break
-                                        else:
-                                            print("Notebook result is empty - task values may be set but not returned via notebook.exit()")
-                                
-                            except Exception as e:
-                                print(f"Error getting output for task {task_run_id}: {e}")
-                                import traceback
-                                traceback.print_exc()
-                
-                # Skip trying to get overall run output - Databricks doesn't support it for multi-task runs
-                print("\nNote: Cannot get overall run output for multi-task jobs (Databricks limitation)")
-                
-            except Exception as e:
-                print(f"Error extracting table names: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            # DO NOT use defaults - table names must come from the materialization job
-            print(f"\n=== FINAL RESULTS ===")
-            print(f"Training table: {training_table_name if training_table_name else 'NOT FOUND'}")
-            print(f"Eval table: {eval_table_name if eval_table_name else 'NOT FOUND'}")
-            
-            if not training_table_name or not eval_table_name:
-                print("\nERROR: Could not extract table names from job output.")
-                print("The notebook is currently using:")
-                print("  dbutils.jobs.taskValues.set(key='train_table_name', value=train_table_name)")
-                print("  dbutils.jobs.taskValues.set(key='eval_table_name', value=eval_table_name)")
-                print("\nHowever, these values are not accessible via the Databricks SDK's get_run_output().")
-                print("\nSOLUTION: The notebook should ALSO add at the end:")
-                print("  import json")
-                print("  dbutils.notebook.exit(json.dumps({")
-                print("    'train_table_name': train_table_name,")
-                print("    'eval_table_name': eval_table_name")
-                print("  }))")
-                print("\nThis will make the table names available in the notebook output.")
-                print("\nTable names will not be set in the database until this is fixed.")
-            
-            # Update dataset with run information
-            success = update_dataset_run_info(
+            # Update the dataset record immediately (table names will be updated when job completes)
+            from utils.db import update_dataset_run_info
+            update_success = update_dataset_run_info(
                 dataset_id=dataset_id,
                 run_id=str(run.run_id),
-                run_url=result.run_page_url,
-                training_table_name=training_table_name,
-                eval_table_name=eval_table_name
+                run_url=run_url
             )
             
-            if not success:
-                return dash.no_update, dbc.Alert("Failed to update dataset with run info", color="warning", dismissable=True)
+            if not update_success:
+                print(f"Warning: Failed to update dataset record for dataset {dataset_id}")
             
-            # Refresh the dataset store
-            df = get_datasets(project_id)
-            records = df.to_dict('records') if not df.empty else []
-            items = [
-                {
-                    'id': int(rec['id']), 
-                    'name': rec.get('name'),
-                    'feature_lookup_id': rec.get('feature_lookup_id'),
-                    'evaluation_type': rec.get('evaluation_type'),
-                    'percentage': rec.get('percentage'),
-                    'materialized': rec.get('materialized'),
-                    'training_table_name': rec.get('training_table_name'),
-                    'eval_table_name': rec.get('eval_table_name'),
-                    'run_id': rec.get('run_id'),
-                    'run_url': rec.get('run_url')
-                }
-                for rec in records
-            ]
+            # Start background thread to poll for job completion and extract table names
+            import threading
+            def poll_job_completion():
+                try:
+                    print(f"Starting background polling for job completion: {run.run_id}")
+                    
+                    # Wait for job completion - handle both success and failure cases
+                    try:
+                        result = client.jobs.wait_get_run_job_terminated_or_skipped(
+                            run_id=run.run_id
+                        )
+                        print(f"Materialization job completed: {result.run_page_url}")
+                        job_succeeded = True
+                    except Exception as wait_error:
+                        # Job failed - get the run details to understand what happened
+                        print(f"Materialization job failed: {wait_error}")
+                        try:
+                            result = client.jobs.get_run(run_id=run.run_id)
+                            print(f"Failed job details: {result.run_page_url if hasattr(result, 'run_page_url') else 'N/A'}")
+                            job_succeeded = False
+                        except Exception as get_run_error:
+                            print(f"Could not get run details: {get_run_error}")
+                            return  # Exit early if we can't even get run details
+                    
+                    # Only try to extract table names if job succeeded
+                    training_table_name = None
+                    eval_table_name = None
+                    
+                    if job_succeeded:
+                        try:
+                            # Get the run details to find task outputs
+                            if hasattr(result, 'tasks') and result.tasks:
+                                for task in result.tasks:
+                                    if hasattr(task, 'run_id'):
+                                        task_run_id = task.run_id
+                                        print(f"Getting output for task run_id: {task_run_id}")
+                                    
+                                        try:
+                                            # Get the task output
+                                            task_output = client.jobs.get_run_output(run_id=task_run_id)
+                                        
+                                            # Check for notebook output with table names
+                                            if hasattr(task_output, 'notebook_output') and task_output.notebook_output:
+                                                nb_output = task_output.notebook_output
+                                            
+                                                if hasattr(nb_output, 'result'):
+                                                    output_str = nb_output.result
+                                                    print(f"Notebook output: {output_str[:500] if output_str else 'None'}")
+                                                
+                                                    if output_str:
+                                                        # Try to parse as JSON first
+                                                        try:
+                                                            import json
+                                                            output_data = json.loads(output_str)
+                                                        
+                                                            # Look for table names in various formats
+                                                            for key in ['train_table_name', 'training_table_name']:
+                                                                if key in output_data:
+                                                                    training_table_name = output_data[key]
+                                                                    print(f"Found {key}: {training_table_name}")
+                                                        
+                                                            for key in ['eval_table_name', 'evaluation_table_name']:
+                                                                if key in output_data:
+                                                                    eval_table_name = output_data[key]
+                                                                    print(f"Found {key}: {eval_table_name}")
+                                                                
+                                                        except json.JSONDecodeError:
+                                                            # Try regex extraction as fallback
+                                                            import re
+                                                            train_patterns = [
+                                                                r'"train_table_name"\s*:\s*"([^"]+)"',
+                                                                r'"training_table_name"\s*:\s*"([^"]+)"',
+                                                            ]
+                                                            eval_patterns = [
+                                                                r'"eval_table_name"\s*:\s*"([^"]+)"',
+                                                                r'"evaluation_table_name"\s*:\s*"([^"]+)"',
+                                                            ]
+                                                        
+                                                            for pattern in train_patterns:
+                                                                match = re.search(pattern, output_str, re.IGNORECASE)
+                                                                if match:
+                                                                    training_table_name = match.group(1)
+                                                                    print(f"Extracted training table via regex: {training_table_name}")
+                                                                    break
+                                                        
+                                                            for pattern in eval_patterns:
+                                                                match = re.search(pattern, output_str, re.IGNORECASE)
+                                                                if match:
+                                                                    eval_table_name = match.group(1)
+                                                                    print(f"Extracted eval table via regex: {eval_table_name}")
+                                                                    break
+                                        except Exception as e:
+                                            print(f"Error getting output for task {task_run_id}: {e}")
+                        
+                            # Update dataset record with table names if found
+                            if training_table_name or eval_table_name:
+                                print(f"Updating dataset {dataset_id} with table names: train={training_table_name}, eval={eval_table_name}")
+                                update_dataset_run_info(
+                                    dataset_id=dataset_id,
+                                    run_id=str(run.run_id),
+                                    run_url=run_url,
+                                    training_table_name=training_table_name,
+                                    eval_table_name=eval_table_name
+                                )
+                            else:
+                                print(f"No table names found in job output for dataset {dataset_id}")
+                                
+                        except Exception as e:
+                            print(f"Error extracting table names from job output: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        # Job failed - we already logged the error, no table names to extract
+                        print(f"Job failed for dataset {dataset_id}, skipping table name extraction")
+                        
+                except Exception as e:
+                    print(f"Error in background job polling: {e}")
+                    import traceback
+                    traceback.print_exc()
             
-            alert = dbc.Alert(
-                f"Materialization completed successfully! Run ID: {run.run_id}",
+            # Start the polling thread
+            polling_thread = threading.Thread(target=poll_job_completion, daemon=True)
+            polling_thread.start()
+            
+            # Refresh dataset store to reflect changes
+            try:
+                from utils.db import get_datasets
+                project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
+                if project_id:
+                    records = get_datasets(project_id)
+                    items = [
+                        {
+                            'id': rec.get('id'),
+                            'name': rec.get('name'),
+                            'feature_lookup_id': rec.get('feature_lookup_id'),
+                            'evaluation_type': rec.get('evaluation_type'),
+                            'percentage': rec.get('percentage'),
+                            'materialized': rec.get('materialized', False),
+                            'run_id': rec.get('run_id'),
+                            'run_url': rec.get('run_url'),
+                            'training_table_name': rec.get('training_table_name'),
+                            'eval_table_name': rec.get('eval_table_name')
+                        }
+                        for rec in records.to_dict('records') if rec
+                    ]
+                    updated_store = {'items': items, 'active_id': dataset_id}
+                    print(f"DEBUG: Materialize - updating store with active_id={dataset_id}, items count={len(items)}")
+                else:
+                    updated_store = dash.no_update
+            except Exception as e:
+                print(f"Warning: Failed to refresh dataset store: {e}")
+                updated_store = dash.no_update
+            
+            # Return success message and updated store
+            dataset_name = dataset.get('name', f'ID {dataset_id}')
+            return updated_store, dbc.Alert(
+                f"Successfully started materialization job for dataset '{dataset_name}'. Job ID: {job_id}, Run ID: {run.run_id}",
                 color="success",
                 dismissable=True
             )
-            
-            return {'items': items, 'active_id': dataset_id}, alert
             
         except Exception as e:
             error_msg = f"Error running materialize job: {e}"

@@ -50,6 +50,25 @@ def create_train_tab():
                                 html.Tr(html.Td(children=["Select a project to see runs."], colSpan=7))
                             ])
                         ], bordered=True, hover=True, responsive=True, striped=True)
+                    ),
+                    html.Hr(),
+                    html.H5("Logged Models"),
+                    dcc.Loading(
+                        id="loading-logged-models",
+                        type="default",
+                        children=dbc.Table([
+                            html.Thead(html.Tr([
+                                html.Th("Model Name"),
+                                html.Th("Model ID"),
+                                html.Th("Created"),
+                                html.Th("User"),
+                                html.Th("Metrics"),
+                                html.Th("Parameters")
+                            ])),
+                            html.Tbody(id="train-logged-models-list", children=[
+                                html.Tr(html.Td(children=["Select a project to see logged models."], colSpan=6))
+                            ])
+                        ], bordered=True, hover=True, responsive=True, striped=True)
                     )
                 ], width=12)
             ], className="p-3")

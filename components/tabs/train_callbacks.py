@@ -433,20 +433,5 @@
             # This case should ideally not be hit if error_msg is None and registration was successful
             return dbc.Alert(f"Model registration for '{model_name_str}' returned an unexpected response format. API Response: {response_data}", color="warning")
     
-    # --- Callback to update notebook dropdown in Project Tab --- #
-    @app.callback(
-        Output("project-notebook-dropdown", "options"),
-        Input("project-git-url", "value"),
-        prevent_initial_call=True
-    )
-    def update_notebook_dropdown_options(git_url):
-        if not git_url:
-            return [] # Return empty options, value will be handled by populate_form or remain as is
-        
-        notebook_options = fetch_notebook_files_from_github(git_url, folder_path="notebooks")
-        
-        if not notebook_options:
-            return [{"label": "No files found in 'notebooks' folder or error", "value": "", "disabled": True}]
-
-        return notebook_options
-    # --- End Notebook Dropdown Callback --- #
+    # --- NOTE: Removed duplicate notebook dropdown callback --- #
+    # The notebook dropdown options are now handled in project_callbacks.py to avoid conflicts

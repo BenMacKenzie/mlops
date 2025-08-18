@@ -55,23 +55,40 @@ def register_feature_lookup_callbacks(app):
         Input('list-store', 'data')
     )
     def update_eol_dropdown(store_data):
+        print(f"DEBUG: update_eol_dropdown called with store_data: {store_data}")
         project_id = None
         if isinstance(store_data, dict):
             project_id = store_data.get('active_project_id')
+        elif isinstance(store_data, list) and len(store_data) > 0:
+            project_id = store_data[0].get('id') if store_data[0] else None
+        
+        print(f"DEBUG: update_eol_dropdown project_id: {project_id}")
+        
         # Fetch EOL definitions for project
         if not project_id:
+            print("DEBUG: No project_id found, returning empty options")
             return []
+        
         df = get_eol_definitions(project_id)
+        print(f"DEBUG: get_eol_definitions returned {len(df)} rows")
+        
         if df.empty:
+            print("DEBUG: No EOL definitions found for project")
             return []
+        
         # Build dropdown options: label=name, value=id
         opts = []
         for _, row in df.iterrows():
             try:
                 val = int(row['id'])
-            except Exception:
+                name = row.get('name')
+                print(f"DEBUG: Adding EOL option: {name} (id={val})")
+                opts.append({'label': name, 'value': val})
+            except Exception as e:
+                print(f"DEBUG: Error processing row {row}: {e}")
                 continue
-            opts.append({'label': row.get('name'), 'value': val})
+        
+        print(f"DEBUG: Returning {len(opts)} EOL dropdown options")
         return opts
     # Populate catalog dropdown for table selection
     @app.callback(
@@ -624,6 +641,7 @@ def register_feature_lookup_callbacks(app):
 
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),
+        Output('feature-lookup-form-alert', 'children', allow_duplicate=True),
         Input('update-feature-lookup-button', 'n_clicks'),
         State('feature-lookup-store', 'data'),
         State('feature-lookup-name', 'value'),
@@ -633,9 +651,20 @@ def register_feature_lookup_callbacks(app):
         prevent_initial_call=True
     )
     def update_fl_callback(n_clicks, store_data, name, eol_id, tables, project_store):
+        print(f"DEBUG: update_fl_callback called with n_clicks={n_clicks}, name='{name}', eol_id={eol_id}")
+        print(f"DEBUG: store_data={store_data}")
+        print(f"DEBUG: tables={tables}")
+        
         fl_id = store_data.get('active_id') if isinstance(store_data, dict) else None
-        if fl_id is None or not name:
-            return dash.no_update
+        print(f"DEBUG: extracted fl_id={fl_id}")
+        
+        if fl_id is None:
+            alert = dbc.Alert("No feature lookup selected", color="warning", dismissable=True)
+            return dash.no_update, alert
+        
+        if not name:
+            alert = dbc.Alert("Feature lookup name is required", color="warning", dismissable=True)
+            return dash.no_update, alert
         
         # Prepare feature list from selected tables
         feats = []
@@ -659,8 +688,15 @@ def register_feature_lookup_callbacks(app):
                     # Store as simple string (backward compatibility)
                     feats.append(str(tbl_entry))
         
+        print(f"DEBUG: Calling update_feature_lookup with fl_id={fl_id}, name='{name}', eol_id={eol_id}, feats={feats}")
+        
         if not update_feature_lookup(fl_id, name, eol_id, feats):
-            return dash.no_update
+            print("DEBUG: update_feature_lookup failed")
+            alert = dbc.Alert("Failed to update feature lookup", color="danger", dismissable=True)
+            return dash.no_update, alert
+            
+        print("DEBUG: update_feature_lookup succeeded, refreshing data")
+        
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
         df = get_feature_lookups(project_id)
         records = df.to_dict('records') if not df.empty else []
@@ -668,7 +704,18 @@ def register_feature_lookup_callbacks(app):
             {'id': int(rec['id']), 'name': rec.get('name'), 'eol_id': rec.get('eol_id'), 'features': rec.get('features')}
             for rec in records
         ]
-        return {'items': items, 'active_id': fl_id}
+        
+        alert = dbc.Alert("Feature lookup updated successfully!", color="success", dismissable=True)
+        return {'items': items, 'active_id': fl_id}, alert
+
+    # Clear alert when feature lookup selection changes
+    @app.callback(
+        Output('feature-lookup-form-alert', 'children', allow_duplicate=True),
+        Input('feature-lookup-store', 'data'),
+        prevent_initial_call=True
+    )
+    def clear_feature_lookup_alert(store_data):
+        return None
 
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),

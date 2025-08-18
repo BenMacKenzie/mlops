@@ -275,6 +275,7 @@ def register_new_project_callbacks(app):
         Output("project-schema", "value"),
         Output("project-git-url", "value"),
         Output("project-notebook-dropdown", "value"),
+        Output("project-notebook-dropdown", "options"),
         Input("list-store", "data"),
         prevent_initial_call=True
     )
@@ -284,8 +285,8 @@ def register_new_project_callbacks(app):
         
         # Handle empty or invalid store_data
         if not store_data:
-            # Return empty values for all form fields
-            return '', '', '', '', '', None
+            # Return empty values for all form fields including options
+            return '', '', '', '', '', None, []
             
         # Get active project ID, handling both dict and list cases
         if isinstance(store_data, dict):
@@ -299,104 +300,87 @@ def register_new_project_callbacks(app):
         # If no active project or no items, return empty values
         if not active_project_id or not items:
             print("No active project ID or items found")
-            return '', '', '', '', '', None
+            return '', '', '', '', '', None, []
             
         # Use the helper function to get the project based on active_project_id
         project = get_project_from_store(store_data, active_project_id)
         if not project:
             print(f"No project found for ID {active_project_id}")
-            return '', '', '', '', '', None
+            return '', '', '', '', '', None, []
             
         # Handle both dictionary and object cases for project
         if isinstance(project, dict):
+            git_url = project.get('git_url', '')
+            training_notebook = project.get('training_notebook', None)
+            
+            # Fetch notebook options if git_url is available
+            notebook_options = []
+            if git_url and git_url.startswith("https://github.com/"):
+                try:
+                    from components.tabs.project_tab import fetch_notebook_files_from_github
+                    notebook_options = fetch_notebook_files_from_github(git_url)
+                    print(f"[DEBUG] Fetched {len(notebook_options)} notebook options in populate_form")
+                except Exception as e:
+                    print(f"Error fetching notebook files in populate_form: {str(e)}")
+                    notebook_options = []
+            
             return (
                 project.get('text', ''),
                 project.get('description', ''),
                 project.get('catalog', ''),
                 project.get('schema', ''),
-                project.get('git_url', ''),
-                project.get('training_notebook', None)
+                git_url,
+                training_notebook,
+                notebook_options
             )
         else:
             # Handle object case
+            git_url = getattr(project, 'git_url', '')
+            training_notebook = getattr(project, 'training_notebook', None)
+            
+            # Fetch notebook options if git_url is available
+            notebook_options = []
+            if git_url and git_url.startswith("https://github.com/"):
+                try:
+                    from components.tabs.project_tab import fetch_notebook_files_from_github
+                    notebook_options = fetch_notebook_files_from_github(git_url)
+                    print(f"[DEBUG] Fetched {len(notebook_options)} notebook options in populate_form (object case)")
+                except Exception as e:
+                    print(f"Error fetching notebook files in populate_form (object case): {str(e)}")
+                    notebook_options = []
+            
             return (
                 getattr(project, 'text', ''),
                 getattr(project, 'description', ''),
                 getattr(project, 'catalog', ''),
                 getattr(project, 'schema', ''),
-                getattr(project, 'git_url', ''),
-                getattr(project, 'training_notebook', None)
+                git_url,
+                training_notebook,
+                notebook_options
             )
 
 
 
+    # NOTE: Removed separate update_notebook_options callback to avoid conflicts
+    # The notebook options are now handled in the populate_form callback above
+    
     @app.callback(
-        Output("project-notebook-dropdown", "options"),
-        [Input("project-git-url", "value"),
-         Input({"type": "list-group-item", "index": ALL}, "n_clicks"),
-         Input("list-store", "data")],
+        Output("project-notebook-dropdown", "options", allow_duplicate=True),
+        Input("project-git-url", "value"),
         prevent_initial_call=True
     )
-    def update_notebook_options(git_url, project_clicks, store_data):
-        """Update notebook dropdown options based on GitHub URL or project selection."""
-        ctx = callback_context
-        if not ctx.triggered:
-            return []
-        
-        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        
-        # If triggered by store_data change (project selection), we need to fetch options for the selected project's git_url
-        if trigger_id == "list-store":
-            # Get active project ID
-            if isinstance(store_data, dict):
-                active_project_id = store_data.get("active_project_id")
-                items = store_data.get('items', [])
-            else:
-                items = store_data if isinstance(store_data, list) else []
-                active_project_id = items[0].get('id') if items and isinstance(items[0], dict) else None
-            
-            if active_project_id:
-                # Get project details to get the git_url
-                project = get_project_by_id(active_project_id)
-                if project is not None and project.get('git_url'):
-                    git_url = project['git_url']
-                else:
-                    return []
-            else:
-                return []
-        
-        # If triggered by project selection, we need to fetch options for the selected project's git_url
-        elif trigger_id.startswith('{"type":"list-group-item","index":'):
-            try:
-                import json
-                item_data = json.loads(trigger_id)
-                project_id = item_data['index']
-                
-                if project_id == -1:  # No projects found
-                    return []
-                
-                # Get project details to get the git_url
-                project = get_project_by_id(project_id)
-                if project is not None and project.get('git_url'):
-                    git_url = project['git_url']
-                else:
-                    return []
-            except Exception as e:
-                print(f"Error getting project git_url: {str(e)}")
-                return []
-        
-        # If no git_url or not a GitHub URL, return empty
+    def update_notebook_options_on_git_url_change(git_url):
+        """Update notebook dropdown options when git URL is manually changed."""
         if not git_url or not git_url.startswith("https://github.com/"):
             return []
         
         try:
-            # Import the function from project_tab
             from components.tabs.project_tab import fetch_notebook_files_from_github
             options = fetch_notebook_files_from_github(git_url)
-            print(f"[DEBUG] Fetched {len(options)} notebook options for git_url: {git_url}")
+            print(f"[DEBUG] Fetched {len(options)} notebook options for manually changed git_url: {git_url}")
             return options
         except Exception as e:
-            print(f"Error fetching notebook files: {str(e)}")
+            print(f"Error fetching notebook files on git URL change: {str(e)}")
             return []
 
     @app.callback(

@@ -10,6 +10,7 @@ import pandas as pd
 from utils.db import get_datasets, get_project_by_id
 from jobs.training import create_training_job, run_training_job
 from databricks.sdk import WorkspaceClient
+from utils.mlflow_service import mlflow_workspace_service
 
 
 def register_training_callbacks(app):
@@ -268,3 +269,105 @@ def register_training_callbacks(app):
         except Exception as e:
             print(f"Error fetching training runs: {e}")
             return [html.Tr(html.Td(f"Error fetching training runs: {str(e)}", colSpan=6))]
+    
+    @app.callback(
+        Output("train-logged-models-list", "children"),
+        Input("tabs", "active_tab"),
+        Input("list-store", "data"),
+        Input("train-status-output", "children"),  # Trigger on new training runs
+        prevent_initial_call=True
+    )
+    def update_logged_models_list(active_tab, proj_store, status_output):
+        if active_tab != 'tab-train' or not proj_store:
+            raise PreventUpdate
+
+        project_id = proj_store.get('active_project_id')
+        if not project_id:
+            return [html.Tr(html.Td("Select a project to view logged models.", colSpan=6))]
+
+        try:
+            # Get project details to determine experiment name
+            project_details = get_project_by_id(project_id)
+            if project_details is None:
+                return [html.Tr(html.Td("Error retrieving project details.", colSpan=6))]
+            
+            project_name = project_details.get('name')
+            if not project_name:
+                return [html.Tr(html.Td("Project name is missing.", colSpan=6))]
+            
+            # Use project name as experiment name (matching training logic)
+            experiment_name = f"/{project_name}"
+            
+            print(f"Fetching logged models for experiment: {experiment_name}")
+            
+            # Check if mlflow service is available
+            if mlflow_workspace_service is None:
+                return [html.Tr(html.Td("MLflow service not available.", colSpan=6))]
+            
+            # Get logged models using the existing MLflow service for this specific experiment
+            logged_models_df = mlflow_workspace_service.get_logged_models(experiment_name)
+            
+            if logged_models_df.empty:
+                return [html.Tr(html.Td("No logged models found for this project.", colSpan=6))]
+            
+            table_rows = []
+            
+            for _, model in logged_models_df.iterrows():
+                model_name = model.get('model_name', 'N/A')
+                model_id = model.get('model_id', 'N/A')
+                created = model.get('creation_timestamp', 'N/A')
+                user_id = model.get('user_id', 'N/A')
+                
+                # Format creation timestamp
+                if created != 'N/A' and pd.notna(created):
+                    try:
+                        if isinstance(created, pd.Timestamp):
+                            created = created.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            created = str(created)
+                    except:
+                        created = 'N/A'
+                
+                # Extract metrics (non-parameter columns)
+                metric_cols = [col for col in logged_models_df.columns 
+                              if not col.startswith('param_') and 
+                                 col not in ['model_id', 'model_name', 'catalog_name', 'schema_name', 
+                                           'creation_timestamp', 'last_updated_timestamp', 'user_id', 'description']]
+                
+                metrics_list = []
+                for metric_col in metric_cols:
+                    metric_value = model.get(metric_col)
+                    if pd.notna(metric_value) and metric_value is not None:
+                        # Format metric value
+                        if isinstance(metric_value, (int, float)):
+                            metrics_list.append(f"{metric_col}: {metric_value:.4f}")
+                        else:
+                            metrics_list.append(f"{metric_col}: {metric_value}")
+                
+                metrics_str = " | ".join(metrics_list) if metrics_list else "N/A"
+                
+                # Extract parameters
+                param_cols = [col for col in logged_models_df.columns if col.startswith('param_')]
+                params_list = []
+                for param_col in param_cols:
+                    param_value = model.get(param_col)
+                    if pd.notna(param_value) and param_value is not None:
+                        param_name = param_col.replace('param_', '')
+                        params_list.append(f"{param_name}: {param_value}")
+                
+                params_str = " | ".join(params_list) if params_list else "N/A"
+                
+                table_rows.append(html.Tr([
+                    html.Td(model_name),
+                    html.Td(model_id),
+                    html.Td(created),
+                    html.Td(user_id),
+                    html.Td(metrics_str, style={'max-width': '200px', 'overflow': 'hidden', 'text-overflow': 'ellipsis'}),
+                    html.Td(params_str, style={'max-width': '200px', 'overflow': 'hidden', 'text-overflow': 'ellipsis'})
+                ]))
+            
+            return table_rows
+            
+        except Exception as e:
+            print(f"Error fetching logged models: {e}")
+            return [html.Tr(html.Td(f"Error fetching logged models: {str(e)}", colSpan=6))]
