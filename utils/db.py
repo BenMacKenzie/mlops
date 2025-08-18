@@ -359,7 +359,7 @@ def create_feature_lookup(project_id: int, eol_id: int, name: str, features: lis
     try:
         name_escaped = name.replace("'", "''") if name else ''
         feats = [str(f).strip() for f in features if f]
-        feats_sql = ', '.join(f"'{f.replace("'", "''")}'" for f in feats)
+        feats_sql = ', '.join(f"'{f.replace(chr(39), chr(39)*2)}'" for f in feats)
         try:
             eol_int = int(eol_id)
             eol_sql = str(eol_int)
@@ -395,7 +395,7 @@ def update_feature_lookup(feature_lookup_id: int, name: str, eol_id: int, featur
     try:
         name_escaped = name.replace("'", "''") if name else ''
         feats = [str(f).strip() for f in features if f]
-        feats_sql = ', '.join(f"'{f.replace("'", "''")}'" for f in feats)
+        feats_sql = ', '.join(f"'{f.replace(chr(39), chr(39)*2)}'" for f in feats)
         try:
             eol_int = int(eol_id)
             eol_sql = str(eol_int)
@@ -611,3 +611,113 @@ def get_columns(catalog: str = None, schema: str = None, table: str = None) -> l
     except Exception as e:
         print(f"Error fetching columns for {cat}.{sch}.{table}: {e}")
         return []
+
+# Training Runs Management Functions
+
+def create_training_run(project_id: int, dataset_id: int, job_name: str, parameters: str = None, created_by: str = None):
+    """Create a new training run record."""
+    print(f"create_training_run called for project_id={project_id}, dataset_id={dataset_id}")
+    try:
+        params_sql = f"'{parameters}'" if parameters else "NULL"
+        created_by_sql = f"'{created_by}'" if created_by else "NULL"
+        
+        query = f"""
+        INSERT INTO {CATALOG_NAME}.{SCHEMA_NAME}.training_runs 
+        (project_id, dataset_id, job_name, parameters, created_by, status)
+        VALUES ({project_id}, {dataset_id}, '{job_name}', {params_sql}, {created_by_sql}, 'PENDING')
+        """
+        sqlQuery(query)
+        
+        # Get the last inserted ID
+        id_query = f"""
+        SELECT MAX(id) as id FROM {CATALOG_NAME}.{SCHEMA_NAME}.training_runs 
+        WHERE project_id = {project_id} AND dataset_id = {dataset_id}
+        """
+        result = sqlQuery(id_query)
+        if not result.empty:
+            return int(result.iloc[0]['id'])
+        return None
+    except Exception as e:
+        print(f"Error creating training run: {e}")
+        return None
+
+def update_training_run(run_id: int, **kwargs):
+    """Update a training run record with new information."""
+    print(f"update_training_run called for run_id={run_id}")
+    try:
+        # Build SET clause from kwargs
+        set_clauses = []
+        for key, value in kwargs.items():
+            if value is None:
+                set_clauses.append(f"{key} = NULL")
+            elif isinstance(value, str):
+                # Escape single quotes
+                value_escaped = value.replace("'", "''")
+                set_clauses.append(f"{key} = '{value_escaped}'")
+            elif isinstance(value, (int, float)):
+                set_clauses.append(f"{key} = {value}")
+            else:
+                # Convert to string for complex types
+                value_str = str(value).replace("'", "''")
+                set_clauses.append(f"{key} = '{value_str}'")
+        
+        if not set_clauses:
+            return False
+            
+        set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+        set_clause = ", ".join(set_clauses)
+        
+        query = f"""
+        UPDATE {CATALOG_NAME}.{SCHEMA_NAME}.training_runs
+        SET {set_clause}
+        WHERE id = {run_id}
+        """
+        sqlQuery(query)
+        return True
+    except Exception as e:
+        print(f"Error updating training run {run_id}: {e}")
+        return False
+
+def get_training_runs(project_id: int = None, dataset_id: int = None, limit: int = 100) -> pd.DataFrame:
+    """Get training runs, optionally filtered by project or dataset."""
+    print(f"get_training_runs called with project_id={project_id}, dataset_id={dataset_id}")
+    try:
+        where_clauses = []
+        if project_id:
+            where_clauses.append(f"project_id = {project_id}")
+        if dataset_id:
+            where_clauses.append(f"dataset_id = {dataset_id}")
+        
+        where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        
+        query = f"""
+        SELECT tr.*, p.name as project_name, d.name as dataset_name
+        FROM {CATALOG_NAME}.{SCHEMA_NAME}.training_runs tr
+        LEFT JOIN {CATALOG_NAME}.{SCHEMA_NAME}.project p ON tr.project_id = p.id
+        LEFT JOIN {CATALOG_NAME}.{SCHEMA_NAME}.datasets d ON tr.dataset_id = d.id
+        {where_clause}
+        ORDER BY tr.created_at DESC
+        LIMIT {limit}
+        """
+        return sqlQuery(query)
+    except Exception as e:
+        print(f"Error fetching training runs: {e}")
+        return pd.DataFrame()
+
+def get_training_run_by_job_id(job_id: int) -> pd.Series:
+    """Get a training run by its Databricks job ID."""
+    print(f"get_training_run_by_job_id called for job_id={job_id}")
+    try:
+        query = f"""
+        SELECT * FROM {CATALOG_NAME}.{SCHEMA_NAME}.training_runs
+        WHERE job_id = {job_id}
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        result = sqlQuery(query)
+        if not result.empty:
+            return result.iloc[0]
+        return None
+    except Exception as e:
+        print(f"Error fetching training run by job_id {job_id}: {e}")
+        return None

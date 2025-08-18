@@ -21,6 +21,8 @@ from components.tabs.feature_lookup_callbacks import register_feature_lookup_cal
 from components.tabs.dataset_tab import create_dataset_tab
 from components.tabs.dataset_callbacks import register_dataset_callbacks
 from components.tabs.eol_table_callbacks import register_eol_callbacks
+from components.tabs.training_tab import create_training_tab
+from components.tabs.training_callbacks import register_training_callbacks
 
 # Check environment variable but don't fail if not set
 warehouse_id = os.getenv('DATABRICKS_WAREHOUSE_ID')
@@ -49,6 +51,8 @@ eol_tab = create_eol_tab()
 feature_lookup_tab, feature_lookup_store = create_feature_lookup_tab()
 # Dataset tab
 dataset_tab = create_dataset_tab()
+# Training tab
+training_tab = create_training_tab()
 mlops_tab = create_mlops_tab()
 
 # Define the app layout
@@ -66,6 +70,7 @@ app.layout = dbc.Container([
         eol_tab,
         feature_lookup_tab,
         dataset_tab,
+        training_tab,
         mlops_tab
     ],
     id="tabs",
@@ -77,6 +82,7 @@ app.layout = dbc.Container([
 register_new_project_callbacks(app)
 register_feature_lookup_callbacks(app)
 register_dataset_callbacks(app)
+register_training_callbacks(app)
 register_mlops_callbacks(app)
 register_eol_callbacks(app)
 
