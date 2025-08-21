@@ -74,19 +74,18 @@ def create_dataset_tab():
             ], width=12)
         ], className="mb-3"),
         
-        # Materialized radio buttons
+        # Status display (shows materialization job status)
         dbc.Row([
             dbc.Col([
-                dbc.Label("Materialized", html_for="dataset-materialized"),
-                dbc.RadioItems(
-                    id="dataset-materialized",
-                    options=[
-                        {'label': 'No', 'value': False},
-                        {'label': 'Yes', 'value': True}
-                    ],
-                    value=False,  # Default to 'No'
-                    inline=True
-                )
+                dbc.Label("Status"),
+                html.Div([
+                    dbc.Badge(
+                        "NOT_STARTED", 
+                        id="dataset-status-display",
+                        color="secondary",
+                        className="ms-2"
+                    )
+                ])
             ], width=12)
         ], className="mb-3"),
         

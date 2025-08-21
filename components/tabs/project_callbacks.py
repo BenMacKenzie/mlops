@@ -2,7 +2,7 @@ import dash
 from dash import Input, Output, State, callback_context, no_update, ALL
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
-from utils.db import get_projects, create_project, update_project, delete_project, get_project_by_id
+from utils.db_universal import get_projects, create_project, update_project, delete_project, get_project_by_id
 import requests
 import json
 
@@ -54,13 +54,13 @@ def register_new_project_callbacks(app):
                 print(f"Error processing project records: {e}")
                 items = []
                 
-        # Set active project to first item if available, otherwise None
-        active_project_id = items[0]['id'] if items else None
+        # Don't auto-select any project - let user or other callbacks handle selection
+        active_project_id = None
         print("Processed items:", items)
-        print("Active project ID:", active_project_id)
+        print("Active project ID: None (no auto-selection)")
         
         # Always return a dictionary with both items and active_project_id
-        return {'items': items, "active_project_id": active_project_id}
+        return {'items': items, "active_project_id": active_project_id, 'create_mode': False}
 
     @app.callback(
         Output("list-group", "children", allow_duplicate=True),
@@ -139,62 +139,70 @@ def register_new_project_callbacks(app):
         else:
             items = []
             
-        return {'items': items, "active_project_id": project_id}
+        # Clear create_mode when selecting a project
+        return {'items': items, "active_project_id": project_id, 'create_mode': False}
 
     @app.callback(
-        Output("list-store", "data", allow_duplicate=True),
+        [Output("project-name", "value", allow_duplicate=True),
+         Output("project-description", "value", allow_duplicate=True),
+         Output("project-catalog", "value", allow_duplicate=True),
+         Output("project-schema", "value", allow_duplicate=True),
+         Output("project-git-url", "value", allow_duplicate=True),
+         Output("project-notebook-dropdown", "value", allow_duplicate=True),
+         Output("project-notebook-dropdown", "options", allow_duplicate=True),
+         Output("list-store", "data", allow_duplicate=True)],
         Input("create-project-button", "n_clicks"),
-        State("project-notebook-dropdown", "value"),
         State("list-store", "data"),
         prevent_initial_call=True
     )
-    def create_project_callback(create_clicks, training_notebook_file, store_data):
-        print("create_project_callback")
-        print("store_data type:", type(store_data))
-        print("store_data:", store_data)
+    def create_project_callback(create_clicks, store_data):
+        """Create a new project with default values when create button is clicked."""
+        print("=== CREATE PROJECT CALLBACK (Create New Project) ===")
         
-        # Ensure store_data is a dictionary
-        if isinstance(store_data, list):
-            store_data = {'items': store_data, 'active_project_id': store_data[0]['id'] if store_data else None}
-        
-        # Create project with default values for required fields
-        project_id = create_project(
-            name="New Project",  # Default name
-            description="No description",  # Default description
-            catalog="default_catalog",  # Default catalog
-            schema="default_schema",  # Default schema
-            git_url="https://github.com/example/repo",  # Default git URL
-            training_notebook=training_notebook_file or "default_notebook.py"  # Use provided notebook or default
+        # Create a new project with default values
+        new_project_id = create_project(
+            name="New Project",
+            description="",
+            catalog="",
+            schema="",
+            git_url="",
+            training_notebook=""
         )
         
-        if project_id is None:
-            print("Failed to create project")
-            return no_update
-            
-        # Refresh the entire list from the database instead of manually adding
+        if new_project_id is None:
+            print("Failed to create new project")
+            raise PreventUpdate
+        
+        # Refresh the project list
         df = get_projects()
         items = []
         if not df.empty:
-            records = df.to_dict(orient='records')
-            items = [
-                {
-                    'id': int(rec['id']),
+            for rec in df.to_dict(orient='records'):
+                items.append({
+                    'id': int(rec.get('id')),
                     'text': rec.get('name'),
                     'description': rec.get('description'),
                     'catalog': rec.get('catalog'),
                     'schema': rec.get('schema'),
                     'git_url': rec.get('git_url'),
                     'training_notebook': rec.get('training_notebook')
-                }
-                for rec in records
-            ]
+                })
         
-        print("Refreshed items after project creation:", items)  # Debug print
-     
-        return {'items': items, "active_project_id": project_id}
+        # Select the newly created project and directly set form values
+        store_data = {'items': items, "active_project_id": new_project_id, 'create_mode': False}
+        
+        # Return the form values for the new project directly
+        return "New Project", "", "", "", "", None, [], store_data
     
     @app.callback(
-        Output("list-store", "data", allow_duplicate=True),
+        [Output("project-name", "value", allow_duplicate=True),
+         Output("project-description", "value", allow_duplicate=True),
+         Output("project-catalog", "value", allow_duplicate=True),
+         Output("project-schema", "value", allow_duplicate=True),
+         Output("project-git-url", "value", allow_duplicate=True),
+         Output("project-notebook-dropdown", "value", allow_duplicate=True),
+         Output("project-notebook-dropdown", "options", allow_duplicate=True),
+         Output("list-store", "data", allow_duplicate=True)],
         Input("update-project-button", "n_clicks"),
         State("project-name", "value"),
         State("project-description", "value"),
@@ -209,18 +217,20 @@ def register_new_project_callbacks(app):
     def update_project_callback(update_clicks, name, description, catalog, schema, git_url,
                               training_notebook_file,
                               store_data, active_states):
-        # choose index
-        try:
-            idx = active_states.index(True)
-        except (ValueError, TypeError):
-            idx = len(store_data.get('items', [])) - 1
-        if idx < 0:
-            return no_update
-        project_item = store_data.get('items', [])[idx]
-        project_id = project_item.get('id')
-        updated = update_project(project_id, name, description, catalog, schema, git_url, training_notebook_file)
+        # Get the active project to update
+        active_project_id = store_data.get('active_project_id') if isinstance(store_data, dict) else None
+        
+        if not active_project_id:
+            print("No active project to update")
+            raise PreventUpdate
+            
+        # Update the project
+        updated = update_project(active_project_id, name, description, catalog, schema, git_url, training_notebook_file)
         if updated is None:
-            return no_update
+            raise PreventUpdate
+        
+        project_id = active_project_id
+        
         # Refresh list
         df = get_projects()
         items = []
@@ -236,7 +246,38 @@ def register_new_project_callbacks(app):
                     'training_notebook': rec.get('training_notebook')
                 })
        
-        return {'items': items, "active_project_id": project_id}
+        store_data = {'items': items, "active_project_id": project_id, 'create_mode': False}
+        
+        # Find the updated project and return its current form values
+        updated_project = None
+        for item in items:
+            if item['id'] == project_id:
+                updated_project = item
+                break
+                
+        if updated_project:
+            # Return the updated project's values directly
+            git_url = updated_project.get('git_url', '')
+            notebook_options = []
+            if git_url and git_url.startswith("https://github.com/"):
+                try:
+                    from components.tabs.project_tab import fetch_notebook_files_from_github
+                    notebook_options = fetch_notebook_files_from_github(git_url)
+                except Exception as e:
+                    print(f"Error fetching notebook files: {str(e)}")
+                    notebook_options = []
+            
+            return (updated_project.get('text', ''), 
+                   updated_project.get('description', ''), 
+                   updated_project.get('catalog', ''), 
+                   updated_project.get('schema', ''), 
+                   updated_project.get('git_url', ''), 
+                   updated_project.get('training_notebook', None), 
+                   notebook_options,
+                   store_data)
+        else:
+            # Fallback - return current form values
+            return name, description, catalog, schema, git_url, training_notebook_file, [], store_data
     
     def get_project_from_store(store_data, project_id):
         """
@@ -281,32 +322,46 @@ def register_new_project_callbacks(app):
     )
     def populate_form(store_data):
         # Populate the form inputs based on the selected project
-        print("populate_form - store_data:", store_data)
+        print(f"=== POPULATE_FORM ===")
+        print(f"store_data type: {type(store_data)}")
+        print(f"store_data: {store_data}")
         
         # Handle empty or invalid store_data
         if not store_data:
-            # Return empty values for all form fields including options
+            print("No store_data - returning empty form")
             return '', '', '', '', '', None, []
             
         # Get active project ID, handling both dict and list cases
         if isinstance(store_data, dict):
             active_project_id = store_data.get("active_project_id")
             items = store_data.get('items', [])
+            print(f"Dict format - active_project_id: {active_project_id}, items count: {len(items)}")
         else:
-            # If it's a list, try to get the first item's ID
+            # Legacy list format - this shouldn't happen with our new create callbacks
             items = store_data if isinstance(store_data, list) else []
-            active_project_id = items[0].get('id') if items and isinstance(items[0], dict) else None
+            active_project_id = None  # Don't auto-select first item in legacy mode
+            print(f"WARNING: List format detected (should not happen) - items count: {len(items)}")
+            print(f"Legacy store_data: {store_data}")
             
-        # If no active project or no items, return empty values
-        if not active_project_id or not items:
-            print("No active project ID or items found")
+        # If no active project, return empty form
+        if active_project_id is None:
+            print("No active project ID - returning empty form")
+            return '', '', '', '', '', None, []
+        
+        # If no items, return empty values    
+        if not items:
+            print("No items found")
             return '', '', '', '', '', None, []
             
         # Use the helper function to get the project based on active_project_id
+        print(f"Looking for project with ID: {active_project_id}")
         project = get_project_from_store(store_data, active_project_id)
         if not project:
-            print(f"No project found for ID {active_project_id}")
+            print(f"ERROR: No project found for ID {active_project_id}")
+            print(f"Available items: {[item.get('id') for item in items if isinstance(item, dict)]}")
             return '', '', '', '', '', None, []
+        
+        print(f"Found project: {project.get('text', 'Unknown')} (ID: {project.get('id')})")
             
         # Handle both dictionary and object cases for project
         if isinstance(project, dict):
@@ -402,12 +457,18 @@ def register_new_project_callbacks(app):
             raise PreventUpdate
         if not active_project_id:
             raise PreventUpdate
+        print(f"About to delete project with ID: {active_project_id}")
         success = delete_project(active_project_id)
+        print(f"Delete project result: {success}")
         if not success:
             return no_update
+        
+        print("Fetching projects after deletion...")
         df = get_projects()
+        print(f"get_projects() returned: {type(df)}, empty: {df.empty if df is not None else 'df is None'}")
+        
         items = []
-        if not df.empty:
+        if df is not None and not df.empty:
             records = df.to_dict(orient="records")
             items = [
                 {
@@ -422,6 +483,6 @@ def register_new_project_callbacks(app):
                 for rec in records
             ]
         new_active_id = items[0]["id"] if items else None
-        return {"items": items, "active_project_id": new_active_id}
+        return {"items": items, "active_project_id": new_active_id, 'create_mode': False}
 
  

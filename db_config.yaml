@@ -1,4 +1,14 @@
 database:
+  # Database type: 'databricks' or 'postgres'
+  type: postgres
+  
+  # Databricks-specific configuration
   catalog: mlops_demo
   schema: app 
   materialize_table_job: 650749561506494
+  
+  # PostgreSQL-specific configuration
+  postgres:
+    # Database connection details come from environment variables
+    # DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+    schema: app  # PostgreSQL schema name

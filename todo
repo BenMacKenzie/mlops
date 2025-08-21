@@ -1,4 +1,4 @@
-1. fix devops per David Hurley's demo.
+1. fix devops per David Hurley's demo.  [uses default profile....  use skd.core Config cfg=Congig()].  look at cookbook.
 2. get access to postgres database or create two versions of backend.
 3. fix exerpiment problem in training.
 4. add in new feature calculation api

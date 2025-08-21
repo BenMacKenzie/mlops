@@ -1,6 +1,6 @@
 import dash_bootstrap_components as dbc
 from dash import html, dcc
-from utils.db import get_feature_lookups
+from utils.db_universal import get_feature_lookups
 
 def create_feature_lookup_tab():
     """Create the Feature Lookups tab layout and initial store."""

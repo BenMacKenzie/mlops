@@ -1,274 +1,255 @@
 import dash_bootstrap_components as dbc
-from dash import html
-import pandas as pd
-from dash import html, dcc, Input, Output, State, no_update, ALL, callback_context
+from dash import html, Input, Output, State, no_update, ALL, callback_context
 import dash_bootstrap_components as dbc
-from utils.db import get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id, sqlQuery
-import yaml, json
+from utils.db_universal import (
+    get_eol_definitions, 
+    create_eol_definition, 
+    delete_eol_definition, 
+    get_eol_definition_by_name, 
+    update_eol_definition, 
+    get_project_by_id, 
+    sqlQuery
+)
 import yaml
+from datetime import datetime
 
 
 def register_eol_callbacks(app):
+    """Clean, simple EOL callbacks without conflicting logic."""
     
+    # Single store to manage EOL state
     @app.callback(
-        [Output('eol-name-input', 'value', allow_duplicate=True),
-         Output('eol-sql-definition-input', 'value', allow_duplicate=True),
-         Output('eol-label-input', 'value', allow_duplicate=True)],
+        [Output('eol-definitions-list', 'children'),
+         Output('eol-form-store', 'data'),
+         Output('eol-form-alert', 'children')],
+        [Input('list-store', 'data'),  # Project changes
+         Input('create-eol-button', 'n_clicks'),
+         Input('update-eol-button', 'n_clicks'),
+         Input('delete-eol-button', 'n_clicks'),
+         Input({'type': 'eol-list-item', 'index': ALL}, 'n_clicks')],
+        [State('eol-name-input', 'value'),
+         State('eol-sql-definition-input', 'value'),
+         State('eol-label-input', 'value'),
+         State('eol-form-store', 'data')],
+        prevent_initial_call=True
+    )
+    def manage_eol_state(project_store, create_clicks, update_clicks, delete_clicks, 
+                        item_clicks, name_input, sql_input, label_input, current_store):
+        """Central callback to manage all EOL state changes."""
+        
+        ctx = callback_context
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else ''
+        
+        print(f"=== EOL MANAGE STATE ===")
+        print(f"Trigger: {trigger_id}")
+        
+        # Get current project ID
+        project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
+        if not project_id:
+            return [], {'selected_eol': None}, None
+            
+        # Handle CREATE button
+        if trigger_id == 'create-eol-button' and create_clicks:
+            print("Handling CREATE")
+            
+            # Find unique name
+            df = get_eol_definitions(project_id)
+            existing_names = df['name'].tolist() if not df.empty else []
+            
+            counter = 1
+            new_name = "new"
+            while new_name in existing_names:
+                counter += 1
+                new_name = f"new{counter}"
+            
+            # Create in database
+            success = create_eol_definition(
+                name=new_name,
+                sql_definition="SELECT 1 as placeholder",
+                project_id=project_id,
+                label=""
+            )
+            
+            if success:
+                # Refresh and select the new item
+                df = get_eol_definitions(project_id)
+                list_items = build_eol_list(df, new_name)
+                store = {'selected_eol': new_name}
+                alert = dbc.Alert("EOL definition created successfully!", color="success", dismissable=True)
+                return list_items, store, alert
+            else:
+                return no_update, no_update, dbc.Alert("Failed to create EOL definition", color="danger", dismissable=True)
+        
+        # Handle UPDATE button
+        elif trigger_id == 'update-eol-button' and update_clicks:
+            print("Handling UPDATE")
+            
+            if not current_store or not current_store.get('selected_eol'):
+                return no_update, no_update, dbc.Alert("No EOL definition selected", color="warning", dismissable=True)
+            
+            if not name_input or not sql_input:
+                return no_update, no_update, dbc.Alert("Name and SQL definition are required", color="warning", dismissable=True)
+            
+            old_name = current_store['selected_eol']
+            
+            # Update in database
+            success = update_eol_definition(old_name, name_input, sql_input, project_id, label_input)
+            
+            if success:
+                # If name changed, update selection
+                new_selected = name_input
+                
+                # Also create or replace the view in the project schema
+                try:
+                    proj = get_project_by_id(project_id)
+                    if proj is not None and not (hasattr(proj, 'empty') and proj.empty):
+                        # Handle both dict and Series formats
+                        if hasattr(proj, 'get'):
+                            catalog = proj.get('catalog')
+                            schema = proj.get('schema')
+                        else:
+                            # Series format
+                            catalog = proj['catalog'] if 'catalog' in proj else None
+                            schema = proj['schema'] if 'schema' in proj else None
+                        
+                        if catalog and schema:
+                            view_name = name_input
+                            ddl = f"CREATE OR REPLACE VIEW {catalog}.{schema}.{view_name} AS {sql_input}"
+                            from utils.db_metadata import sqlQuery as databricks_sqlQuery
+                            databricks_sqlQuery(ddl)
+                            alert_msg = "EOL definition and view updated successfully!"
+                        else:
+                            alert_msg = "EOL definition updated, but project missing catalog/schema info"
+                    else:
+                        alert_msg = "EOL definition updated, but project not found"
+                except Exception as e:
+                    print(f"Error creating view: {e}")
+                    alert_msg = f"EOL definition updated, but view creation failed: {e}"
+                
+                # Refresh and maintain selection
+                df = get_eol_definitions(project_id)
+                list_items = build_eol_list(df, new_selected)
+                store = {'selected_eol': new_selected}
+                alert = dbc.Alert(alert_msg, color="success", dismissable=True)
+                return list_items, store, alert
+            else:
+                return no_update, no_update, dbc.Alert("Failed to update EOL definition", color="danger", dismissable=True)
+        
+        # Handle DELETE button
+        elif trigger_id == 'delete-eol-button' and delete_clicks:
+            print("Handling DELETE")
+            
+            if not current_store or not current_store.get('selected_eol'):
+                return no_update, no_update, dbc.Alert("No EOL definition selected", color="warning", dismissable=True)
+            
+            eol_name = current_store['selected_eol']
+            
+            # Delete from database
+            success = delete_eol_definition(eol_name, project_id)
+            
+            if success:
+                # Refresh and clear selection
+                df = get_eol_definitions(project_id)
+                list_items = build_eol_list(df, None)
+                store = {'selected_eol': None}
+                alert = dbc.Alert("EOL definition deleted successfully!", color="success", dismissable=True)
+                return list_items, store, alert
+            else:
+                return no_update, no_update, dbc.Alert("Failed to delete EOL definition", color="danger", dismissable=True)
+        
+        # Handle list item selection
+        elif 'eol-list-item' in trigger_id:
+            print("Handling SELECTION")
+            
+            try:
+                import json
+                trigger_obj = json.loads(trigger_id)
+                selected_name = trigger_obj.get('index')
+                
+                if selected_name:
+                    df = get_eol_definitions(project_id)
+                    list_items = build_eol_list(df, selected_name)
+                    store = {'selected_eol': selected_name}
+                    return list_items, store, None
+            except Exception as e:
+                print(f"Error handling selection: {e}")
+        
+        # Handle project change (refresh list)
+        elif trigger_id == 'list-store':
+            print("Handling PROJECT CHANGE")
+            
+            df = get_eol_definitions(project_id)
+            if df.empty:
+                return [html.P("No EOL definitions found for this project.")], {'selected_eol': None}, None
+            
+            list_items = build_eol_list(df, None)
+            store = {'selected_eol': None}
+            return list_items, store, None
+        
+        # Default: no update
+        return no_update, no_update, no_update
+    
+    # Populate form based on selected EOL
+    @app.callback(
+        [Output('eol-name-input', 'value'),
+         Output('eol-sql-definition-input', 'value'),
+         Output('eol-label-input', 'value')],
         [Input('eol-form-store', 'data')],
         [State('list-store', 'data')],
         prevent_initial_call=True
     )
-    def auto_populate_first_eol(form_store, store_data):
-        """Automatically populate form with first EOL definition when tab loads."""
-        if not form_store or not form_store.get('old_name'):
-            return no_update, no_update, no_update
-            
-        # Get current project ID from store
-        if isinstance(store_data, dict):
-            current_project_id = store_data.get('active_project_id')
-        else:
-            current_project_id = store_data[0]['id'] if store_data else None
-            
-        if not current_project_id:
-            return no_update, no_update, no_update
-            
-        eol_name = form_store.get('old_name')
-        if eol_name:
-            eol_def = get_eol_definition_by_name(eol_name, current_project_id)
-            if eol_def is not None:
-                name_val = eol_def.get('name', '') if hasattr(eol_def, 'get') else eol_def['name']
-                sql_val = eol_def.get('sql_definition', '') if hasattr(eol_def, 'get') else eol_def['sql_definition']
-                label_val = eol_def.get('label', '') if hasattr(eol_def, 'get') else eol_def.get('label', '')
-                return name_val, sql_val, label_val
-                
-        return no_update, no_update, no_update
-
-    @app.callback(
-        [Output('eol-definitions-list', 'children'),
-         Output('eol-form-store', 'data', allow_duplicate=True),
-         Output('eol-form-alert', 'children', allow_duplicate=True)],
-        [Input('list-store', 'data'),
-            Input('save-eol-button', 'n_clicks'),
-            Input('delete-eol-button', 'n_clicks'),
-            Input('tabs', 'active_tab')],
-        [State('eol-name-input', 'value'),
-            State('eol-sql-definition-input', 'value'),
-            State('eol-label-input', 'value'),
-            State('eol-form-store', 'data')],
-        prevent_initial_call='initial_duplicate'
-    )
-    def update_eol_definitions(store_data, save_clicks, delete_clicks, active_tab,
-                                name, sql_def, label, form_store):
-        """Update the EOL definitions list, dropdown, and form store on save/delete."""
-        # Only refresh when EOL Definitions tab is active
-        if active_tab != 'tab-eol':
-            return no_update, no_update, no_update
-        """Update the EOL definitions list, dropdown, and form store on save/delete."""
-        global current_project_id
-        # Determine current project
-        if isinstance(store_data, dict):
-            current_project_id = store_data.get('active_project_id')
-        else:
-            current_project_id = store_data[0]['id'] if store_data else None
-        print(f"DEBUG: current_project_id = {current_project_id}")
-        # Default: retain existing store state
-        new_form_store = form_store or {'old_name': None}
-        # If no project, nothing to do
-        if not current_project_id:
-            return [], new_form_store, None
+    def populate_eol_form(form_store, project_store):
+        """Populate form when selection changes."""
         
-        # Initialize variables for view creation feedback
-        view_creation_success = None
-        view_error_msg = None
-        operation_performed = None
+        print(f"=== POPULATE FORM ===")
+        print(f"form_store: {form_store}")
         
-        # Handle save or delete triggers
-        ctx = callback_context
-        if ctx.triggered:
-            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-            # Save: create new or update existing
-            if trigger_id == 'save-eol-button' and name and sql_def:
-                operation_performed = 'save'
-                old_name = new_form_store.get('old_name')
-                # Persist to DB
-                if old_name:
-                    update_eol_definition(old_name, name, sql_def, current_project_id, label)
-                else:
-                    create_eol_definition(name, sql_def, current_project_id, label)
-                # Also create or replace the view in the project schema
-                view_creation_success = True
-                view_error_msg = None
-                try:
-                    proj = get_project_by_id(current_project_id)
-                    if proj is not None:
-                        catalog = proj.get('catalog')
-                        schema = proj.get('schema')
-                        view_name = name
-                        # Build and execute DDL for view
-                        ddl = f"CREATE OR REPLACE VIEW {catalog}.{schema}.{view_name} AS {sql_def}"
-                        print(f"DEBUG: Creating view with DDL: {ddl}")
-                        sqlQuery(ddl)
-                        print(f"DEBUG: Successfully created view {catalog}.{schema}.{view_name}")
-                    else:
-                        view_creation_success = False
-                        view_error_msg = "Could not retrieve project details for view creation"
-                except Exception as e:
-                    view_creation_success = False
-                    view_error_msg = str(e)
-                    print(f"Error creating view for EOL '{name}': {e}")
-                # Reset form store after save
-                new_form_store = {'old_name': None}
-            # Delete
-            elif trigger_id == 'delete-eol-button' and name:
-                operation_performed = 'delete'
-                delete_eol_definition(name, current_project_id)
-                new_form_store = {'old_name': None}
-        # Fetch updated EOL definitions
-        print(f"DEBUG: Fetching EOL definitions for project_id = {current_project_id}")
-        eol_df = get_eol_definitions(current_project_id)
-        print(f"DEBUG: eol_df shape = {eol_df.shape}")
-        # If none found
-        if eol_df.empty:
-            return [html.P("No EOL definitions found for this project.")], new_form_store, None
-        # Build list items and dropdown options
-        eol_items = []
-        # Get the currently selected EOL name from form store
-        selected_eol = new_form_store.get('old_name', None)
+        if not form_store or not form_store.get('selected_eol'):
+            print("No selection - clearing form")
+            return '', '', ''
         
-        # Only auto-select first item if:
-        # 1. No current selection AND
-        # 2. This is triggered by a save/delete operation (which clears selection) OR initial load
-        ctx = callback_context
-        should_auto_select = (
-            selected_eol is None and 
-            not eol_df.empty and 
-            (not ctx.triggered or  # Initial load
-             any('save-eol-button' in str(t['prop_id']) or 'delete-eol-button' in str(t['prop_id']) 
-                 for t in ctx.triggered))  # After save/delete operations
-        )
+        # Get current project ID
+        project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
+        if not project_id:
+            return '', '', ''
         
-        if should_auto_select:
-            selected_eol = eol_df.iloc[0]['name']
-            new_form_store = {'old_name': selected_eol}
+        eol_name = form_store['selected_eol']
+        eol_def = get_eol_definition_by_name(eol_name, project_id)
         
-        for idx, (_, row) in enumerate(eol_df.iterrows()):
-            # Highlight the selected item or first item by default
-            is_active = (selected_eol == row['name'])
-            eol_items.append(
-                dbc.ListGroupItem(
-                    row['name'], id={"type": "eol-list-item", "index": row['name']},
-                    action=True, active=is_active
-                )
-            )
-        dropdown_options = [{'label': row['name'], 'value': row['name']} for _, row in eol_df.iterrows()]
-        list_group = dbc.ListGroup(eol_items, id="eol-list-group")
-        
-        # Generate alert based on any operations performed
-        alert = None
-        if operation_performed == 'save':
-            if view_creation_success:
-                alert = dbc.Alert("EOL definition and view created successfully!", color="success", dismissable=True)
-            elif view_creation_success is False:
-                alert = dbc.Alert(f"EOL definition saved, but view creation failed: {view_error_msg}", color="warning", dismissable=True)
+        if eol_def is not None and not (hasattr(eol_def, 'empty') and eol_def.empty):
+            # Handle both dict and Series formats
+            if hasattr(eol_def, 'get'):
+                name_val = eol_def.get('name', '')
+                sql_val = eol_def.get('sql_definition', '')
+                label_val = eol_def.get('label', '')
             else:
-                alert = dbc.Alert("EOL definition saved successfully!", color="success", dismissable=True)
-        elif operation_performed == 'delete':
-            alert = dbc.Alert("EOL definition deleted successfully!", color="success", dismissable=True)
-        
-        return [list_group], new_form_store, alert
-
-    # Clear alert when EOL selection changes
-    @app.callback(
-        Output('eol-form-alert', 'children', allow_duplicate=True),
-        Input('eol-form-store', 'data'),
-        prevent_initial_call=True
-    )
-    def clear_eol_alert(form_store):
-        return None
-
-
-    @app.callback(
-        [Output('eol-name-input', 'value', allow_duplicate=True),
-            Output('eol-sql-definition-input', 'value', allow_duplicate=True),
-            Output('eol-label-input', 'value', allow_duplicate=True),
-            Output('eol-form-store', 'data', allow_duplicate=True)],
-        [Input({'type': 'eol-list-item', 'index': ALL}, 'n_clicks')],
-        [State('list-store', 'data'),
-            State('eol-form-store', 'data')],
-        prevent_initial_call=True
-    )
-    def populate_eol_form(eol_clicks, store_data, form_store):
-        """Populate the EOL form when an EOL definition is selected from the list."""
-        ctx = callback_context
-        print(f"DEBUG: populate_eol_form triggered")
-        print(f"DEBUG: ctx.triggered = {ctx.triggered}")
-        
-        if not ctx.triggered:
-            print("DEBUG: No trigger, returning no_update")
-            return no_update, no_update, no_update, no_update
-        
-        # Get current project ID from store
-        if isinstance(store_data, dict):
-            current_project_id = store_data.get('active_project_id')
+                # Series format
+                name_val = eol_def['name'] if 'name' in eol_def else ''
+                sql_val = eol_def['sql_definition'] if 'sql_definition' in eol_def else ''
+                label_val = eol_def['label'] if 'label' in eol_def else ''
+            
+            print(f"Populating form with: {name_val}, {sql_val[:50] if sql_val else ''}..., {label_val}")
+            return name_val, sql_val, label_val
         else:
-            current_project_id = store_data[0]['id'] if store_data else None
-        
-        print(f"DEBUG: current_project_id = {current_project_id}")
-        
-        if not current_project_id:
-            print("DEBUG: No current_project_id, returning no_update")
-            return no_update, no_update, no_update, no_update
-        
-        # Identify which EOL list item was clicked
-        trigger = ctx.triggered[0]['prop_id']
-        clean_id = trigger.split('.', 1)[0]
-        try:
-            import json
-            trigger_obj = json.loads(clean_id)
-        except Exception as e:
-            print(f"DEBUG: Could not parse trigger id '{clean_id}' as JSON: {e}")
-            return no_update, no_update, no_update, form_store
-        # Only handle clicks on eol-list-item entries
-        if trigger_obj.get('type') == 'eol-list-item':
-            eol_name = trigger_obj.get('index')
-            print(f"DEBUG: Selected EOL definition = {eol_name}")
-            eol_def = get_eol_definition_by_name(eol_name, current_project_id)
-            if eol_def is not None:
-                # Populate form fields and update store with old_name
-                name_val = eol_def.get('name', '') if hasattr(eol_def, 'get') else eol_def['name']
-                sql_val = eol_def.get('sql_definition', '') if hasattr(eol_def, 'get') else eol_def['sql_definition']
-                label_val = eol_def.get('label', '') if hasattr(eol_def, 'get') else eol_def.get('label', '')
-                print(f"DEBUG: Returning name='{name_val}', sql_definition={sql_val[:50]}..., label='{label_val}'")
-                return name_val, sql_val, label_val, {'old_name': eol_name}
-        # Fallback: do not update
-        print("DEBUG: No valid EOL item selected or definition not found, no_update")
-        return no_update, no_update, no_update, form_store
+            print("EOL definition not found")
+            return '', '', ''
 
-    @app.callback(
-        [Output('eol-name-input', 'value', allow_duplicate=True),
-            Output('eol-sql-definition-input', 'value', allow_duplicate=True),
-            Output('eol-label-input', 'value', allow_duplicate=True)],
-        Input('save-eol-button', 'n_clicks'),
-        prevent_initial_call=True
-    )
-    def clear_eol_form_after_save(n_clicks):
-        """Reset the EOL form to initial state after saving."""
-        if n_clicks:
-            # Set name back to 'new' and clear SQL definition and label
-            return 'new', '', ''
-        return no_update, no_update, no_update
 
-    @app.callback(
-        [Output('eol-name-input', 'value', allow_duplicate=True),
-            Output('eol-sql-definition-input', 'value', allow_duplicate=True),
-            Output('eol-label-input', 'value', allow_duplicate=True),
-            Output('eol-form-store', 'data', allow_duplicate=True)],
-        Input('new-eol-button', 'n_clicks'),
-        prevent_initial_call=True
-    )
-    def new_eol_definition(n_clicks):
-        """Reset form for creating a new EOL definition."""
-        if n_clicks:
-            # Reset inputs and clear old_name
-            return 'new', '', '', {'old_name': None}
-        return no_update, no_update, no_update, no_update
+def build_eol_list(eol_df, selected_name):
+    """Helper function to build the EOL list items."""
+    if eol_df.empty:
+        return [html.P("No EOL definitions found for this project.")]
+    
+    eol_items = []
+    for _, row in eol_df.iterrows():
+        is_active = (selected_name == row['name'])
+        eol_items.append(
+            dbc.ListGroupItem(
+                row['name'], 
+                id={"type": "eol-list-item", "index": row['name']},
+                action=True, 
+                active=is_active
+            )
+        )
+    
+    return [dbc.ListGroup(eol_items, id="eol-list-group")]

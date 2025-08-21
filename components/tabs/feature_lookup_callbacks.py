@@ -4,7 +4,7 @@ from dash import Input, Output, State, callback_context, ALL, html
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 
-from utils.db import (
+from utils.db_universal import (
     get_feature_lookups,
     get_feature_lookup_by_id,
     create_feature_lookup,
@@ -13,7 +13,9 @@ from utils.db import (
     get_eol_definitions,
     get_eol_definition_by_id,
     get_eol_view_columns,
-    get_eol_view_timestamp_columns,
+    get_eol_view_timestamp_columns
+)
+from utils.db_metadata import (
     get_catalogs,
     get_schemas,
     get_tables,
@@ -27,9 +29,10 @@ def register_feature_lookup_callbacks(app):
     @app.callback(
         Output('feature-lookup-store', 'data', allow_duplicate=True),
         Input('list-store', 'data'),
+        State('feature-lookup-store', 'data'),
         prevent_initial_call=True
     )
-    def refresh_feature_lookup_store_on_project_change(project_store):
+    def refresh_feature_lookup_store_on_project_change(project_store, current_feature_lookup_store):
         """Refresh feature lookup store when project selection changes."""
         project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
         
@@ -43,11 +46,25 @@ def register_feature_lookup_callbacks(app):
                 for rec in records
             ]
         
-        # Set first item as active, or None if no items
-        active_id = items[0]['id'] if items else None
-        print(f"refresh_feature_lookup_store_on_project_change - project_id: {project_id}, found {len(items)} feature lookups")
+        # Preserve current selection if it exists and is still valid, otherwise auto-select first item
+        # But don't auto-select if we're in "create mode"
+        current_active_id = current_feature_lookup_store.get('active_id') if current_feature_lookup_store else None
+        in_create_mode = current_feature_lookup_store.get('create_mode', False) if current_feature_lookup_store else False
         
-        return {'items': items, 'active_id': active_id}
+        # Check if current selection is still valid in the new items list
+        if current_active_id and any(item['id'] == current_active_id for item in items):
+            active_id = current_active_id  # Preserve existing selection
+            create_mode = False  # Clear create mode when we have a valid selection
+        elif in_create_mode:
+            active_id = None  # Preserve None selection in create mode
+            create_mode = True  # Keep create mode flag
+        else:
+            active_id = None  # Don't auto-select - let user or other callbacks handle selection
+            create_mode = False
+            
+        print(f"refresh_feature_lookup_store_on_project_change - project_id: {project_id}, found {len(items)} feature lookups, preserving active_id: {active_id}, create_mode: {create_mode}")
+        
+        return {'items': items, 'active_id': active_id, 'create_mode': create_mode}
     
     # Populate EOL definitions dropdown based on selected project
     @app.callback(
@@ -55,41 +72,50 @@ def register_feature_lookup_callbacks(app):
         Input('list-store', 'data')
     )
     def update_eol_dropdown(store_data):
-        print(f"DEBUG: update_eol_dropdown called with store_data: {store_data}")
+        print(f"DEBUG: feature_lookup update_eol_dropdown called with store_data: {store_data}")
         project_id = None
         if isinstance(store_data, dict):
             project_id = store_data.get('active_project_id')
         elif isinstance(store_data, list) and len(store_data) > 0:
             project_id = store_data[0].get('id') if store_data[0] else None
         
-        print(f"DEBUG: update_eol_dropdown project_id: {project_id}")
+        print(f"DEBUG: feature_lookup update_eol_dropdown project_id: {project_id}")
         
         # Fetch EOL definitions for project
         if not project_id:
-            print("DEBUG: No project_id found, returning empty options")
+            print("DEBUG: feature_lookup - No project_id found, returning empty options")
             return []
         
-        df = get_eol_definitions(project_id)
-        print(f"DEBUG: get_eol_definitions returned {len(df)} rows")
-        
-        if df.empty:
-            print("DEBUG: No EOL definitions found for project")
+        try:
+            df = get_eol_definitions(project_id)
+            print(f"DEBUG: feature_lookup - get_eol_definitions returned {len(df)} rows")
+            
+            if df.empty:
+                print("DEBUG: feature_lookup - No EOL definitions found for project")
+                return []
+            
+            print(f"DEBUG: feature_lookup - DataFrame columns: {df.columns.tolist()}")
+            
+            # Build dropdown options: label=name, value=id
+            opts = []
+            for idx, row in df.iterrows():
+                try:
+                    val = int(row['id'])
+                    name = row.get('name')
+                    print(f"DEBUG: feature_lookup - Adding EOL option: {name} (id={val})")
+                    opts.append({'label': name, 'value': val})
+                except Exception as e:
+                    print(f"DEBUG: feature_lookup - Error processing row at index {idx}: {e}")
+                    print(f"DEBUG: feature_lookup - Row data: {row.to_dict()}")
+                    continue
+            
+            print(f"DEBUG: feature_lookup - Returning {len(opts)} EOL dropdown options: {opts}")
+            return opts
+        except Exception as e:
+            print(f"ERROR: feature_lookup - Exception in update_eol_dropdown: {e}")
+            import traceback
+            traceback.print_exc()
             return []
-        
-        # Build dropdown options: label=name, value=id
-        opts = []
-        for _, row in df.iterrows():
-            try:
-                val = int(row['id'])
-                name = row.get('name')
-                print(f"DEBUG: Adding EOL option: {name} (id={val})")
-                opts.append({'label': name, 'value': val})
-            except Exception as e:
-                print(f"DEBUG: Error processing row {row}: {e}")
-                continue
-        
-        print(f"DEBUG: Returning {len(opts)} EOL dropdown options")
-        return opts
     # Populate catalog dropdown for table selection
     @app.callback(
         Output('feature-lookup-catalog-dropdown', 'options'),
@@ -564,43 +590,54 @@ def register_feature_lookup_callbacks(app):
         print(f"select_feature_lookup - Selected feature lookup id: {fl_id}")
         
         # Just update the store - form population will be handled by populate_feature_lookup_form
-        return {'items': items, 'active_id': fl_id}
+        # Clear create_mode when selecting an item
+        return {'items': items, 'active_id': fl_id, 'create_mode': False}
 
     @app.callback(
-        Output('feature-lookup-store', 'data', allow_duplicate=True),
+        [Output('feature-lookup-name', 'value', allow_duplicate=True),
+         Output('feature-lookup-eol-dropdown', 'value', allow_duplicate=True),
+         Output('feature-lookup-store', 'data', allow_duplicate=True)],
         Input('create-feature-lookup-button', 'n_clicks'),
+        State('feature-lookup-store', 'data'),
         State('list-store', 'data'),
         prevent_initial_call=True
     )
-    def create_fl_callback(n_clicks, project_store):
-        # Determine current project
-        project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
-        if project_id is None:
-            # Nothing to do if no project selected
-            return dash.no_update
+    def create_feature_lookup_callback(n_clicks, feature_lookup_store, list_store):
+        """Create a new feature lookup with default values when Create button is clicked."""
+        if not n_clicks:
+            raise PreventUpdate
             
-        # Create feature lookup with default values (like projects tab)
-        default_name = "New Feature Lookup"
-        default_eol_id = None  # No EOL definition selected by default
-        default_features = []  # No tables/features by default
+        # Get current project ID
+        project_id = list_store.get('active_project_id') if isinstance(list_store, dict) else None
+        if not project_id:
+            print("No active project for new feature lookup")
+            raise PreventUpdate
+            
+        # Create a new feature lookup with default values
+        new_fl_id = create_feature_lookup(
+            name="New Feature Lookup",
+            eol_id=None,
+            project_id=project_id,
+            features=[]
+        )
         
-        # Create feature lookup in DB with defaults
-        if not create_feature_lookup(project_id, default_eol_id, default_name, default_features):
-            return dash.no_update
-            
-        # Refresh the list of feature lookups from database
+        if new_fl_id is None:
+            print("Failed to create new feature lookup")
+            raise PreventUpdate
+        
+        # Refresh the feature lookup list
         df = get_feature_lookups(project_id)
-        records = df.to_dict('records') if not df.empty else []
-        items = [
-            {'id': int(rec['id']), 'name': rec.get('name'), 'eol_id': rec.get('eol_id'), 'features': rec.get('features')}
-            for rec in records
-        ]
+        items = []
+        if not df.empty:
+            records = df.to_dict('records')
+            items = [
+                {'id': int(rec['id']), 'name': rec.get('name'), 'eol_id': rec.get('eol_id'), 'features': rec.get('features')}
+                for rec in records
+            ]
         
-        # Find the newly created feature lookup (should be the last one)
-        new_feature_lookup_id = items[-1]['id'] if items else None
-        
-        # Set the newly created feature lookup as active (like projects tab)
-        return {'items': items, 'active_id': new_feature_lookup_id}
+        # Select the newly created feature lookup and return form values
+        store_data = {'items': items, 'active_id': new_fl_id, 'create_mode': False}
+        return "New Feature Lookup", None, store_data
 
     @app.callback(
         Output('feature-lookup-name', 'value', allow_duplicate=True),
@@ -675,15 +712,14 @@ def register_feature_lookup_callbacks(app):
                     cols = tbl_entry.get('features', [])
                     lookup_key = tbl_entry.get('lookup_key')
                     timestamp_key = tbl_entry.get('timestamp_key')
-                    # Store as properly formatted JSON string with all fields
-                    import json
+                    # Store as dictionary - let the DB function handle JSON encoding
                     entry_dict = {
                         'table': table_name, 
                         'features': cols,
                         'lookup_key': lookup_key,
                         'timestamp_key': timestamp_key
                     }
-                    feats.append(json.dumps(entry_dict))
+                    feats.append(entry_dict)
                 else:
                     # Store as simple string (backward compatibility)
                     feats.append(str(tbl_entry))
@@ -706,7 +742,7 @@ def register_feature_lookup_callbacks(app):
         ]
         
         alert = dbc.Alert("Feature lookup updated successfully!", color="success", dismissable=True)
-        return {'items': items, 'active_id': fl_id}, alert
+        return {'items': items, 'active_id': fl_id, 'create_mode': False}, alert
 
     # Clear alert when feature lookup selection changes
     @app.callback(
@@ -738,4 +774,4 @@ def register_feature_lookup_callbacks(app):
             for rec in records
         ]
         active_id = items[0]['id'] if items else None
-        return {'items': items, 'active_id': active_id}
+        return {'items': items, 'active_id': active_id, 'create_mode': False}

@@ -3,7 +3,7 @@ from dash import html, dcc
 from dash.dependencies import Input, Output, State
 import requests
 import json
-from utils.db import get_projects
+from utils.db_universal import get_projects
 
 # Helper function to fetch notebook files from GitHub
 def fetch_notebook_files_from_github(github_repo_url: str, folder_path: str = "notebooks") -> list[dict]:

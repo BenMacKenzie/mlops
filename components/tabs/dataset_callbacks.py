@@ -3,7 +3,7 @@ from dash import Input, Output, State, callback_context, ALL
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 
-from utils.db import (
+from utils.db_universal import (
     get_datasets,
     get_dataset_by_id,
     create_dataset,
@@ -13,7 +13,8 @@ from utils.db import (
     get_feature_lookup_by_id,
     get_eol_definition_by_id,
     get_project_by_id,
-    update_dataset_run_info
+    update_dataset_run_info,
+    update_dataset_materialized_status
 )
 import yaml
 from databricks.sdk import WorkspaceClient
@@ -45,6 +46,7 @@ def register_dataset_callbacks(app):
                     'feature_lookup_id': rec.get('feature_lookup_id'),
                     'evaluation_type': rec.get('evaluation_type'),
                     'percentage': rec.get('percentage'),
+                    'status': rec.get('status', 'NOT_STARTED'),
                     'materialized': rec.get('materialized'),
                     'training_table_name': rec.get('training_table_name'),
                     'eval_table_name': rec.get('eval_table_name'),
@@ -55,17 +57,25 @@ def register_dataset_callbacks(app):
             ]
         
         # Preserve current selection if it exists and is still valid, otherwise auto-select first item
+        # But don't auto-select if we're in "create mode"
         current_active_id = current_dataset_store.get('active_id') if current_dataset_store else None
+        in_create_mode = current_dataset_store.get('create_mode', False) if current_dataset_store else False
         
         # Check if current selection is still valid in the new items list
         if current_active_id and any(item['id'] == current_active_id for item in items):
             active_id = current_active_id  # Preserve existing selection
+            create_mode = False  # Clear create mode when we have a valid selection
+        elif in_create_mode:
+            active_id = None  # Preserve None selection in create mode
+            create_mode = True  # Keep create mode flag
         else:
-            active_id = items[0]['id'] if items else None  # Auto-select only when necessary
+            active_id = None  # Don't auto-select - let user or other callbacks handle selection
+            create_mode = False
         
-        print(f"refresh_dataset_store_on_project_change - project_id: {project_id}, found {len(items)} datasets, preserving active_id: {active_id}")
+        print(f"DEBUG: refresh_dataset_store_on_project_change - project_id: {project_id}, found {len(items)} datasets, preserving active_id: {active_id}, create_mode: {create_mode}")
+        print(f"DEBUG: refresh_dataset_store_on_project_change - incoming current_active_id: {current_active_id}")
         
-        return {'items': items, 'active_id': active_id}
+        return {'items': items, 'active_id': active_id, 'create_mode': create_mode}
     
     # Populate feature lookup dropdown based on selected project
     @app.callback(
@@ -73,7 +83,7 @@ def register_dataset_callbacks(app):
         Input('list-store', 'data')
     )
     def update_feature_lookup_dropdown(store_data):
-        print(f"DEBUG: update_feature_lookup_dropdown called with store_data: {store_data}")
+        print(f"DEBUG: dataset update_feature_lookup_dropdown called with store_data: {store_data}")
         project_id = None
         if isinstance(store_data, dict):
             project_id = store_data.get('active_project_id')
@@ -81,34 +91,40 @@ def register_dataset_callbacks(app):
             # Handle list format (happens on initial load sometimes)
             project_id = store_data[0].get('id') if store_data[0] else None
         
-        print(f"DEBUG: update_feature_lookup_dropdown project_id: {project_id}")
+        print(f"DEBUG: dataset update_feature_lookup_dropdown project_id: {project_id}")
         
         # Fetch feature lookups for project
         if not project_id:
-            print("DEBUG: No project_id found, returning empty options")
+            print("DEBUG: dataset - No project_id found, returning empty options")
             return []
         
-        df = get_feature_lookups(project_id)
-        print(f"DEBUG: get_feature_lookups returned {len(df)} rows")
-        
-        if df.empty:
-            print("DEBUG: No feature lookups found for project")
+        try:
+            df = get_feature_lookups(project_id)
+            print(f"DEBUG: dataset - get_feature_lookups returned {len(df)} rows")
+            
+            if df.empty:
+                print("DEBUG: dataset - No feature lookups found for project")
+                return []
+            
+            # Build dropdown options: label=name, value=id
+            opts = []
+            for _, row in df.iterrows():
+                try:
+                    val = int(row['id'])
+                    name = row.get('name')
+                    print(f"DEBUG: dataset - Adding feature lookup option: {name} (id={val})")
+                    opts.append({'label': name, 'value': val})
+                except Exception as e:
+                    print(f"DEBUG: dataset - Error processing row {row}: {e}")
+                    continue
+            
+            print(f"DEBUG: dataset - Returning {len(opts)} feature lookup dropdown options: {opts}")
+            return opts
+        except Exception as e:
+            print(f"ERROR: dataset - Exception in update_feature_lookup_dropdown: {e}")
+            import traceback
+            traceback.print_exc()
             return []
-        
-        # Build dropdown options: label=name, value=id
-        opts = []
-        for _, row in df.iterrows():
-            try:
-                val = int(row['id'])
-                name = row.get('name')
-                print(f"DEBUG: Adding feature lookup option: {name} (id={val})")
-                opts.append({'label': name, 'value': val})
-            except Exception as e:
-                print(f"DEBUG: Error processing row {row}: {e}")
-                continue
-        
-        print(f"DEBUG: Returning {len(opts)} feature lookup dropdown options")
-        return opts
 
     @app.callback(
         Output('dataset-list', 'children'),
@@ -157,68 +173,120 @@ def register_dataset_callbacks(app):
         print(f"select_dataset - Selected dataset id: {dataset_id}")
         
         # Just update the store - form population will be handled by populate_dataset_form
-        return {'items': items, 'active_id': dataset_id}
+        # Clear create_mode when selecting an item
+        return {'items': items, 'active_id': dataset_id, 'create_mode': False}
 
     @app.callback(
-        Output('dataset-store', 'data', allow_duplicate=True),
+        [Output('dataset-name', 'value', allow_duplicate=True),
+         Output('dataset-feature-lookup-dropdown', 'value', allow_duplicate=True),
+         Output('dataset-evaluation-type-dropdown', 'value', allow_duplicate=True),
+         Output('dataset-percentage', 'value', allow_duplicate=True),
+         Output('dataset-status-display', 'children', allow_duplicate=True),
+         Output('dataset-status-display', 'color', allow_duplicate=True),
+         Output('dataset-run-id', 'value', allow_duplicate=True),
+         Output('dataset-run-url', 'value', allow_duplicate=True),
+         Output('dataset-run-url-link', 'href', allow_duplicate=True),
+         Output('dataset-run-url-link', 'style', allow_duplicate=True),
+         Output('dataset-run-url-placeholder', 'style', allow_duplicate=True),
+         Output('dataset-training-table', 'value', allow_duplicate=True),
+         Output('dataset-eval-table', 'value', allow_duplicate=True),
+         Output('materialize-dataset-button', 'disabled', allow_duplicate=True),
+         Output('dataset-store', 'data', allow_duplicate=True)],
         Input('create-dataset-button', 'n_clicks'),
+        State('dataset-store', 'data'),
         State('list-store', 'data'),
         prevent_initial_call=True
     )
-    def create_dataset_callback(n_clicks, project_store):
-        # Determine current project
-        project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
-        if project_id is None:
-            # Nothing to do if no project selected
-            return dash.no_update
+    def create_dataset_callback(n_clicks, dataset_store, list_store):
+        """Create a new dataset with default values when Create button is clicked."""
+        if not n_clicks:
+            raise PreventUpdate
             
-        # Get the first available feature lookup for this project as default
-        feature_lookups_df = get_feature_lookups(project_id)
-        if feature_lookups_df.empty:
-            print("No feature lookups available for this project - cannot create dataset")
-            return dash.no_update
-        
-        default_feature_lookup_id = int(feature_lookups_df.iloc[0]['id'])
-        
-        # Create dataset with default values (like projects tab)
-        default_name = "New Dataset"
-        default_evaluation_type = "random"
-        default_percentage = 80.0
-        default_materialized = False
-        
-        # Create dataset in DB with defaults
-        if not create_dataset(project_id, default_feature_lookup_id, default_name, default_evaluation_type, default_percentage, default_materialized):
-            return dash.no_update
+        # Get current project ID
+        project_id = list_store.get('active_project_id') if isinstance(list_store, dict) else None
+        if not project_id:
+            print("No active project for new dataset")
+            raise PreventUpdate
             
-        # Refresh the list of datasets from database
+        # Get available feature lookups for this project
+        fl_df = get_feature_lookups(project_id)
+        if fl_df.empty:
+            # Can't create dataset without a feature lookup - show error alert
+            print("Cannot create dataset: No feature lookups available for this project")
+            raise PreventUpdate
+        
+        # Use the first available feature lookup as default
+        default_fl_id = int(fl_df.iloc[0]['id'])
+        
+        # Find a unique name for the new dataset
         df = get_datasets(project_id)
-        records = df.to_dict('records') if not df.empty else []
-        items = [
-            {
-                'id': int(rec['id']), 
-                'name': rec.get('name'),
-                'feature_lookup_id': rec.get('feature_lookup_id'),
-                'evaluation_type': rec.get('evaluation_type'),
-                'percentage': rec.get('percentage'),
-                'materialized': rec.get('materialized'),
-                'training_table_name': rec.get('training_table_name'),
-                'eval_table_name': rec.get('eval_table_name')
-            }
-            for rec in records
-        ]
+        existing_names = df['name'].tolist() if not df.empty else []
         
-        # Find the newly created dataset (should be the last one)
-        new_dataset_id = items[-1]['id'] if items else None
+        counter = 1
+        new_name = "New Dataset"
+        while new_name in existing_names:
+            counter += 1
+            new_name = f"New Dataset {counter}"
         
-        # Set the newly created dataset as active (like projects tab)
-        return {'items': items, 'active_id': new_dataset_id}
+        success = create_dataset(
+            project_id=project_id,
+            feature_lookup_id=default_fl_id,  # Use first available feature lookup
+            name=new_name,
+            evaluation_type="random",
+            percentage=80.0,
+            materialized=False  # New datasets are not materialized by default
+        )
+        
+        if not success:
+            print("Failed to create new dataset")
+            raise PreventUpdate
+        
+        # Refresh the dataset list and find the newly created item
+        df = get_datasets(project_id)
+        items = []
+        new_dataset_id = None
+        
+        if not df.empty:
+            records = df.to_dict('records')
+            for rec in records:
+                item = {
+                    'id': int(rec['id']), 
+                    'name': rec.get('name'),
+                    'feature_lookup_id': rec.get('feature_lookup_id'),
+                    'evaluation_type': rec.get('evaluation_type'),
+                    'percentage': rec.get('percentage'),
+                    'status': rec.get('status', 'NOT_STARTED'),
+                    'materialized': rec.get('materialized', False),
+                    'run_id': rec.get('run_id'),
+                    'run_url': rec.get('run_url'),
+                    'training_table_name': rec.get('training_table_name'),
+                    'eval_table_name': rec.get('eval_table_name')
+                }
+                items.append(item)
+                
+                # Find the newly created dataset by name
+                if rec.get('name') == new_name:
+                    new_dataset_id = int(rec['id'])
+        
+        # Select the newly created dataset and return form values
+        if new_dataset_id:
+            store_data = {'items': items, 'active_id': new_dataset_id, 'create_mode': False}
+        else:
+            # Fallback - select the last item if we can't find by name
+            new_dataset_id = items[-1]['id'] if items else None
+            store_data = {'items': items, 'active_id': new_dataset_id, 'create_mode': False}
+        
+        # Return form values for the new dataset
+        return (new_name, default_fl_id, "random", 80.0, "NOT_STARTED", "secondary", '', '', '#', 
+                {'display': 'none'}, {'display': 'inline'}, '', '', True, store_data)
 
     @app.callback(
         Output('dataset-name', 'value'),
         Output('dataset-feature-lookup-dropdown', 'value'),
         Output('dataset-evaluation-type-dropdown', 'value'),
         Output('dataset-percentage', 'value'),
-        Output('dataset-materialized', 'value'),
+        Output('dataset-status-display', 'children'),
+        Output('dataset-status-display', 'color'),
         Output('dataset-run-id', 'value'),
         Output('dataset-run-url', 'value'),
         Output('dataset-run-url-link', 'href'),
@@ -233,14 +301,14 @@ def register_dataset_callbacks(app):
     def populate_dataset_form(store_data):
         """Populate form inputs when the dataset store updates (like projects tab)."""
         if not isinstance(store_data, dict):
-            return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
+            return '', None, None, None, "NOT_STARTED", "secondary", '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
             
         active_id = store_data.get('active_id')
         items = store_data.get('items', [])
         
         # If no active selection, clear the form
         if active_id is None or not items:
-            return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
+            return '', None, None, None, "NOT_STARTED", "secondary", '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
             
         # Find the selected dataset
         for rec in items:
@@ -249,6 +317,7 @@ def register_dataset_callbacks(app):
                 feature_lookup_id = rec.get('feature_lookup_id')
                 evaluation_type = rec.get('evaluation_type')
                 percentage = rec.get('percentage')
+                status = rec.get('status', 'NOT_STARTED')
                 materialized = rec.get('materialized', False)
                 run_id = rec.get('run_id') or ''
                 run_url = rec.get('run_url') or ''
@@ -263,13 +332,25 @@ def register_dataset_callbacks(app):
                     link_style = {'display': 'none'}
                     placeholder_style = {'display': 'inline'}
                 
-                # Disable materialize button if dataset is already materialized
-                materialize_disabled = materialized
+                # Disable materialize button if dataset is already materialized (status = SUCCESS)
+                materialize_disabled = (status == 'SUCCESS')
                 
-                return name, feature_lookup_id, evaluation_type, percentage, materialized, run_id, run_url, run_url, link_style, placeholder_style, training_table, eval_table, materialize_disabled
+                # Set badge color based on status
+                status_colors = {
+                    'NOT_STARTED': 'secondary',
+                    'PENDING': 'warning',
+                    'RUNNING': 'info',
+                    'SUCCESS': 'success',
+                    'FAILED': 'danger',
+                    'TERMINATED': 'dark',
+                    'SKIPPED': 'light'
+                }
+                badge_color = status_colors.get(status, 'secondary')
+                
+                return name, feature_lookup_id, evaluation_type, percentage, status, badge_color, run_id, run_url, run_url, link_style, placeholder_style, training_table, eval_table, materialize_disabled
         
         # If no matching record found, clear the form
-        return '', None, None, None, False, '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
+        return '', None, None, None, "NOT_STARTED", "secondary", '', '', '#', {'display': 'none'}, {'display': 'inline'}, '', '', True
 
     @app.callback(
         Output('dataset-store', 'data', allow_duplicate=True),
@@ -279,16 +360,16 @@ def register_dataset_callbacks(app):
         State('dataset-feature-lookup-dropdown', 'value'),
         State('dataset-evaluation-type-dropdown', 'value'),
         State('dataset-percentage', 'value'),
-        State('dataset-materialized', 'value'),
         State('list-store', 'data'),
         prevent_initial_call=True
     )
-    def update_dataset_callback(n_clicks, store_data, name, feature_lookup_id, evaluation_type, percentage, materialized, project_store):
+    def update_dataset_callback(n_clicks, store_data, name, feature_lookup_id, evaluation_type, percentage, project_store):
         dataset_id = store_data.get('active_id') if isinstance(store_data, dict) else None
         if dataset_id is None or not name:
             return dash.no_update
         
-        if not update_dataset(dataset_id, name, feature_lookup_id, evaluation_type, percentage, materialized):
+        # Update only user-editable fields - materialized status is controlled by materialize job
+        if not update_dataset(dataset_id, name, feature_lookup_id, evaluation_type, percentage):
             return dash.no_update
             
         # Refresh the list from database
@@ -302,13 +383,15 @@ def register_dataset_callbacks(app):
                 'feature_lookup_id': rec.get('feature_lookup_id'),
                 'evaluation_type': rec.get('evaluation_type'),
                 'percentage': rec.get('percentage'),
+                'status': rec.get('status', 'NOT_STARTED'),
                 'materialized': rec.get('materialized'),
                 'training_table_name': rec.get('training_table_name'),
                 'eval_table_name': rec.get('eval_table_name')
             }
             for rec in records
         ]
-        return {'items': items, 'active_id': dataset_id}
+        print(f"DEBUG: update_dataset_callback returning store with active_id={dataset_id}, items={len(items)}")
+        return {'items': items, 'active_id': dataset_id, 'create_mode': False}
 
     @app.callback(
         Output('dataset-store', 'data', allow_duplicate=True),
@@ -335,15 +418,16 @@ def register_dataset_callbacks(app):
                 'feature_lookup_id': rec.get('feature_lookup_id'),
                 'evaluation_type': rec.get('evaluation_type'),
                 'percentage': rec.get('percentage'),
+                'status': rec.get('status', 'NOT_STARTED'),
                 'materialized': rec.get('materialized'),
                 'training_table_name': rec.get('training_table_name'),
                 'eval_table_name': rec.get('eval_table_name')
             }
             for rec in records
         ]
-        # After deletion, auto-select first item if any exist
-        new_active_id = items[0]['id'] if items else None
-        return {'items': items, 'active_id': new_active_id}
+        # After deletion, don't auto-select anything
+        new_active_id = None
+        return {'items': items, 'active_id': new_active_id, 'create_mode': False}
     
     @app.callback(
         Output('dataset-store', 'data', allow_duplicate=True),
@@ -425,13 +509,25 @@ def register_dataset_callbacks(app):
         print(f"DEBUG: EOL definition: {eol_def}")
         print(f"DEBUG: Label column extracted: '{label_column}' (type: {type(label_column)})")
         
+        # Get features data from feature lookup and convert to JSON
+        features_data = feature_lookup.get('features', [])
+        feature_lookup_name = feature_lookup.get('name', '')
+        print(f"DEBUG: Features data from lookup: {features_data}")
+        print(f"DEBUG: Feature lookup name: {feature_lookup_name}")
+        
+        # Convert features to JSON string
+        import json
+        features_json = json.dumps(features_data)
+        print(f"DEBUG: Features JSON: {features_json}")
+        
         # Define job parameters
         parameters = {
             "app_catalog_name": app_catalog_name,
             "app_schema_name": app_schema_name,
             "project_catalog_name": project_catalog_name,
             "project_schema_name": project_schema_name,
-            "feature_lookup_id": str(feature_lookup_id),
+            "features": features_json,
+            "name": feature_lookup_name,
             "eol_view": eol_view,
             "dataset_id": str(dataset_id),
             "label": label_column
@@ -460,12 +556,13 @@ def register_dataset_callbacks(app):
             
             run_url = f"{databricks_host}/jobs/{job_id}/runs/{run.run_id}"
             
-            # Update the dataset record immediately (table names will be updated when job completes)
-            from utils.db import update_dataset_run_info
+            # Update the dataset record immediately with PENDING status
+            from utils.db_universal import update_dataset_run_info
             update_success = update_dataset_run_info(
                 dataset_id=dataset_id,
                 run_id=str(run.run_id),
-                run_url=run_url
+                run_url=run_url,
+                status='PENDING'
             )
             
             if not update_success:
@@ -494,6 +591,12 @@ def register_dataset_callbacks(app):
                         except Exception as get_run_error:
                             print(f"Could not get run details: {get_run_error}")
                             return  # Exit early if we can't even get run details
+                    
+                    # Determine final status based on job result
+                    if job_succeeded:
+                        final_status = 'SUCCESS'
+                    else:
+                        final_status = 'FAILED'
                     
                     # Only try to extract table names if job succeeded
                     training_table_name = None
@@ -565,26 +668,30 @@ def register_dataset_callbacks(app):
                                         except Exception as e:
                                             print(f"Error getting output for task {task_run_id}: {e}")
                         
-                            # Update dataset record with table names if found
-                            if training_table_name or eval_table_name:
-                                print(f"Updating dataset {dataset_id} with table names: train={training_table_name}, eval={eval_table_name}")
-                                update_dataset_run_info(
-                                    dataset_id=dataset_id,
-                                    run_id=str(run.run_id),
-                                    run_url=run_url,
-                                    training_table_name=training_table_name,
-                                    eval_table_name=eval_table_name
-                                )
-                            else:
-                                print(f"No table names found in job output for dataset {dataset_id}")
+                            # Update dataset record with table names and SUCCESS status
+                            print(f"Updating dataset {dataset_id} with status=SUCCESS and table names: train={training_table_name}, eval={eval_table_name}")
+                            update_dataset_run_info(
+                                dataset_id=dataset_id,
+                                run_id=str(run.run_id),
+                                run_url=run_url,
+                                status='SUCCESS',
+                                training_table_name=training_table_name,
+                                eval_table_name=eval_table_name
+                            )
                                 
                         except Exception as e:
                             print(f"Error extracting table names from job output: {e}")
                             import traceback
                             traceback.print_exc()
                     else:
-                        # Job failed - we already logged the error, no table names to extract
-                        print(f"Job failed for dataset {dataset_id}, skipping table name extraction")
+                        # Job failed - update status to FAILED
+                        print(f"Job failed for dataset {dataset_id}, updating status to FAILED")
+                        update_dataset_run_info(
+                            dataset_id=dataset_id,
+                            run_id=str(run.run_id),
+                            run_url=run_url,
+                            status='FAILED'
+                        )
                         
                 except Exception as e:
                     print(f"Error in background job polling: {e}")
@@ -597,7 +704,7 @@ def register_dataset_callbacks(app):
             
             # Refresh dataset store to reflect changes
             try:
-                from utils.db import get_datasets
+                from utils.db_universal import get_datasets
                 project_id = project_store.get('active_project_id') if isinstance(project_store, dict) else None
                 if project_id:
                     records = get_datasets(project_id)
@@ -608,6 +715,7 @@ def register_dataset_callbacks(app):
                             'feature_lookup_id': rec.get('feature_lookup_id'),
                             'evaluation_type': rec.get('evaluation_type'),
                             'percentage': rec.get('percentage'),
+                            'status': rec.get('status', 'NOT_STARTED'),
                             'materialized': rec.get('materialized', False),
                             'run_id': rec.get('run_id'),
                             'run_url': rec.get('run_url'),

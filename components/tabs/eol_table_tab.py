@@ -3,7 +3,7 @@ from dash import html
 import pandas as pd
 from dash import html, dcc, Input, Output, State, no_update, ALL, callback_context
 import dash_bootstrap_components as dbc
-from utils.db import sqlQuery, get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
+from utils.db_universal import sqlQuery, get_eol_definitions, create_eol_definition, delete_eol_definition, get_eol_definition_by_name, update_eol_definition, get_project_by_id
 import yaml, json
 import yaml
 
@@ -46,8 +46,8 @@ def create_eol_definition_layout():
                         ),
                     ], className="mb-3"),
                     html.Div([
-                        dbc.Button("New EOL Definition", id='new-eol-button', color='secondary', className='me-2'),
-                        dbc.Button("Save EOL Definition", id='save-eol-button', color='success', className='me-2'),
+                        dbc.Button("Create EOL Definition", id='create-eol-button', color='success', className='me-2'),
+                        dbc.Button("Update EOL Definition", id='update-eol-button', color='primary', className='me-2'),
                         dbc.Button("Delete EOL Definition", id='delete-eol-button', color='danger'),
                     ], className="mt-3"),
                     html.Div(id='eol-form-alert', className='mt-3')

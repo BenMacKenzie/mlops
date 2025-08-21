@@ -14,7 +14,7 @@ def list_projects():
     print("=" * 50)
     
     try:
-        from utils.db import get_projects
+        from utils.db_universal import get_projects
         
         projects_df = get_projects()
         

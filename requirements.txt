@@ -8,3 +8,4 @@ python-dotenv
 dash-ag-grid
 mlflow
 PyYAML
+psycopg2

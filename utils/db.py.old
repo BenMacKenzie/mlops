@@ -571,81 +571,8 @@ def update_dataset_run_info(dataset_id: int, run_id: str, run_url: str, training
         print(f"Error updating dataset run info: {e}")
         return False
   
-# -----------------------------------------------------------------------------
-# Fetch all table names from the configured catalog and schema
-##
-# -----------------------------------------------------------------------------
-# Fetch all catalogs and schemas for dynamic table selection
-def get_catalogs() -> list:
-    """Fetch all catalogs available in the metastore."""
-    print(f"get_catalogs called")
-    try:
-        df = sqlQuery("SHOW CATALOGS")
-        if df.empty:
-            return []
-        # Pick first column containing catalog names
-        cols = [c for c in df.columns if 'catalog' in c.lower() or 'name' in c.lower()]
-        col = cols[0] if cols else df.columns[0]
-        return [str(v) for v in df[col].tolist()]
-    except Exception as e:
-        print(f"Error fetching catalogs: {e}")
-        return []
-
-def get_schemas(catalog: str) -> list:
-    """Fetch all schemas within the specified catalog."""
-    print(f"get_schemas called with catalog={catalog}")
-    try:
-        query = f"SHOW SCHEMAS IN {catalog}"
-        df = sqlQuery(query)
-        if df.empty:
-            return []
-        # Pick first column containing schema names
-        cols = [c for c in df.columns if 'schema' in c.lower() or 'name' in c.lower()]
-        col = cols[0] if cols else df.columns[0]
-        return [str(v) for v in df[col].tolist()]
-    except Exception as e:
-        print(f"Error fetching schemas: {e}")
-        return []
-
-##
-# -----------------------------------------------------------------------------
-def get_tables(catalog: str = None, schema: str = None) -> list:
-    """Fetch all table names from the specified or configured catalog and schema."""
-    cat = catalog or CATALOG_NAME
-    sch = schema or SCHEMA_NAME
-    print(f"get_tables called with catalog={cat}, schema={sch}")
-    try:
-        query = f"SHOW TABLES IN {cat}.{sch}"
-        df = sqlQuery(query)
-        if df.empty:
-            return []
-        # Determine the column containing table names
-        cols = [c for c in df.columns if 'name' in c.lower()]
-        col = cols[0] if cols else df.columns[0]
-        return [str(t) for t in df[col].tolist()]
-    except Exception as e:
-        print(f"Error fetching tables: {e}")
-        return []
-  
-def get_columns(catalog: str = None, schema: str = None, table: str = None) -> list:
-    """Fetch all column names from the specified catalog.schema.table."""
-    cat = catalog or CATALOG_NAME
-    sch = schema or SCHEMA_NAME
-    if not table or not cat or not sch:
-        return []
-    try:
-        # Describe table to get column metadata
-        query = f"DESCRIBE TABLE {cat}.{sch}.{table}"
-        df = sqlQuery(query)
-        if df.empty:
-            return []
-        # Determine column containing column names
-        cols = [c for c in df.columns if 'col' in c.lower()]
-        col = cols[0] if cols else df.columns[0]
-        return [str(v) for v in df[col].tolist()]
-    except Exception as e:
-        print(f"Error fetching columns for {cat}.{sch}.{table}: {e}")
-        return []
+# NOTE: Database metadata functions (get_catalogs, get_schemas, get_tables, get_columns)
+# have been moved to utils/db_metadata.py
 
 # Training Runs Management Functions
 

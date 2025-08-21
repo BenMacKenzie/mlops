@@ -7,7 +7,7 @@ import dash_bootstrap_components as dbc
 from dash import html, ctx
 import pandas as pd
 
-from utils.db import get_datasets, get_project_by_id
+from utils.db_universal import get_datasets, get_project_by_id
 from jobs.training import create_training_job, run_training_job
 from databricks.sdk import WorkspaceClient
 from utils.mlflow_service import mlflow_workspace_service
@@ -103,11 +103,13 @@ def register_training_callbacks(app):
         training_notebook = project_details.get('training_notebook')
         
         # Get target variable from EOL definition associated with feature lookup
-        from utils.db import sqlQuery, CATALOG_NAME, SCHEMA_NAME
+        from utils.db_universal import sqlQuery, get_table_name
+        feature_lookups_table = get_table_name('feature_lookups')
+        eol_definition_table = get_table_name('eol_definition')
         feature_lookup_query = f"""
             SELECT fl.name as feature_lookup_name, fl.eol_id, eol.label 
-            FROM {CATALOG_NAME}.{SCHEMA_NAME}.feature_lookups fl
-            LEFT JOIN {CATALOG_NAME}.{SCHEMA_NAME}.eol_definition eol ON fl.eol_id = eol.id
+            FROM {feature_lookups_table} fl
+            LEFT JOIN {eol_definition_table} eol ON fl.eol_id = eol.id
             WHERE fl.id = {feature_lookup_id}
         """
         feature_lookup_df = sqlQuery(feature_lookup_query)
