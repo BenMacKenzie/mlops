@@ -249,15 +249,16 @@ Server endpoints needed for the cascading dropdowns:
 - `GET /api/uc/columns?catalog=X&schema=Y&table=Z` — list columns in table
 
 ### 6. Runs (within project)
-A single "run" trains a model then evaluates it as a multi-task Databricks job (train → evaluate), both logging to the same MLflow experiment.
+A single "run" trains and evaluates a model in one Databricks Job, logging to one MLflow experiment.
 
 - Select a materialized dataset
 - Configure hyperparameters (or use notebook defaults)
-- Launch run — creates a two-task job: train notebook → evaluation notebook (sequential, with `depends_on`)
+- Launch run — creates a single-task job running the training notebook (which includes evaluation via `mlflow.evaluate()`)
 - View running/completed runs with status, training metrics, and eval metrics
-- Links to Databricks job and MLflow experiment for each run
+- Links to Databricks job and MLflow experiment (resolved by numeric ID) for each run
+- Delete runs to clean up stale/failed entries
 - Auto-polls running jobs every 10s; status updated to SUCCESS/FAILED once terminal
-- Job reuse: first run creates the multi-task job definition, subsequent runs reuse it with `run-now`
+- Job reuse: first run creates the job definition, subsequent runs reuse it with `run-now`
 
 ### 7. MLflow Integration
 - **Experiment Viewer:** List experiments for the project, show runs with metrics/params
@@ -295,18 +296,11 @@ The app does NOT contain training or evaluation notebooks. Users provide their o
 
 Training and evaluation notebooks must accept these `dbutils.widgets`:
 
-**Training notebooks:**
+**Training notebook** (includes evaluation via `mlflow.evaluate()`):
 - `target` — label column name
 - `training_table_name` — UC table with training data
 - `eval_table_name` — UC table with eval data
-- `experiment_name` — MLflow experiment name
-- Must set task values: `dbutils.jobs.taskValues.set(key="model_uri", value=model_info.model_uri)`
-
-**Evaluation notebooks:**
-- `target` — label column name
-- `eval_table_name` — UC table with eval data
-- `model_uri` — MLflow model URI from training task (e.g. `runs:/<run_id>/model`)
-- `experiment_name` — MLflow experiment name
+- `experiment_name` — MLflow experiment name (short name; notebook prepends `/Users/<username>/`)
 
 See https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks for reference implementations.
 
@@ -329,18 +323,12 @@ Note: Notebook paths should strip `.py` extension when passed to the Databricks 
 
 ### Training Job
 - **Notebook:** User-provided, referenced from the user's git repo
-- **Git source:** Project's `git_url` + `notebook_path/training_notebook`
+- **Git source:** Project's `git_url` + `notebook_path/training_notebook` (job-level `git_source`, relative paths)
 - **Params:** `target`, `training_table_name`, `eval_table_name`, `experiment_name`
-- **Output:** Notebook logs to MLflow; app reads experiment/run data via REST API
-
-### Evaluation Job
-- **Notebook:** User-provided, referenced from the user's git repo
-- **Git source:** Project's `git_url` + `notebook_path/evaluation_notebook`
-- **Params:** `target`, `eval_table_name`, `model_name`, `model_version`, `experiment_name`
-- **Output:** Notebook logs eval metrics to MLflow; app reads results via REST API
+- **Output:** Notebook trains model, evaluates via `mlflow.evaluate()`, and logs everything to MLflow. App resolves the MLflow experiment numeric ID via `GET /api/2.0/mlflow/experiments/get-by-name` for direct linking.
 
 ### Job creation and execution code
-The Python SDK wrappers that create and run Databricks Jobs are **app server logic**, implemented as Express API endpoints. The user's git repo contains only the training/evaluation notebooks — not any job orchestration code. The reference implementation at https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks shows the notebook contract (widget params) that user notebooks must follow.
+The job orchestration is **app server logic**, implemented as Express API endpoints. The user's git repo contains only the training notebook — not any job orchestration code. The reference implementation at https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks shows the notebook contract (widget params) that user notebooks must follow.
 
 ## app.yaml
 
@@ -397,7 +385,7 @@ See `deploy.sh` for the full deployment script.
 - [x] Design and create Lakebase schema — 2026-04-11
 - [x] Build Express API routes for CRUD on all entities — 2026-04-11
 - [x] Build React UI: Projects list + detail page (incl. GitHub notebook auto-fetch) — 2026-04-11
-- [x] Build React UI: Dataset builder, Training, Evaluation tabs — 2026-04-11
+- [x] Build React UI: Dataset builder, Runs tab — 2026-04-11
 - [x] Build job launcher logic (submit runs to Databricks Jobs API) — 2026-04-11
 - [x] Create Lakebase tables via psql — 2026-04-12
 - [x] Fix materialize notebook upload (Workspace Import API) — 2026-04-12
@@ -405,12 +393,18 @@ See `deploy.sh` for the full deployment script.
 - [x] Refactor feature_definition → container + feature_entry model (multi-table support) — 2026-04-12
 - [x] Add view/expand for existing EOLs and feature definitions (read-only detail view) — 2026-04-12
 - [x] Add copy-to-new-version for EOLs and feature definitions — 2026-04-12
-- [ ] Remove DROP TABLE statements from schema init (added for migration, should be one-time) — 2026-04-12
-- [ ] Fix local dev Lakebase auth (SASL issue with AppKit token refresh) — 2026-04-12
-- [ ] End-to-end test: create project, create EOL, create dataset, train, evaluate — 2026-04-12
+- [x] Remove DROP TABLE statements from schema init — 2026-04-13
+- [x] Merge training_run + evaluation_run into single `run` table — 2026-04-13
+- [x] Single-task training job (training notebook includes evaluation) — 2026-04-14
+- [x] MLflow experiment link resolved by numeric ID via API — 2026-04-14
+- [x] Dynamic username resolution (PGUSER local, SCIM API deployed) — 2026-04-14
+- [x] Read-only detail view for feature lookup entries — 2026-04-14
+- [x] Pushed to GitHub: `appkit-rewrite` branch on BenMacKenzie/mlops — 2026-04-14
+- [ ] End-to-end test: create project → EOL → features → dataset → train — 2026-04-12
 - [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime, esbuild bundle has plugin manifest issue) — 2026-04-12
 - [ ] Build MLflow experiment viewer + run comparison UI — 2026-04-12
 - [ ] Build Serving endpoints UI (live from Databricks API) — 2026-04-12
+- [ ] Fix local dev Lakebase auth (SASL issue with AppKit token refresh) — 2026-04-12
 
 ## Decisions
 - 2026-04-11: Use AppKit (not APX) for React app framework — official SDK, built-in Lakebase plugin
@@ -423,8 +417,12 @@ See `deploy.sh` for the full deployment script.
 - 2026-04-12: Refactored feature_definition into container + feature_entry — a definition is a named spec (name + EOL), entries are individual lookups/declarative features that can reference different tables. Materialize gathers all entries. Definitions are immutable; copy to create new versions.
 - 2026-04-12: Materialize notebook auto-uploaded to workspace via Import API (`/api/2.0/workspace/import`) before each job run — strips `/Workspace` prefix for API, uses `format: SOURCE`
 - 2026-04-12: Serverless jobs need `databricks-feature-engineering` in environment dependencies spec
-- 2026-04-13: Merged training_run + evaluation_run into single `run` table — train and evaluate are two tasks in one Databricks job, same MLflow experiment. Eliminated separate evaluation tab.
+- 2026-04-13: Merged training_run + evaluation_run into single `run` table — eliminated separate evaluation tab
 - 2026-04-13: Git source jobs use job-level `git_source` (not task-level) and relative notebook paths (no leading `/`); workspace jobs use absolute paths
+- 2026-04-14: Dropped separate evaluation task — training notebook includes `mlflow.evaluate()`, so a single-task job is sufficient
+- 2026-04-14: MLflow experiment names are short (`project_dataset`); notebook prepends `/Users/<username>/`. Server resolves numeric experiment ID via `GET /api/2.0/mlflow/experiments/get-by-name` (note: MLflow API is at 2.0, not 2.1)
+- 2026-04-14: Username resolved dynamically — `PGUSER` env var for local dev, Databricks SCIM API (`/api/2.1/preview/scim/v2/Me`) for deployed app, cached after first call
+- 2026-04-14: Code pushed to `appkit-rewrite` branch on https://github.com/BenMacKenzie/mlops
 
 ## Meeting Notes
 See `meetings/` folder for dated meeting notes.
