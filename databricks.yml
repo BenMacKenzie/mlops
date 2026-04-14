@@ -1,0 +1,31 @@
+bundle:
+  name: mlops
+
+variables:
+  sql_warehouse_id:
+    description: SQL Warehouse ID
+
+resources:
+  apps:
+    app:
+      name: "mlops"
+      description: "ML model lifecycle manager"
+      source_code_path: ./
+
+      user_api_scopes:
+        - sql
+
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.sql_warehouse_id}
+            permission: CAN_USE
+
+targets:
+  default:
+    default: true
+    workspace:
+      host: https://fevm-serverless-stable-1dpktm.cloud.databricks.com
+
+    variables:
+      sql_warehouse_id: c3adcf234afed63a
