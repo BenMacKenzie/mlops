@@ -86,6 +86,8 @@ export const checkRunStatus = (runId: number) =>
   request<Run>(`/api/runs/${runId}/check-status`, { method: 'POST' });
 export const deleteRun = (id: number) =>
   request<{ ok: boolean }>(`/api/runs/${id}`, { method: 'DELETE' });
+export const registerModel = (runId: number) =>
+  request<Run>(`/api/runs/${runId}/register-model`, { method: 'POST' });
 
 // ── Job launchers ──
 export const materializeDataset = (projectId: number, datasetId: number) =>

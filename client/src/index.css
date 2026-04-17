@@ -1,6 +1,24 @@
 @import "@databricks/appkit-ui/styles.css";
 
-/* Override AppKit dark styles on form elements */
+/* Force light mode — override AppKit dark theme */
+html, body, #root {
+  background-color: #f9fafb !important;
+  color: #111827 !important;
+  -webkit-text-fill-color: #111827 !important;
+  color-scheme: light !important;
+}
+
+*, *::before, *::after {
+  color: inherit;
+  -webkit-text-fill-color: inherit;
+}
+
+::selection {
+  background-color: #3b82f6 !important;
+  color: white !important;
+  -webkit-text-fill-color: white !important;
+}
+
 select, input, textarea {
   background-color: white !important;
   color: black !important;

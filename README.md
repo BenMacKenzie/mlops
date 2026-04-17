@@ -181,3 +181,14 @@ databricks bundle deploy -t prod
 - **Backend**: Node.js, Express, tRPC
 - **UI Components**: Radix UI, shadcn/ui
 - **Databricks**: App Kit SDK, Analytics SDK
+
+
+
+## To Do
+
+1. support functions
+2. register models to unity catalog
+3. update the CV notebooks
+4. deploy to endpoint 
+	1. write tables to online store
+	2. 

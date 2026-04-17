@@ -53,7 +53,7 @@ function StatusBadge({ status }: { status: string }) {
 function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: '', description: '', catalog: 'serverless_stable_1dpktm_catalog', schema: '', git_url: 'https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks', notebook_path: '', training_notebook: '', evaluation_notebook: '' });
+  const [form, setForm] = useState({ name: '', description: '', catalog: 'serverless_stable_1dpktm_catalog', schema: '', model_name: '', git_url: 'https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks', notebook_path: '', training_notebook: '', evaluation_notebook: '' });
   const [notebooks, setNotebooks] = useState<{ name: string; path: string }[]>([]);
   const [loadingNotebooks, setLoadingNotebooks] = useState(false);
 
@@ -108,7 +108,7 @@ function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
       notebook_path: parsed?.path || form.notebook_path,
     };
     await api.createProject(submitData as Omit<Project, 'id'>);
-    setForm({ name: '', description: '', catalog: '', schema: '', git_url: '', notebook_path: '', training_notebook: '', evaluation_notebook: '' });
+    setForm({ name: '', description: '', catalog: '', schema: '', model_name: '', git_url: '', notebook_path: '', training_notebook: '', evaluation_notebook: '' });
     setNotebooks([]);
     setShowForm(false);
     load();
@@ -130,6 +130,7 @@ function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
             <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">description</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
             <div><label className="block text-sm font-medium text-gray-700 mb-1">catalog</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })} placeholder="serverless_stable_1dpktm_catalog" /></div>
             <div><label className="block text-sm font-medium text-gray-700 mb-1">schema</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.schema} onChange={(e) => setForm({ ...form, schema: e.target.value })} /></div>
+            <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">model name <span className="text-xs text-gray-400">(for UC model registry — defaults to project name)</span></label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.model_name} onChange={(e) => setForm({ ...form, model_name: e.target.value })} placeholder={form.name || 'project name'} /></div>
             <div className="col-span-2">
               <label className="block text-sm font-medium text-gray-700 mb-1">git url (include path to notebooks folder)</label>
               <input
@@ -230,7 +231,7 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
 
   if (!project) return <div className="text-center py-8">Loading...</div>;
 
-  const tabs = ['overview', 'eols', 'features', 'datasets', 'runs'];
+  const tabs = ['overview', 'eols', 'features', 'datasets', 'training'];
 
   return (
     <div>
@@ -253,7 +254,7 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
       {tab === 'eols' && <EOLsTab projectId={projectId} eols={eols} reload={load} />}
       {tab === 'features' && <FeaturesTab projectId={projectId} eols={eols} features={features} reload={load} />}
       {tab === 'datasets' && <DatasetsTab projectId={projectId} features={features} datasets={datasets} reload={load} />}
-      {tab === 'runs' && <RunsTab projectId={projectId} datasets={datasets} runs={runs} reload={load} />}
+      {tab === 'training' && <RunsTab projectId={projectId} datasets={datasets} runs={runs} reload={load} />}
     </div>
   );
 }
@@ -269,6 +270,7 @@ function OverviewTab({ project, eols, features, datasets, runs }: {
         <dl className="space-y-2 text-sm">
           <div><dt className="text-gray-500">Catalog</dt><dd className="font-mono">{project.catalog}</dd></div>
           <div><dt className="text-gray-500">Schema</dt><dd className="font-mono">{project.schema}</dd></div>
+          <div><dt className="text-gray-500">Model Name</dt><dd className="font-mono">{project.model_name || project.name}</dd></div>
           <div><dt className="text-gray-500">Git URL</dt><dd className="font-mono break-all">{project.git_url || '-'}</dd></div>
           <div><dt className="text-gray-500">Notebook Path</dt><dd className="font-mono">{project.notebook_path || '-'}</dd></div>
           <div><dt className="text-gray-500">Training Notebook</dt><dd className="font-mono">{project.training_notebook || '-'}</dd></div>
@@ -439,6 +441,9 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved }: { featureId: numb
     selectedFeatures: [] as string[], selectedLookupKeys: [] as string[],
     timestamp_lookup_key: '', output_name: '', default_values: '',
     declarative_spec: '',
+    declarative_input: '', declarative_function: '', declarative_window_type: '',
+    declarative_window_duration: '', declarative_slide_duration: '',
+    declarative_filter: '',
   });
 
   const [catalogs, setCatalogs] = useState<string[]>([]);
@@ -510,18 +515,48 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved }: { featureId: numb
   };
 
   const submit = async () => {
+    if (featureType === 'declarative') {
+      if (!form.catalog || !form.schema || !form.table) { alert('Select a source table'); return; }
+      if (!form.declarative_input) { alert('Select an input column'); return; }
+      if (!form.declarative_function) { alert('Select a function'); return; }
+      if (!form.declarative_window_type) { alert('Select a time window type'); return; }
+      if (!form.declarative_window_duration) { alert('Enter a window duration (e.g. 30d, 12h)'); return; }
+      if (form.declarative_window_type === 'sliding' && !form.declarative_slide_duration) { alert('Sliding window requires a slide duration'); return; }
+    }
+
     const fullTableName = `${form.catalog}.${form.schema}.${form.table}`;
+
+    let declarativeSpec = null;
+    if (featureType === 'declarative') {
+      const windowSpec: Record<string, any> = {
+        type: form.declarative_window_type,
+        window_duration: form.declarative_window_duration,
+      };
+      if (form.declarative_window_type === 'sliding' && form.declarative_slide_duration) {
+        windowSpec.slide_duration = form.declarative_slide_duration;
+      }
+      declarativeSpec = {
+        source_table: fullTableName,
+        input: form.declarative_input,
+        function: form.declarative_function,
+        time_window: windowSpec,
+        lookup_key: form.selectedLookupKeys.length > 0 ? form.selectedLookupKeys : null,
+        timestamp_lookup_key: form.timestamp_lookup_key || null,
+        filter_condition: form.declarative_filter || null,
+      };
+    }
+
     await api.createFeatureEntry(featureId, {
       feature_type: featureType,
-      table_name: featureType === 'lookup' ? fullTableName : null,
+      table_name: fullTableName,
       feature_names: featureType === 'lookup' ? form.selectedFeatures : null,
       lookup_key: featureType === 'lookup' ? form.selectedLookupKeys : null,
       timestamp_lookup_key: form.timestamp_lookup_key || null,
       output_name: form.output_name || null,
       default_values: form.default_values ? JSON.parse(form.default_values) : null,
-      declarative_spec: featureType === 'declarative' && form.declarative_spec ? JSON.parse(form.declarative_spec) : null,
+      declarative_spec: declarativeSpec,
     });
-    setForm({ catalog: '', schema: '', table: '', selectedFeatures: [], selectedLookupKeys: [], timestamp_lookup_key: '', output_name: '', default_values: '', declarative_spec: '' });
+    setForm({ catalog: '', schema: '', table: '', selectedFeatures: [], selectedLookupKeys: [], timestamp_lookup_key: '', output_name: '', default_values: '', declarative_spec: '', declarative_input: '', declarative_function: '', declarative_window_type: '', declarative_window_duration: '', declarative_slide_duration: '', declarative_filter: '' });
     onSaved();
   };
 
@@ -603,9 +638,100 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved }: { featureId: numb
       )}
 
       {featureType === 'declarative' && (
-        <div>
-          <label className="block text-sm font-medium mb-1">Declarative Spec (JSON)</label>
-          <textarea className="w-full px-3 py-2 border rounded font-mono text-sm h-32" value={form.declarative_spec} onChange={(e) => setForm({ ...form, declarative_spec: e.target.value })} placeholder='{"source_tables": [...], "features": [...]}' />
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-sm font-medium mb-1">Source Catalog {loadingUc === 'catalogs' && <span className="text-blue-500 text-xs">loading...</span>}</label>
+            <select className="w-full px-3 py-2 border rounded" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })}>
+              <option value="">Select catalog...</option>
+              {catalogs.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Source Schema {loadingUc === 'schemas' && <span className="text-blue-500 text-xs">loading...</span>}</label>
+            <select className="w-full px-3 py-2 border rounded" value={form.schema} onChange={(e) => setForm({ ...form, schema: e.target.value })} disabled={!form.catalog}>
+              <option value="">Select schema...</option>
+              {schemas.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Source Table {loadingUc === 'tables' && <span className="text-blue-500 text-xs">loading...</span>}</label>
+            <select className="w-full px-3 py-2 border rounded" value={form.table} onChange={(e) => setForm({ ...form, table: e.target.value })} disabled={!form.schema}>
+              <option value="">Select table...</option>
+              {tables.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Input Column {loadingUc === 'columns' && <span className="text-blue-500 text-xs">loading...</span>}</label>
+            <select className="w-full px-3 py-2 border rounded" value={form.declarative_input} onChange={(e) => setForm({ ...form, declarative_input: e.target.value })} disabled={columns.length === 0}>
+              <option value="">Select column...</option>
+              {columns.map((col) => <option key={col.name} value={col.name}>{col.name} ({col.type})</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Function</label>
+            <select className="w-full px-3 py-2 border rounded" value={form.declarative_function} onChange={(e) => setForm({ ...form, declarative_function: e.target.value })}>
+              <option value="">Select function...</option>
+              <option value="sum">Sum</option>
+              <option value="avg">Avg / Mean</option>
+              <option value="count">Count</option>
+              <option value="min">Min</option>
+              <option value="max">Max</option>
+              <option value="stddev_pop">Stddev (population)</option>
+              <option value="stddev_samp">Stddev (sample)</option>
+              <option value="var_pop">Variance (population)</option>
+              <option value="var_samp">Variance (sample)</option>
+              <option value="approx_count_distinct">Approx Count Distinct</option>
+              <option value="first">First</option>
+              <option value="last">Last</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Time Window Type</label>
+            <select className="w-full px-3 py-2 border rounded" value={form.declarative_window_type} onChange={(e) => setForm({ ...form, declarative_window_type: e.target.value })}>
+              <option value="">Select window type...</option>
+              <option value="continuous">Continuous</option>
+              <option value="tumbling">Tumbling</option>
+              <option value="sliding">Sliding</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Window Duration <span className="text-xs text-gray-400">(e.g. 30d, 12h, 60m)</span></label>
+            <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.declarative_window_duration} onChange={(e) => setForm({ ...form, declarative_window_duration: e.target.value })} placeholder="30d" />
+          </div>
+          {form.declarative_window_type === 'sliding' && (
+            <div>
+              <label className="block text-sm font-medium mb-1">Slide Duration <span className="text-xs text-gray-400">(e.g. 1d, 6h)</span></label>
+              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.declarative_slide_duration} onChange={(e) => setForm({ ...form, declarative_slide_duration: e.target.value })} placeholder="1d" />
+            </div>
+          )}
+          <div>
+            <label className="block text-sm font-medium mb-1">Lookup Key(s) <span className="text-xs text-gray-400">(from EOL entity columns)</span></label>
+            <div className="border rounded p-2 space-y-1">
+              {eolColumns.map((col) => (
+                <label key={col} className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
+                  <input type="checkbox" checked={form.selectedLookupKeys.includes(col)} onChange={() => toggleLookupKey(col)} />
+                  <span className="font-mono text-xs">{col}</span>
+                </label>
+              ))}
+              {eolColumns.length === 0 && <span className="text-xs text-gray-400">No EOL selected on this feature definition</span>}
+            </div>
+          </div>
+          {selectedEol?.timestamp_column && (
+            <div>
+              <label className="block text-sm font-medium mb-1">Timestamp Lookup Key</label>
+              <div className="border rounded p-2">
+                <label className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
+                  <input type="checkbox" checked={form.timestamp_lookup_key === selectedEol.timestamp_column} onChange={(e) => setForm({ ...form, timestamp_lookup_key: e.target.checked ? selectedEol!.timestamp_column : '' })} />
+                  <span className="font-mono text-xs">{selectedEol.timestamp_column}</span>
+                  <span className="text-gray-400 text-xs">(point-in-time join)</span>
+                </label>
+              </div>
+            </div>
+          )}
+          <div className="col-span-2">
+            <label className="block text-sm font-medium mb-1">Filter Condition <span className="text-xs text-gray-400">(optional SQL expression)</span></label>
+            <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.declarative_filter} onChange={(e) => setForm({ ...form, declarative_filter: e.target.value })} placeholder='e.g. amount > 100' />
+          </div>
         </div>
       )}
 
@@ -645,10 +771,19 @@ function FeatureEntryDetail({ entry, eolId, eols }: { entry: FeatureEntry; eolId
   const lookupKeys = entry.lookup_key || [];
 
   if (entry.feature_type === 'declarative') {
+    const spec = entry.declarative_spec || {} as any;
     return (
       <div className="mt-2 p-3 border rounded bg-gray-50">
         <div className="text-xs font-medium text-purple-700 mb-2">Declarative Feature</div>
-        <pre className="text-xs font-mono bg-white p-2 rounded border overflow-x-auto">{JSON.stringify(entry.declarative_spec, null, 2)}</pre>
+        <div className="grid grid-cols-2 gap-2 text-sm">
+          {spec.source_table && <div><span className="text-gray-500">Source:</span> <span className="font-mono">{spec.source_table}</span></div>}
+          {spec.input && <div><span className="text-gray-500">Input:</span> <span className="font-mono">{spec.input}</span></div>}
+          {spec.function && <div><span className="text-gray-500">Function:</span> <span className="font-mono">{spec.function}</span></div>}
+          {spec.time_window && <div><span className="text-gray-500">Window:</span> <span className="font-mono">{spec.time_window.type} / {spec.time_window.window_duration}{spec.time_window.slide_duration ? ` (slide: ${spec.time_window.slide_duration})` : ''}</span></div>}
+          {spec.lookup_key && <div><span className="text-gray-500">Lookup Key:</span> <span className="font-mono">{spec.lookup_key.join(', ')}</span></div>}
+          {spec.timestamp_lookup_key && <div><span className="text-gray-500">Timestamp Key:</span> <span className="font-mono">{spec.timestamp_lookup_key}</span></div>}
+          {spec.filter_condition && <div className="col-span-2"><span className="text-gray-500">Filter:</span> <span className="font-mono">{spec.filter_condition}</span></div>}
+        </div>
       </div>
     );
   }
@@ -824,8 +959,10 @@ function FeaturesTab({ projectId, eols, features, reload }: { projectId: number;
                                   {' (key: '}<span className="font-mono">{entry.lookup_key?.join(', ')}</span>{')'}
                                 </span>
                               )}
-                              {entry.feature_type === 'declarative' && (
-                                <span className="font-mono text-gray-500 text-xs">{JSON.stringify(entry.declarative_spec).slice(0, 100)}...</span>
+                              {entry.feature_type === 'declarative' && entry.declarative_spec && (
+                                <span className="font-mono text-gray-500 text-xs">
+                                  {(entry.declarative_spec as any).function}({(entry.declarative_spec as any).input}) over {(entry.declarative_spec as any).time_window?.type} {(entry.declarative_spec as any).time_window?.window_duration} — {(entry.declarative_spec as any).source_table}
+                                </span>
                               )}
                             </div>
                             <button onClick={(e) => { e.stopPropagation(); api.deleteFeatureEntry(entry.id).then(reload); }} className="text-red-400 text-xs hover:text-red-600">remove</button>
@@ -965,7 +1102,23 @@ function DatasetsTab({ projectId, features, datasets, reload }: {
                   Split: {d.eval_split_type}{d.eval_split_config?.percentage ? ` (${d.eval_split_config.percentage}%)` : ''}
                   {d.row_count !== null && <> | Rows: {d.row_count.toLocaleString()}</>}
                 </div>
-                {d.training_table && <div className="text-sm font-mono text-gray-500">Train: {d.training_table} | Eval: {d.eval_table}</div>}
+                {d.training_table && (() => {
+                  const tableUrl = (t: string) => {
+                    if (!d.materialize_run_url) return null;
+                    const host = new URL(d.materialize_run_url).origin;
+                    const parts = t.split('.');
+                    if (parts.length === 3) return `${host}/explore/data/${parts[0]}/${parts[1]}/${parts[2]}`;
+                    return null;
+                  };
+                  const trainUrl = tableUrl(d.training_table!);
+                  const evalUrl = d.eval_table ? tableUrl(d.eval_table) : null;
+                  return (
+                    <div className="text-sm font-mono text-gray-500">
+                      Train: {trainUrl ? <a href={trainUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">{d.training_table}</a> : d.training_table}
+                      {d.eval_table && <> | Eval: {evalUrl ? <a href={evalUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">{d.eval_table}</a> : d.eval_table}</>}
+                    </div>
+                  );
+                })()}
               </div>
               <div className="flex gap-2">
                 {d.status === 'NOT_STARTED' && (
@@ -974,13 +1127,11 @@ function DatasetsTab({ projectId, features, datasets, reload }: {
                     className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700"
                   >Materialize</button>
                 )}
+                {d.materialize_run_url && (
+                  <a href={d.materialize_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline">View Job</a>
+                )}
                 {d.status === 'MATERIALIZING' && (
-                  <>
-                    {d.materialize_run_url && (
-                      <a href={d.materialize_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline">View Job</a>
-                    )}
-                    <button onClick={() => checkNow(d)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Check Status</button>
-                  </>
+                  <button onClick={() => checkNow(d)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Check Status</button>
                 )}
                 {d.status === 'FAILED' && (
                   <button
@@ -1005,6 +1156,7 @@ function RunsTab({ projectId, datasets, runs, reload }: {
 }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ dataset_id: '', parameters: '' });
+  const [registerError, setRegisterError] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Poll for status on RUNNING runs
@@ -1076,6 +1228,13 @@ function RunsTab({ projectId, datasets, runs, reload }: {
         </div>
       )}
 
+      {registerError && (
+        <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex justify-between items-center">
+          <span>Registration failed: {registerError}</span>
+          <button onClick={() => setRegisterError('')} className="text-red-400 hover:text-red-600 text-xs ml-4">Dismiss</button>
+        </div>
+      )}
+
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="w-full text-left text-sm">
           <thead className="bg-gray-50">
@@ -1084,8 +1243,7 @@ function RunsTab({ projectId, datasets, runs, reload }: {
               <th className="px-4 py-3 font-medium text-gray-500">Dataset</th>
               <th className="px-4 py-3 font-medium text-gray-500">Status</th>
               <th className="px-4 py-3 font-medium text-gray-500">Model</th>
-              <th className="px-4 py-3 font-medium text-gray-500">Training Metrics</th>
-              <th className="px-4 py-3 font-medium text-gray-500">Eval Metrics</th>
+              <th className="px-4 py-3 font-medium text-gray-500">Metrics</th>
               <th className="px-4 py-3 font-medium text-gray-500">Links</th>
             </tr>
           </thead>
@@ -1112,9 +1270,24 @@ function RunsTab({ projectId, datasets, runs, reload }: {
                     )}
                     {r.error_message && <div className="text-xs text-red-500 mt-1">{r.error_message}</div>}
                   </td>
-                  <td className="px-4 py-3 font-mono text-xs">{r.model_name ? `${r.model_name} v${r.model_version}` : '-'}</td>
-                  <td className="px-4 py-3 font-mono text-xs">{formatMetrics(r.training_metrics)}</td>
-                  <td className="px-4 py-3 font-mono text-xs">{formatMetrics(r.eval_metrics)}</td>
+                  <td className="px-4 py-3 font-mono text-xs">
+                    {r.model_name ? (
+                      <a
+                        href={`${host}/explore/data/models/${r.model_name.replace(/\./g, '/')}${r.model_version ? `/version/${r.model_version}` : ''}`}
+                        target="_blank" rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline"
+                      >{r.model_name.split('.').pop()} v{r.model_version}</a>
+                    ) : r.status === 'SUCCESS' ? (
+                      <button
+                        className="px-2 py-1 bg-purple-600 text-white text-xs rounded hover:bg-purple-700"
+                        onClick={() => {
+                          setRegisterError('');
+                          api.registerModel(r.id).then(reload).catch((e) => setRegisterError(e.message));
+                        }}
+                      >Register</button>
+                    ) : '-'}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-xs">{formatMetrics(r.eval_metrics || r.training_metrics)}</td>
                   <td className="px-4 py-3 text-xs space-x-2">
                     {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
                     {r.mlflow_experiment_id && <a href={`${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
@@ -1124,7 +1297,7 @@ function RunsTab({ projectId, datasets, runs, reload }: {
               );
             })}
             {runs.length === 0 && (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">No runs yet</td></tr>
+              <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">No runs yet</td></tr>
             )}
           </tbody>
         </table>

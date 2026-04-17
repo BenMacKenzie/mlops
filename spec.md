@@ -94,6 +94,7 @@ Evolves the existing schema from the prototype. Key changes:
 | description | TEXT | |
 | catalog | VARCHAR(255) | Unity Catalog catalog for this project's assets |
 | schema | VARCHAR(255) | UC schema within catalog |
+| model_name | VARCHAR(255) | Name for UC model registry (defaults to project name) |
 | git_url | TEXT | GitHub repo URL (e.g. `https://github.com/user/repo`) |
 | notebook_path | TEXT | Path within repo where notebooks live (e.g. `notebooks`) |
 | training_notebook | TEXT | Notebook filename selected from git repo (e.g. `01_Train_Classification_Model.py`) |
@@ -248,13 +249,14 @@ Server endpoints needed for the cascading dropdowns:
 - `GET /api/uc/tables?catalog=X&schema=Y` — list tables in schema
 - `GET /api/uc/columns?catalog=X&schema=Y&table=Z` — list columns in table
 
-### 6. Runs (within project)
+### 6. Training (within project)
 A single "run" trains and evaluates a model in one Databricks Job, logging to one MLflow experiment.
 
 - Select a materialized dataset
 - Configure hyperparameters (or use notebook defaults)
-- Launch run — creates a single-task job running the training notebook (which includes evaluation via `mlflow.evaluate()`)
-- View running/completed runs with status, training metrics, and eval metrics
+- Launch run — creates a single-task job running the training notebook (which includes evaluation via `mlflow.evaluate()` or cross-validation)
+- View running/completed runs with status and test/eval metrics (single Metrics column; training metrics hidden)
+- **Register model:** One-click registration to Unity Catalog as `{catalog}.{schema}.{model_name}` (model name configured at project level). Creates registered model if needed, then creates a version from the MLflow run artifact. Registered models link to UC model explorer.
 - Links to Databricks job and MLflow experiment (resolved by numeric ID) for each run
 - Delete runs to clean up stale/failed entries
 - Auto-polls running jobs every 10s; status updated to SUCCESS/FAILED once terminal
@@ -296,11 +298,13 @@ The app does NOT contain training or evaluation notebooks. Users provide their o
 
 Training and evaluation notebooks must accept these `dbutils.widgets`:
 
-**Training notebook** (includes evaluation via `mlflow.evaluate()`):
+**Training notebook** (includes evaluation via `mlflow.evaluate()` or cross-validation):
 - `target` — label column name
 - `training_table_name` — UC table with training data
 - `eval_table_name` — UC table with eval data
 - `experiment_name` — MLflow experiment name (short name; notebook prepends `/Users/<username>/`)
+- `catalog` — Unity Catalog catalog (for volume access, e.g. TMPDIR)
+- `schema` — UC schema within catalog
 
 See https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks for reference implementations.
 
@@ -324,8 +328,8 @@ Note: Notebook paths should strip `.py` extension when passed to the Databricks 
 ### Training Job
 - **Notebook:** User-provided, referenced from the user's git repo
 - **Git source:** Project's `git_url` + `notebook_path/training_notebook` (job-level `git_source`, relative paths)
-- **Params:** `target`, `training_table_name`, `eval_table_name`, `experiment_name`
-- **Output:** Notebook trains model, evaluates via `mlflow.evaluate()`, and logs everything to MLflow. App resolves the MLflow experiment numeric ID via `GET /api/2.0/mlflow/experiments/get-by-name` for direct linking.
+- **Params:** `target`, `training_table_name`, `eval_table_name`, `experiment_name`, `catalog`, `schema`
+- **Output:** Notebook trains model, evaluates via `mlflow.evaluate()` or cross-validation, and logs everything to MLflow. App resolves the MLflow experiment numeric ID via `GET /api/2.0/mlflow/experiments/get-by-name` for direct linking.
 
 ### Job creation and execution code
 The job orchestration is **app server logic**, implemented as Express API endpoints. The user's git repo contains only the training notebook — not any job orchestration code. The reference implementation at https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks shows the notebook contract (widget params) that user notebooks must follow.
@@ -400,6 +404,12 @@ See `deploy.sh` for the full deployment script.
 - [x] Dynamic username resolution (PGUSER local, SCIM API deployed) — 2026-04-14
 - [x] Read-only detail view for feature lookup entries — 2026-04-14
 - [x] Pushed to GitHub: `appkit-rewrite` branch on BenMacKenzie/mlops — 2026-04-14
+- [x] Fix DeltaTableSource namespace — use short table_name with separate catalog_name/schema_name — 2026-04-17
+- [x] Rename Runs tab → Training — 2026-04-17
+- [x] Add model registration to Unity Catalog (one-click from training runs) — 2026-04-17
+- [x] Add model_name as project-level field (backfill existing projects with project name) — 2026-04-17
+- [x] Pass catalog/schema as training notebook params (for volume TMPDIR) — 2026-04-17
+- [x] Consolidate metrics display to single column (test/eval only, hide training metrics) — 2026-04-17
 - [ ] End-to-end test: create project → EOL → features → dataset → train — 2026-04-12
 - [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime, esbuild bundle has plugin manifest issue) — 2026-04-12
 - [ ] Build MLflow experiment viewer + run comparison UI — 2026-04-12
@@ -423,6 +433,18 @@ See `deploy.sh` for the full deployment script.
 - 2026-04-14: MLflow experiment names are short (`project_dataset`); notebook prepends `/Users/<username>/`. Server resolves numeric experiment ID via `GET /api/2.0/mlflow/experiments/get-by-name` (note: MLflow API is at 2.0, not 2.1)
 - 2026-04-14: Username resolved dynamically — `PGUSER` env var for local dev, Databricks SCIM API (`/api/2.1/preview/scim/v2/Me`) for deployed app, cached after first call
 - 2026-04-14: Code pushed to `appkit-rewrite` branch on https://github.com/BenMacKenzie/mlops
+- 2026-04-14: MLflow experiment scoped to project (not dataset) so all runs appear in one experiment; experiment ID lookup falls back to null instead of name to avoid broken links
+- 2026-04-14: Materialize notebook now excludes `timestamp_lookup_key` columns (observation dates) alongside entity columns
+- 2026-04-14: Dataset tab now links to UC table explorer and job run URL (visible in all statuses, not just MATERIALIZING)
+- 2026-04-14: **Future enhancement** — consolidate to a single Databricks Job per project (store `job_id` on project record, reuse across all runs/datasets). Currently each run creates its own job on first launch; `notebook_params` already vary per run so a shared job would work.
+- 2026-04-17: DeltaTableSource requires `catalog_name` and `schema_name` as separate params; `table_name` must be the short name only — passing a fully qualified name caused garbled namespace resolution
+- 2026-04-17: `fe.create_feature()` also requires `catalog_name`/`schema_name` — these specify the output feature catalog/schema
+- 2026-04-17: Model registration uses MLflow UC APIs: `unity-catalog/registered-models/create` + `unity-catalog/model-versions/create`. Model artifact source is `{artifact_uri}/model` by convention.
+- 2026-04-17: MLflow `runs/get` is a GET endpoint (not POST) — must pass `run_id` as query param
+- 2026-04-17: Metrics bucketing handles both `mlflow.evaluate()` prefixes (`eval_`, `evaluation_`) and CatBoost CV prefixes (`test-`, `train-`). UI shows only test/eval metrics.
+- 2026-04-17: `model_name` added to project table as UC model registry name; defaults to project name. Backfilled via `UPDATE app.project SET model_name = name WHERE model_name = ''`
+- 2026-04-17: Training notebook receives `catalog` and `schema` as widget params — needed for constructing volume paths (e.g. TMPDIR for CatBoost on serverless)
+- 2026-04-17: Serverless jobs cannot write to `/tmp` — use UC volumes for temp storage. CatBoost `cv()` needs `train_dir` or `logging_dir` set to a volume path.
 
 ## Meeting Notes
 See `meetings/` folder for dated meeting notes.

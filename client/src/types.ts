@@ -4,6 +4,7 @@ export interface Project {
   description: string;
   catalog: string;
   schema: string;
+  model_name: string;
   git_url: string;
   notebook_path: string;
   training_notebook: string;

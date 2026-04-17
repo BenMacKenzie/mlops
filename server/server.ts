@@ -143,11 +143,11 @@ appkit.server.extend((app) => {
 
   app.post('/api/projects', async (req, res) => {
     try {
-      const { name, description, catalog, schema, git_url, notebook_path, training_notebook, evaluation_notebook } = req.body;
+      const { name, description, catalog, schema, model_name, git_url, notebook_path, training_notebook, evaluation_notebook } = req.body;
       const result = await db.query(
-        `INSERT INTO app.project (name, description, catalog, schema, git_url, notebook_path, training_notebook, evaluation_notebook)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-        [name, description, catalog, schema, git_url, notebook_path, training_notebook, evaluation_notebook]
+        `INSERT INTO app.project (name, description, catalog, schema, model_name, git_url, notebook_path, training_notebook, evaluation_notebook)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [name, description, catalog, schema, model_name || name, git_url, notebook_path, training_notebook, evaluation_notebook]
       );
       res.status(201).json(result.rows[0]);
     } catch (e: any) {
@@ -157,11 +157,11 @@ appkit.server.extend((app) => {
 
   app.put('/api/projects/:id', async (req, res) => {
     try {
-      const { name, description, catalog, schema, git_url, notebook_path, training_notebook, evaluation_notebook } = req.body;
+      const { name, description, catalog, schema, model_name, git_url, notebook_path, training_notebook, evaluation_notebook } = req.body;
       const result = await db.query(
-        `UPDATE app.project SET name=$1, description=$2, catalog=$3, schema=$4, git_url=$5, notebook_path=$6, training_notebook=$7, evaluation_notebook=$8
-         WHERE id=$9 RETURNING *`,
-        [name, description, catalog, schema, git_url, notebook_path, training_notebook, evaluation_notebook, req.params.id]
+        `UPDATE app.project SET name=$1, description=$2, catalog=$3, schema=$4, model_name=$5, git_url=$6, notebook_path=$7, training_notebook=$8, evaluation_notebook=$9
+         WHERE id=$10 RETURNING *`,
+        [name, description, catalog, schema, model_name || name, git_url, notebook_path, training_notebook, evaluation_notebook, req.params.id]
       );
       if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       res.json(result.rows[0]);
@@ -683,13 +683,21 @@ appkit.server.extend((app) => {
           lookup_key: e.lookup_key,
           timestamp_lookup_key: e.timestamp_lookup_key || null,
         }));
-      const featureLookupJson = JSON.stringify(featureLookups);
+      const declarativeFeatures = entriesResult.rows
+        .filter((e: any) => e.feature_type === 'declarative' && e.declarative_spec)
+        .map((e: any) => ({
+          ...e.declarative_spec,
+          // Ensure entity columns and timestamp from EOL are available
+          entity_columns: eol.entity_columns || [],
+          timeseries_column: eol.timestamp_column || '',
+        }));
 
       const params = {
         eol_sql: eol.sql_definition,
         label_column: eol.label_column || '',
         entity_columns_json: JSON.stringify(eol.entity_columns || []),
-        feature_definitions_json: featureLookupJson,
+        feature_definitions_json: JSON.stringify(featureLookups),
+        declarative_features_json: JSON.stringify(declarativeFeatures),
         catalog: project.catalog,
         schema: project.schema,
         training_table_name: trainingTable,
@@ -778,7 +786,7 @@ appkit.server.extend((app) => {
       const eolResult = await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [featureDef.eol_id]);
       const eol = eolResult.rows[0];
 
-      const experimentName = `${project.name}_${dataset.name}`;
+      const experimentName = project.name;
       const userName = await getUsername(req);
       const experimentFullPath = `/Users/${userName}/${experimentName}`;
       const trainNotebookPath = project.notebook_path
@@ -793,6 +801,8 @@ appkit.server.extend((app) => {
         training_table_name: dataset.training_table || '',
         eval_table_name: dataset.eval_table || '',
         experiment_name: experimentName,
+        catalog: project.catalog,
+        schema: project.schema,
         ...(run.parameters || {}),
       };
 
@@ -800,7 +810,7 @@ appkit.server.extend((app) => {
       let jobId = run.job_id;
       if (!jobId) {
         const createPayload = {
-          name: `mlops-${project.name}-${dataset.name}`,
+          name: `mlops-${project.name}`,
           git_source: { git_url: project.git_url, git_provider: 'gitHub', git_branch: 'main' },
           tasks: [
             {
@@ -818,7 +828,7 @@ appkit.server.extend((app) => {
             spec: { client: '1', dependencies: ['databricks-feature-engineering'] },
           }],
         };
-        console.log(`[job] Creating multi-task job: mlops-${project.name}-${dataset.name}`);
+        console.log(`[job] Creating job: mlops-${project.name}`);
         const createResult = await databricksApi(req, 'POST', 'jobs/create', createPayload);
         if (createResult.error_code) throw new Error(`Job create failed: ${createResult.message}`);
         jobId = createResult.job_id;
@@ -838,7 +848,7 @@ appkit.server.extend((app) => {
       const runUrl = `${host}/#job/${jobId}/run/${databricksRunId}`;
 
       // Look up the numeric MLflow experiment ID by name (MLflow API is at 2.0, not 2.1)
-      let mlflowExperimentId = experimentName;
+      let mlflowExperimentId: string | null = null;
       try {
         const token = getToken(req);
         const expUrl = `${host}/api/2.0/mlflow/experiments/get-by-name?experiment_name=${encodeURIComponent(experimentFullPath)}`;
@@ -882,9 +892,70 @@ appkit.server.extend((app) => {
       const resultState = state?.result_state;
 
       if (lifeCycleState === 'TERMINATED' && resultState === 'SUCCESS') {
+        // Fetch MLflow experiment ID and metrics
+        const host = process.env.DATABRICKS_HOST || '';
+        const token = getToken(req);
+        let mlflowExperimentId = run.mlflow_experiment_id;
+        let trainingMetrics: Record<string, any> | null = null;
+        let evalMetrics: Record<string, any> | null = null;
+        let mlflowRunId: string | null = run.mlflow_run_id;
+
+        try {
+          // Resolve experiment ID if we don't have it yet
+          if (!mlflowExperimentId) {
+            const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [run.project_id])).rows[0];
+            const userName = await getUsername(req);
+            const experimentFullPath = `/Users/${userName}/${project.name}`;
+            const expResp = await fetch(`${host}/api/2.0/mlflow/experiments/get-by-name?experiment_name=${encodeURIComponent(experimentFullPath)}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const expData = await expResp.json();
+            if (expData.experiment?.experiment_id) {
+              mlflowExperimentId = expData.experiment.experiment_id;
+            }
+          }
+
+          // Find the MLflow run associated with this Databricks job run
+          if (mlflowExperimentId) {
+            const searchResp = await fetch(`${host}/api/2.0/mlflow/runs/search`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                experiment_ids: [mlflowExperimentId],
+                filter_string: `tags.mlflow.databricks.jobRunId = '${run.run_id}'`,
+                max_results: 1,
+              }),
+            });
+            const searchData = await searchResp.json();
+            const mlRun = searchData.runs?.[0];
+            if (mlRun) {
+              mlflowRunId = mlRun.info?.run_id || null;
+              // Extract metrics into training vs test buckets
+              // Handles both mlflow.evaluate() prefixes (eval_, evaluation_) and
+              // CatBoost CV prefixes (test-, train-)
+              const metrics = mlRun.data?.metrics || [];
+              const train: Record<string, any> = {};
+              const eval_: Record<string, any> = {};
+              for (const m of metrics) {
+                if (m.key.startsWith('eval_') || m.key.startsWith('evaluation_') || m.key.startsWith('test-')) {
+                  eval_[m.key] = m.value;
+                } else if (m.key.startsWith('train-')) {
+                  train[m.key] = m.value;
+                } else {
+                  train[m.key] = m.value;
+                }
+              }
+              if (Object.keys(train).length > 0) trainingMetrics = train;
+              if (Object.keys(eval_).length > 0) evalMetrics = eval_;
+            }
+          }
+        } catch (e: any) {
+          console.error(`[mlflow] Post-run lookup failed: ${e.message}`);
+        }
+
         await db.query(
-          `UPDATE app.run SET status='SUCCESS', ended_at=NOW() WHERE id=$1`,
-          [run.id]
+          `UPDATE app.run SET status='SUCCESS', mlflow_experiment_id=$1, mlflow_run_id=$2, training_metrics=$3, eval_metrics=$4, ended_at=NOW() WHERE id=$5`,
+          [mlflowExperimentId, mlflowRunId, trainingMetrics ? JSON.stringify(trainingMetrics) : null, evalMetrics ? JSON.stringify(evalMetrics) : null, run.id]
         );
       } else if (lifeCycleState === 'TERMINATED') {
         await db.query(
@@ -895,6 +966,73 @@ appkit.server.extend((app) => {
       const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
       res.json(updated.rows[0]);
     } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Register a model from a run into Unity Catalog ──
+  app.post('/api/runs/:id/register-model', async (req, res) => {
+    try {
+      const result = await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.status(404).json({ error: 'Run not found' }); return; }
+      const run = result.rows[0];
+      if (run.status !== 'SUCCESS') { res.status(400).json({ error: 'Run must be SUCCESS to register' }); return; }
+      if (!run.mlflow_run_id) { res.status(400).json({ error: 'Run has no MLflow run ID' }); return; }
+
+      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [run.project_id])).rows[0];
+      const modelName = project.model_name || project.name;
+      const fullModelName = `${project.catalog}.${project.schema}.${modelName}`;
+
+      const host = process.env.DATABRICKS_HOST || '';
+      const token = getToken(req);
+      const mlflowFetch = async (path: string, body: any, method: string = 'POST') => {
+        const isGet = method === 'GET';
+        const qs = isGet ? '?' + new URLSearchParams(body).toString() : '';
+        const resp = await fetch(`${host}/api/2.0/mlflow/${path}${qs}`, {
+          method,
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: isGet ? undefined : JSON.stringify(body),
+        });
+        return resp.json();
+      };
+
+      // 1. Create registered model (ignore RESOURCE_ALREADY_EXISTS)
+      const createResult: any = await mlflowFetch('unity-catalog/registered-models/create', {
+        name: fullModelName,
+      });
+      if (createResult.error_code && createResult.error_code !== 'RESOURCE_ALREADY_EXISTS') {
+        throw new Error(`Create model failed: ${createResult.message}`);
+      }
+      console.log(`[register] Model ${fullModelName}: ${createResult.error_code ? 'already exists' : 'created'}`);
+
+      // 2. Get the MLflow run to find the model artifact URI
+      const mlRun: any = await mlflowFetch('runs/get', { run_id: run.mlflow_run_id }, 'GET');
+      if (mlRun.error_code) throw new Error(`Get MLflow run failed: ${mlRun.message}`);
+      const artifactUri = mlRun.run?.info?.artifact_uri;
+      if (!artifactUri) throw new Error('MLflow run has no artifact URI');
+      // Convention: model artifact logged under "model" directory
+      const modelSource = `${artifactUri}/model`;
+
+      // 3. Create model version
+      const versionResult: any = await mlflowFetch('unity-catalog/model-versions/create', {
+        name: fullModelName,
+        source: modelSource,
+        run_id: run.mlflow_run_id,
+      });
+      if (versionResult.error_code) throw new Error(`Create version failed: ${versionResult.message}`);
+      const version = versionResult.model_version?.version;
+      console.log(`[register] Created ${fullModelName} version ${version}`);
+
+      // 4. Update run record
+      await db.query(
+        `UPDATE app.run SET model_name=$1, model_version=$2, model_uri=$3 WHERE id=$4`,
+        [fullModelName, version ? parseInt(version) : null, modelSource, run.id]
+      );
+
+      const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      console.error(`[register] Error: ${e.message}`);
       res.status(500).json({ error: e.message });
     }
   });
@@ -928,9 +1066,12 @@ db.query(`
   CREATE SCHEMA IF NOT EXISTS app;
   CREATE TABLE IF NOT EXISTS app.project (
     id BIGSERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL, description TEXT NOT NULL DEFAULT '',
-    catalog VARCHAR(255) NOT NULL, schema VARCHAR(255) NOT NULL, git_url TEXT NOT NULL DEFAULT '',
+    catalog VARCHAR(255) NOT NULL, schema VARCHAR(255) NOT NULL, model_name VARCHAR(255) NOT NULL DEFAULT '',
+    git_url TEXT NOT NULL DEFAULT '',
     notebook_path TEXT NOT NULL DEFAULT '', training_notebook TEXT NOT NULL DEFAULT '', evaluation_notebook TEXT NOT NULL DEFAULT ''
   );
+  ALTER TABLE app.project ADD COLUMN IF NOT EXISTS model_name VARCHAR(255) NOT NULL DEFAULT '';
+  UPDATE app.project SET model_name = name WHERE model_name = '';
   CREATE TABLE IF NOT EXISTS app.entity_observation_label (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL, sql_definition TEXT NOT NULL, label_column VARCHAR(255),
