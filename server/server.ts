@@ -17,6 +17,10 @@ const appkit = await createApp({
 
 const db = appkit.lakebase;
 
+// Lakebase project config for synced tables (feature store online serving)
+const LAKEBASE_BRANCH = process.env.LAKEBASE_BRANCH || 'projects/mlops/branches/production';
+const LAKEBASE_PG_DATABASE = process.env.PGDATABASE || 'databricks_postgres';
+
 // Helper: call Databricks REST API using the user's OBO token (or app token for local dev)
 function getToken(req: any): string {
   return (req.headers['x-forwarded-access-token'] as string)
@@ -41,10 +45,10 @@ async function getUsername(req: any): Promise<string> {
   return _cachedUser;
 }
 
-async function databricksApi(req: any, method: string, apiPath: string, body?: any): Promise<any> {
+async function databricksApi(req: any, method: string, apiPath: string, body?: any, apiPrefix = 'api/2.1'): Promise<any> {
   const host = process.env.DATABRICKS_HOST || '';
   const token = getToken(req);
-  const resp = await fetch(`${host}/api/2.1/${apiPath}`, {
+  const resp = await fetch(`${host}/${apiPrefix}/${apiPath}`, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -574,6 +578,20 @@ appkit.server.extend((app) => {
     }
   });
 
+  // Clear model registration from a run (so it can be re-registered)
+  app.post('/api/runs/:id/unregister', async (req, res) => {
+    try {
+      await db.query(
+        'UPDATE app.run SET model_name=NULL, model_version=NULL, model_uri=NULL WHERE id=$1',
+        [req.params.id]
+      );
+      const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ════════════════════════════════════════════
   //  JOB LAUNCHER — Materialize, Train, Evaluate
   //  Pattern: jobs/create → jobs/run-now → poll
@@ -796,6 +814,20 @@ appkit.server.extend((app) => {
         ? `${project.notebook_path}/${project.evaluation_notebook}`
         : project.evaluation_notebook;
 
+      // Build feature lookups JSON for the training notebook (for fe.log_model)
+      const entriesResult = await db.query(
+        'SELECT * FROM app.feature_entry WHERE feature_definition_id = $1 ORDER BY id',
+        [featureDef.id]
+      );
+      const featureLookups = entriesResult.rows
+        .filter((e: any) => e.feature_type === 'lookup')
+        .map((e: any) => ({
+          table_name: e.table_name,
+          feature_names: e.feature_names,
+          lookup_key: e.lookup_key,
+          timestamp_lookup_key: e.timestamp_lookup_key || null,
+        }));
+
       const trainParams = {
         target: eol.label_column || '',
         training_table_name: dataset.training_table || '',
@@ -803,6 +835,7 @@ appkit.server.extend((app) => {
         experiment_name: experimentName,
         catalog: project.catalog,
         schema: project.schema,
+        feature_lookups_json: JSON.stringify(featureLookups),
         ...(run.parameters || {}),
       };
 
@@ -971,6 +1004,8 @@ appkit.server.extend((app) => {
   });
 
   // ── Register a model from a run into Unity Catalog ──
+  // Uses an app-managed notebook job because mlflow.register_model() requires
+  // Python SDK access to resolve artifact paths (REST API fails when DBFS root is disabled).
   app.post('/api/runs/:id/register-model', async (req, res) => {
     try {
       const result = await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.id]);
@@ -983,56 +1018,539 @@ appkit.server.extend((app) => {
       const modelName = project.model_name || project.name;
       const fullModelName = `${project.catalog}.${project.schema}.${modelName}`;
 
-      const host = process.env.DATABRICKS_HOST || '';
-      const token = getToken(req);
-      const mlflowFetch = async (path: string, body: any, method: string = 'POST') => {
-        const isGet = method === 'GET';
-        const qs = isGet ? '?' + new URLSearchParams(body).toString() : '';
-        const resp = await fetch(`${host}/api/2.0/mlflow/${path}${qs}`, {
-          method,
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: isGet ? undefined : JSON.stringify(body),
-        });
-        return resp.json();
+      // Upload the register_model notebook to the workspace
+      const userName = await getUsername(req);
+      const notebookPath = `/Workspace/Users/${userName}/.mlops/register_model`;
+      const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'register_model.py');
+      await uploadNotebook(req, localNotebook, notebookPath);
+
+      const params = {
+        run_id: run.mlflow_run_id,
+        model_name: fullModelName,
       };
 
-      // 1. Create registered model (ignore RESOURCE_ALREADY_EXISTS)
-      const createResult: any = await mlflowFetch('unity-catalog/registered-models/create', {
-        name: fullModelName,
-      });
-      if (createResult.error_code && createResult.error_code !== 'RESOURCE_ALREADY_EXISTS') {
-        throw new Error(`Create model failed: ${createResult.message}`);
-      }
-      console.log(`[register] Model ${fullModelName}: ${createResult.error_code ? 'already exists' : 'created'}`);
-
-      // 2. Get the MLflow run to find the model artifact URI
-      const mlRun: any = await mlflowFetch('runs/get', { run_id: run.mlflow_run_id }, 'GET');
-      if (mlRun.error_code) throw new Error(`Get MLflow run failed: ${mlRun.message}`);
-      const artifactUri = mlRun.run?.info?.artifact_uri;
-      if (!artifactUri) throw new Error('MLflow run has no artifact URI');
-      // Convention: model artifact logged under "model" directory
-      const modelSource = `${artifactUri}/model`;
-
-      // 3. Create model version
-      const versionResult: any = await mlflowFetch('unity-catalog/model-versions/create', {
-        name: fullModelName,
-        source: modelSource,
-        run_id: run.mlflow_run_id,
-      });
-      if (versionResult.error_code) throw new Error(`Create version failed: ${versionResult.message}`);
-      const version = versionResult.model_version?.version;
-      console.log(`[register] Created ${fullModelName} version ${version}`);
-
-      // 4. Update run record
-      await db.query(
-        `UPDATE app.run SET model_name=$1, model_version=$2, model_uri=$3 WHERE id=$4`,
-        [fullModelName, version ? parseInt(version) : null, modelSource, run.id]
+      console.log(`[register] Launching register job: ${fullModelName} from run ${run.mlflow_run_id}`);
+      const { job_id, run_id: jobRunId, run_url } = await createOrRunJob(
+        req, `mlops-register-${modelName}`, notebookPath, params
       );
 
-      const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
-      res.json(updated.rows[0]);
+      // Update run to indicate registration is in progress
+      await db.query(
+        `UPDATE app.run SET model_name=$1, model_uri=$2 WHERE id=$3`,
+        [fullModelName, `runs:/${run.mlflow_run_id}/model`, run.id]
+      );
+
+      // Poll for completion (registration jobs are fast — usually <30s)
+      let attempts = 0;
+      const maxAttempts = 30;
+      while (attempts < maxAttempts) {
+        await new Promise(r => setTimeout(r, 5000));
+        attempts++;
+        const jobRun = await databricksApi(req, 'GET', `jobs/runs/get?run_id=${jobRunId}`);
+        const lifeCycleState = jobRun.state?.life_cycle_state;
+        const resultState = jobRun.state?.result_state;
+
+        if (lifeCycleState === 'TERMINATED' && resultState === 'SUCCESS') {
+          // Get the output from the task run (not the parent job run)
+          let version: string | null = null;
+          try {
+            // Find the task run_id
+            const taskRunId = jobRun.tasks?.[0]?.run_id || jobRunId;
+            const output = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${taskRunId}`);
+            const nbResult = JSON.parse(output.notebook_output?.result || '{}');
+            version = nbResult.version;
+            console.log(`[register] Registered ${fullModelName} v${version}`);
+          } catch (e: any) {
+            console.log(`[register] Registered ${fullModelName} (could not parse version: ${e.message})`);
+          }
+
+          await db.query(
+            `UPDATE app.run SET model_version=$1 WHERE id=$2`,
+            [version ? parseInt(version) : null, run.id]
+          );
+          const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
+          res.json(updated.rows[0]);
+          return;
+        } else if (lifeCycleState === 'TERMINATED') {
+          const errMsg = jobRun.state?.state_message || resultState || 'Unknown error';
+          // Clear partial model info
+          await db.query(
+            `UPDATE app.run SET model_name=NULL, model_uri=NULL WHERE id=$1`,
+            [run.id]
+          );
+          throw new Error(`Registration job failed: ${errMsg}`);
+        }
+        // Still running — continue polling
+      }
+      throw new Error('Registration timed out after 150s');
     } catch (e: any) {
       console.error(`[register] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ════════════════════════════════════════════
+  //  ONLINE TABLES
+  // ════════════════════════════════════════════
+  app.get('/api/projects/:projectId/online-tables', async (req, res) => {
+    try {
+      const result = await db.query(
+        'SELECT * FROM app.online_table WHERE project_id = $1 ORDER BY source_table',
+        [req.params.projectId]
+      );
+      res.json(result.rows);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/projects/:projectId/online-tables', async (req, res) => {
+    try {
+      const { source_table, primary_key_columns, timeseries_key, sync_mode } = req.body;
+      if (!source_table || !primary_key_columns?.length) {
+        res.status(400).json({ error: 'source_table and primary_key_columns required' }); return;
+      }
+
+      // Look up project catalog/schema for the destination synced table
+      const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [req.params.projectId]);
+      if (projResult.rows.length === 0) { res.status(404).json({ error: 'Project not found' }); return; }
+      const project = projResult.rows[0];
+
+      const syncMode = sync_mode || 'triggered';
+      const schedulingPolicy = syncMode === 'continuous' ? 'CONTINUOUS' : 'TRIGGERED';
+
+      // Destination: project schema with _online suffix (e.g. catalog.project_schema.table_name_online)
+      const shortName = source_table.split('.').pop();
+      const syncedTableId = `${project.catalog}.${project.schema}.${shortName}_online`;
+
+      // Enable Change Data Feed on source table (required for TRIGGERED/CONTINUOUS sync)
+      try {
+        await executeSql(req, `ALTER TABLE ${source_table} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
+        console.log(`[synced-table] Enabled CDF on ${source_table}`);
+      } catch (e: any) {
+        console.warn(`[synced-table] CDF enable warning (may already be set): ${e.message}`);
+      }
+
+      // Resolve PK columns from Unity Catalog's information_schema
+      const parts = source_table.split('.');
+      const pkRows = await executeSql(req,
+        `SELECT column_name FROM ${parts[0]}.information_schema.constraint_column_usage
+         WHERE table_catalog='${parts[0]}' AND table_schema='${parts[1]}' AND table_name='${parts[2]}'`);
+      const pkColumns = pkRows.map((r: any) => r.column_name);
+      if (pkColumns.length === 0) {
+        throw new Error(`No primary key constraint found on ${source_table}. Add one with: ALTER TABLE ${source_table} ADD CONSTRAINT pk PRIMARY KEY (col1, col2)`);
+      }
+
+      const spec: any = {
+        source_table_full_name: source_table,
+        branch: LAKEBASE_BRANCH,
+        primary_key_columns: pkColumns,
+        scheduling_policy: schedulingPolicy,
+        postgres_database: LAKEBASE_PG_DATABASE,
+        create_database_objects_if_missing: true,
+      };
+
+      console.log(`[synced-table] Creating ${syncedTableId} from ${source_table} (pk: ${pkColumns.join(', ')})`);
+      const apiResult = await databricksApi(req, 'POST',
+        `postgres/synced_tables?synced_table_id=${encodeURIComponent(syncedTableId)}`,
+        { spec }, 'api/2.0');
+
+      if (apiResult.error_code) throw new Error(`Synced table create failed: ${apiResult.message}`);
+      const pipelineId = apiResult.name || apiResult.status?.pipeline_id || null;
+
+      const result = await db.query(
+        `INSERT INTO app.online_table (project_id, source_table, online_table_name, primary_key_columns, timeseries_key, sync_mode, status, pipeline_id)
+         VALUES ($1,$2,$3,$4,$5,$6,'PROVISIONING',$7) RETURNING *`,
+        [req.params.projectId, source_table, syncedTableId, pkColumns, timeseries_key || null, syncMode, pipelineId]
+      );
+      console.log(`[synced-table] Created: ${syncedTableId}`);
+      res.status(201).json(result.rows[0]);
+    } catch (e: any) {
+      console.error(`[synced-table] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/online-tables/:id/check-status', async (req, res) => {
+    try {
+      const result = await db.query('SELECT * FROM app.online_table WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
+      const ot = result.rows[0];
+
+      if (ot.status === 'NOT_PUBLISHED') { res.json(ot); return; }
+
+      // Always re-query for PROVISIONING and FAILED (to capture error messages)
+      const syncedTableId = ot.online_table_name || ot.source_table;
+      const apiResult = await databricksApi(req, 'GET',
+        `postgres/synced_tables/${encodeURIComponent(syncedTableId)}`,
+        undefined, 'api/2.0');
+      console.log(`[synced-table] Status response for ${syncedTableId}:`, JSON.stringify(apiResult).slice(0, 500));
+
+      let newStatus = ot.status;
+      let errorMessage: string | null = null;
+
+      // The response may be a long-running operation or the synced table state
+      const detailedState = apiResult.status?.detailed_state
+        || apiResult.state
+        || (apiResult.done === true ? 'ONLINE' : '')
+        || '';
+      const stateStr = String(detailedState).toUpperCase();
+
+      // Extract pipeline URL from status message
+      const statusMessage = apiResult.status?.message || '';
+      const pipelineUrl = statusMessage.match(/https?:\/\/\S+/)?.[0]?.replace(/\.$/, '') || null;
+
+      if (stateStr.includes('ONLINE') || stateStr === 'ACTIVE' || apiResult.done === true) {
+        newStatus = 'ONLINE';
+      } else if (stateStr.includes('FAIL') || stateStr.includes('ERROR') || apiResult.error_code) {
+        newStatus = 'FAILED';
+        errorMessage = statusMessage || stateStr;
+      }
+
+      // Always update pipeline_id with the pipeline URL if available
+      await db.query('UPDATE app.online_table SET status=$1, pipeline_id=COALESCE($2, pipeline_id) WHERE id=$3',
+        [newStatus, pipelineUrl, ot.id]);
+
+      const updated = await db.query('SELECT * FROM app.online_table WHERE id = $1', [ot.id]);
+      const row = updated.rows[0];
+      res.json(errorMessage ? { ...row, error_message: errorMessage } : row);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete('/api/online-tables/:id', async (req, res) => {
+    try {
+      const result = await db.query('SELECT * FROM app.online_table WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
+      const ot = result.rows[0];
+
+      // Delete synced table from Databricks (ignore errors if already gone)
+      const syncedTableId = ot.online_table_name || ot.source_table;
+      try {
+        await databricksApi(req, 'DELETE',
+          `postgres/synced_tables/${encodeURIComponent(syncedTableId)}`,
+          undefined, 'api/2.0');
+        console.log(`[synced-table] Deleted from Databricks: ${syncedTableId}`);
+      } catch (e: any) {
+        console.warn(`[synced-table] Databricks delete warning: ${e.message}`);
+      }
+
+      await db.query('DELETE FROM app.online_table WHERE id = $1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ════════════════════════════════════════════
+  //  DEPLOYMENTS
+  // ════════════════════════════════════════════
+  app.get('/api/projects/:projectId/deployments', async (req, res) => {
+    try {
+      const result = await db.query(
+        'SELECT * FROM app.deployment WHERE project_id = $1 ORDER BY id DESC',
+        [req.params.projectId]
+      );
+      res.json(result.rows);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/projects/:projectId/deployments', async (req, res) => {
+    try {
+      const { name, run_id, endpoint_name, endpoint_config } = req.body;
+      if (!name || !run_id || !endpoint_name) {
+        res.status(400).json({ error: 'name, run_id, and endpoint_name required' }); return;
+      }
+      const result = await db.query(
+        `INSERT INTO app.deployment (project_id, name, run_id, endpoint_name, endpoint_config)
+         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        [req.params.projectId, name, run_id, endpoint_name, endpoint_config ? JSON.stringify(endpoint_config) : null]
+      );
+      res.status(201).json(result.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Publish all required online tables for a deployment
+  app.post('/api/deployments/:id/publish-tables', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      // Trace: deployment → run → dataset → feature_definition → feature_entries
+      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id]);
+      const run = runResult.rows[0];
+      const dsResult = await db.query('SELECT * FROM app.dataset WHERE id = $1', [run.dataset_id]);
+      const dataset = dsResult.rows[0];
+      const entriesResult = await db.query(
+        `SELECT fe.* FROM app.feature_entry fe
+         JOIN app.feature_definition fd ON fe.feature_definition_id = fd.id
+         WHERE fd.id = $1 AND fe.table_name IS NOT NULL`,
+        [dataset.feature_definition_id]
+      );
+
+      // Get existing online tables for this project
+      const existingOt = await db.query(
+        'SELECT source_table FROM app.online_table WHERE project_id = $1',
+        [dep.project_id]
+      );
+      const existingTables = new Set(existingOt.rows.map((r: any) => r.source_table));
+
+      // Publish missing tables
+      let published = 0;
+      const seen = new Set<string>();
+      for (const entry of entriesResult.rows) {
+        const sourceTable = entry.table_name;
+        if (seen.has(sourceTable) || existingTables.has(sourceTable)) continue;
+        seen.add(sourceTable);
+
+        // Look up project for destination schema
+        const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id]);
+        const project = projResult.rows[0];
+        const shortName = sourceTable.split('.').pop();
+        const syncedTableId = `${project.catalog}.${project.schema}.${shortName}_online`;
+        const syncMode = 'triggered';
+        // Enable CDF and resolve PK from UC information_schema
+        try {
+          await executeSql(req, `ALTER TABLE ${sourceTable} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
+        } catch { /* may already be set */ }
+        const srcParts = sourceTable.split('.');
+        const pkRows = await executeSql(req,
+          `SELECT column_name FROM ${srcParts[0]}.information_schema.constraint_column_usage
+           WHERE table_catalog='${srcParts[0]}' AND table_schema='${srcParts[1]}' AND table_name='${srcParts[2]}'`);
+        const pkCols = pkRows.map((r: any) => r.column_name);
+        if (pkCols.length === 0) {
+          console.error(`[publish-tables] No PK constraint on ${sourceTable}, skipping`);
+          continue;
+        }
+
+        const spec: any = {
+          source_table_full_name: sourceTable,
+          branch: LAKEBASE_BRANCH,
+          primary_key_columns: pkCols,
+          scheduling_policy: 'TRIGGERED',
+          postgres_database: LAKEBASE_PG_DATABASE,
+          create_database_objects_if_missing: true,
+        };
+
+        console.log(`[publish-tables] Creating synced table: ${syncedTableId} from ${sourceTable}`);
+        const apiResult = await databricksApi(req, 'POST',
+          `postgres/synced_tables?synced_table_id=${encodeURIComponent(syncedTableId)}`,
+          { spec }, 'api/2.0');
+        if (apiResult.error_code) {
+          console.error(`[publish-tables] Failed: ${apiResult.message}`);
+          continue;
+        }
+        const pipelineId = apiResult.name || apiResult.status?.pipeline_id || null;
+        await db.query(
+          `INSERT INTO app.online_table (project_id, source_table, online_table_name, primary_key_columns, timeseries_key, sync_mode, status, pipeline_id)
+           VALUES ($1,$2,$3,$4,$5,$6,'PROVISIONING',$7)`,
+          [dep.project_id, sourceTable, syncedTableId, entry.lookup_key || [], entry.timestamp_lookup_key || null, syncMode, pipelineId]
+        );
+        published++;
+      }
+      res.json({ published });
+    } catch (e: any) {
+      console.error(`[publish-tables] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Create serving endpoint for a deployment
+  app.post('/api/deployments/:id/create-endpoint', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id]);
+      const run = runResult.rows[0];
+      if (!run.model_name || !run.model_version) {
+        res.status(400).json({ error: 'Run has no registered model' }); return;
+      }
+
+      // Check model version status — must be READY before creating endpoint
+      const host = process.env.DATABRICKS_HOST || '';
+      const token = getToken(req);
+      const mvResp = await fetch(
+        `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const mvData: any = await mvResp.json();
+      const mvStatus = mvData.model_version?.status;
+      if (mvStatus && mvStatus !== 'READY') {
+        res.status(400).json({ error: `Model version status is ${mvStatus}. Wait for it to become READY before deploying.` });
+        return;
+      }
+
+      const config = dep.endpoint_config || {};
+      const payload = {
+        name: dep.endpoint_name,
+        config: {
+          served_entities: [{
+            entity_name: run.model_name,
+            entity_version: String(run.model_version),
+            workload_size: config.workload_size || 'Small',
+            scale_to_zero_enabled: config.scale_to_zero_enabled !== false,
+          }],
+        },
+      };
+
+      console.log(`[endpoint] Creating: ${dep.endpoint_name} with model ${run.model_name} v${run.model_version}`);
+      const apiResult = await databricksApi(req, 'POST', 'serving-endpoints', payload, 'api/2.0');
+      if (apiResult.error_code) throw new Error(`Endpoint create failed: ${apiResult.message}`);
+
+      await db.query(
+        `UPDATE app.deployment SET endpoint_status='CREATING' WHERE id=$1`,
+        [dep.id]
+      );
+      const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      console.error(`[endpoint] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Check serving endpoint status
+  app.post('/api/deployments/:id/check-status', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      if (dep.endpoint_status === 'NOT_CREATED') { res.json(dep); return; }
+
+      const apiResult = await databricksApi(req, 'GET', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}`, undefined, 'api/2.0');
+      const readyState = apiResult.state?.ready;
+
+      let newStatus = dep.endpoint_status;
+      if (readyState === 'READY') {
+        newStatus = 'READY';
+      } else if (apiResult.state?.config_update === 'IN_PROGRESS') {
+        newStatus = 'CREATING';
+      }
+      // Check for failure
+      if (apiResult.error_code) {
+        newStatus = 'FAILED';
+      }
+
+      if (newStatus !== dep.endpoint_status) {
+        await db.query('UPDATE app.deployment SET endpoint_status=$1 WHERE id=$2', [newStatus, dep.id]);
+      }
+      const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Test inference on a deployment's endpoint
+  // Get sample entity key values from a deployment's training table
+  app.get('/api/deployments/:id/samples', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      // Trace: deployment → run → dataset → feature_definition → EOL
+      const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
+      const dataset = (await db.query('SELECT * FROM app.dataset WHERE id = $1', [run.dataset_id])).rows[0];
+      const fd = (await db.query('SELECT * FROM app.feature_definition WHERE id = $1', [dataset.feature_definition_id])).rows[0];
+      const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [fd.eol_id])).rows[0];
+
+      const entityCols = Array.isArray(eol.entity_columns)
+        ? eol.entity_columns
+        : (eol.entity_columns || '').replace(/^\{|\}$/g, '').split(',').filter(Boolean);
+
+      if (entityCols.length === 0 || !eol.sql_definition) {
+        res.json([]); return;
+      }
+
+      // Query the EOL SQL definition (the spine) which has the entity columns
+      const colList = entityCols.join(', ');
+      const eolSql = eol.sql_definition.trim().replace(/;$/, '');
+      const rows = await executeSql(req, `SELECT DISTINCT ${colList} FROM (${eolSql}) AS _eol LIMIT 3`);
+      res.json(rows);
+    } catch (e: any) {
+      console.error(`[samples] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/deployments/:id/test', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+      if (dep.endpoint_status !== 'READY') { res.status(400).json({ error: 'Endpoint not ready' }); return; }
+
+      const host = process.env.DATABRICKS_HOST || '';
+      const token = getToken(req);
+      const payload = req.body;
+
+      const resp = await fetch(`${host}/serving-endpoints/${encodeURIComponent(dep.endpoint_name)}/invocations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      res.status(resp.status).json(data);
+    } catch (e: any) {
+      console.error(`[test] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Stop a deployment's serving endpoint (deletes the endpoint, keeps the deployment record)
+  app.post('/api/deployments/:id/stop-endpoint', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      if (dep.endpoint_status === 'NOT_CREATED') { res.json(dep); return; }
+
+      try {
+        await databricksApi(req, 'DELETE', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}`, undefined, 'api/2.0');
+        console.log(`[deployment] Stopped endpoint: ${dep.endpoint_name}`);
+      } catch (e: any) {
+        console.warn(`[deployment] Endpoint stop warning: ${e.message}`);
+      }
+
+      await db.query('UPDATE app.deployment SET endpoint_status=$1 WHERE id=$2', ['NOT_CREATED', dep.id]);
+      const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      console.error(`[deployment] Stop error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete('/api/deployments/:id', async (req, res) => {
+    try {
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      // Delete endpoint from Databricks if it exists
+      if (dep.endpoint_status !== 'NOT_CREATED') {
+        try {
+          await databricksApi(req, 'DELETE', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}`, undefined, 'api/2.0');
+          console.log(`[deployment] Deleted endpoint: ${dep.endpoint_name}`);
+        } catch (e: any) {
+          console.warn(`[deployment] Endpoint delete warning: ${e.message}`);
+        }
+      }
+
+      await db.query('DELETE FROM app.deployment WHERE id = $1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
@@ -1104,6 +1622,19 @@ db.query(`
     model_uri TEXT, model_name VARCHAR(255), model_version INTEGER,
     databricks_run_url TEXT, error_message TEXT,
     started_at TIMESTAMP, ended_at TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS app.online_table (
+    id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
+    source_table VARCHAR(255) NOT NULL, online_table_name VARCHAR(255) NOT NULL,
+    primary_key_columns TEXT[], timeseries_key VARCHAR(255),
+    sync_mode VARCHAR(50) DEFAULT 'triggered',
+    status VARCHAR(50) DEFAULT 'NOT_PUBLISHED', pipeline_id VARCHAR(255)
+  );
+  CREATE TABLE IF NOT EXISTS app.deployment (
+    id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL, run_id BIGINT NOT NULL REFERENCES app.run(id) ON DELETE CASCADE,
+    endpoint_name VARCHAR(255) NOT NULL, endpoint_status VARCHAR(50) DEFAULT 'NOT_CREATED',
+    endpoint_config JSONB, created_at TIMESTAMP DEFAULT NOW()
   );
 `).then(() => console.log('Database schema initialized'))
   .catch((e: Error) => console.error('Schema init error:', e.message));

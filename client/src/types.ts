@@ -78,3 +78,26 @@ export interface Run {
   started_at: string | null;
   ended_at: string | null;
 }
+
+export interface OnlineTable {
+  id: number;
+  project_id: number;
+  source_table: string;
+  online_table_name: string;
+  primary_key_columns: string[];
+  timeseries_key: string | null;
+  sync_mode: 'triggered' | 'continuous';
+  status: 'NOT_PUBLISHED' | 'PROVISIONING' | 'ONLINE' | 'FAILED';
+  pipeline_id: string | null;
+}
+
+export interface Deployment {
+  id: number;
+  project_id: number;
+  name: string;
+  run_id: number;
+  endpoint_name: string;
+  endpoint_status: 'NOT_CREATED' | 'CREATING' | 'READY' | 'FAILED';
+  endpoint_config: Record<string, any> | null;
+  created_at: string | null;
+}

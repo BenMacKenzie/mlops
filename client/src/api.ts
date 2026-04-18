@@ -1,4 +1,4 @@
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run } from './types';
+import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -94,6 +94,36 @@ export const materializeDataset = (projectId: number, datasetId: number) =>
   request<{ job_id: number; run_id: number; run_url: string }>(`/api/projects/${projectId}/datasets/${datasetId}/materialize`, { method: 'POST' });
 export const checkDatasetStatus = (projectId: number, datasetId: number) =>
   request<Dataset>(`/api/projects/${projectId}/datasets/${datasetId}/check-status`, { method: 'POST' });
+
+// ── Online Tables ──
+export const getOnlineTables = (projectId: number) =>
+  request<OnlineTable[]>(`/api/projects/${projectId}/online-tables`);
+export const publishOnlineTable = (projectId: number, data: { source_table: string; primary_key_columns: string[]; timeseries_key?: string | null; sync_mode: string }) =>
+  request<OnlineTable>(`/api/projects/${projectId}/online-tables`, { method: 'POST', body: JSON.stringify(data) });
+export const checkOnlineTableStatus = (id: number) =>
+  request<OnlineTable>(`/api/online-tables/${id}/check-status`, { method: 'POST' });
+export const deleteOnlineTable = (id: number) =>
+  request<{ ok: boolean }>(`/api/online-tables/${id}`, { method: 'DELETE' });
+
+// ── Deployments ──
+export const getDeployments = (projectId: number) =>
+  request<Deployment[]>(`/api/projects/${projectId}/deployments`);
+export const createDeployment = (projectId: number, data: { name: string; run_id: number; endpoint_name: string; endpoint_config?: Record<string, any> }) =>
+  request<Deployment>(`/api/projects/${projectId}/deployments`, { method: 'POST', body: JSON.stringify(data) });
+export const publishDeploymentTables = (deploymentId: number) =>
+  request<{ published: number }>(`/api/deployments/${deploymentId}/publish-tables`, { method: 'POST' });
+export const createDeploymentEndpoint = (deploymentId: number) =>
+  request<Deployment>(`/api/deployments/${deploymentId}/create-endpoint`, { method: 'POST' });
+export const checkDeploymentStatus = (deploymentId: number) =>
+  request<Deployment>(`/api/deployments/${deploymentId}/check-status`, { method: 'POST' });
+export const getDeploymentSamples = (deploymentId: number) =>
+  request<Record<string, any>[]>(`/api/deployments/${deploymentId}/samples`);
+export const testDeploymentEndpoint = (deploymentId: number, data: Record<string, any>) =>
+  request<any>(`/api/deployments/${deploymentId}/test`, { method: 'POST', body: JSON.stringify(data) });
+export const stopDeploymentEndpoint = (id: number) =>
+  request<Deployment>(`/api/deployments/${id}/stop-endpoint`, { method: 'POST' });
+export const deleteDeployment = (id: number) =>
+  request<{ ok: boolean }>(`/api/deployments/${id}`, { method: 'DELETE' });
 
 // ── Databricks proxy ──
 export const databricksGet = (path: string, params?: Record<string, string>) => {

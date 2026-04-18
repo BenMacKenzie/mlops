@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run } from './types';
+import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment } from './types';
 import * as api from './api';
 
 // ── Simple hash-based routing ──
@@ -231,7 +231,7 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
 
   if (!project) return <div className="text-center py-8">Loading...</div>;
 
-  const tabs = ['overview', 'eols', 'features', 'datasets', 'training'];
+  const tabs = ['overview', 'eols', 'features', 'datasets', 'training', 'deployment'];
 
   return (
     <div>
@@ -255,6 +255,7 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
       {tab === 'features' && <FeaturesTab projectId={projectId} eols={eols} features={features} reload={load} />}
       {tab === 'datasets' && <DatasetsTab projectId={projectId} features={features} datasets={datasets} reload={load} />}
       {tab === 'training' && <RunsTab projectId={projectId} datasets={datasets} runs={runs} reload={load} />}
+      {tab === 'deployment' && <DeploymentTab projectId={projectId} eols={eols} features={features} datasets={datasets} runs={runs} />}
     </div>
   );
 }
@@ -1301,6 +1302,486 @@ function RunsTab({ projectId, datasets, runs, reload }: {
             )}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════
+//  TEST ENDPOINT
+// ════════════════════════════════════════════
+function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: string[] }) {
+  const [samples, setSamples] = useState<Record<string, any>[]>([]);
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    api.getDeploymentSamples(dep.id).then(setSamples).catch(() => setSamples([]));
+  }, [dep.id]);
+
+  const selectSample = (sample: Record<string, any>) => {
+    const newInputs: Record<string, string> = {};
+    for (const col of entityColumns) {
+      newInputs[col] = String(sample[col] ?? '');
+    }
+    setInputs(newInputs);
+  };
+
+  const send = async () => {
+    setResult(null); setError(''); setLoading(true);
+    try {
+      const record: Record<string, any> = {};
+      for (const [k, v] of Object.entries(inputs)) {
+        const num = Number(v);
+        record[k] = v !== '' && !isNaN(num) ? num : v;
+      }
+      const res = await api.testDeploymentEndpoint(dep.id, { dataframe_records: [record] });
+      setResult(res);
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="mt-4 border-t pt-3">
+      <div className="text-sm font-medium mb-2">Test Endpoint</div>
+      {samples.length > 0 && (
+        <div className="mb-2">
+          <label className="block text-xs text-gray-500 mb-1">Sample records (click to use)</label>
+          <div className="flex gap-2 flex-wrap">
+            {samples.map((s, i) => (
+              <button
+                key={i}
+                onClick={() => selectSample(s)}
+                className="px-2 py-1 bg-gray-100 text-xs font-mono rounded hover:bg-gray-200 border"
+              >{entityColumns.map(c => `${c}=${s[c]}`).join(', ')}</button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="flex gap-3 items-end flex-wrap mb-2">
+        {entityColumns.map(col => (
+          <div key={col}>
+            <label className="block text-xs text-gray-500 mb-1">{col}</label>
+            <input
+              className="px-3 py-1.5 border rounded font-mono text-sm w-40"
+              value={inputs[col] || ''}
+              onChange={e => setInputs({ ...inputs, [col]: e.target.value })}
+              placeholder={col}
+            />
+          </div>
+        ))}
+        <button
+          onClick={send}
+          disabled={loading || entityColumns.length === 0 || entityColumns.some(c => !inputs[c])}
+          className="px-4 py-1.5 bg-purple-600 text-white text-sm rounded hover:bg-purple-700 disabled:bg-gray-300"
+        >{loading ? 'Sending...' : 'Send'}</button>
+      </div>
+      {(result || error) && (
+        <pre className="px-3 py-2 border rounded font-mono text-xs overflow-auto bg-gray-50 whitespace-pre-wrap max-h-32">
+          {error ? <span className="text-red-500">{error}</span> : JSON.stringify(result, null, 2)}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════
+//  DEPLOYMENT TAB
+// ════════════════════════════════════════════
+function DeploymentTab({ projectId, eols, features, datasets, runs }: {
+  projectId: number; eols: EOL[]; features: FeatureDefinition[]; datasets: Dataset[]; runs: Run[];
+}) {
+  const [onlineTables, setOnlineTables] = useState<OnlineTable[]>([]);
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ name: '', run_id: '', endpoint_name: '' });
+  const [selectedDepId, setSelectedDepId] = useState<number | null>(null);
+  const [testInputs, setTestInputs] = useState<Record<string, string>>({});
+  const [testResult, setTestResult] = useState<any>(null);
+  const [testError, setTestError] = useState('');
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const load = useCallback(async () => {
+    const [ot, dep] = await Promise.all([
+      api.getOnlineTables(projectId),
+      api.getDeployments(projectId),
+    ]);
+    // Refresh status for any synced table missing a pipeline URL
+    const refreshed = await Promise.all(ot.map(async (t) => {
+      if (t.status !== 'NOT_PUBLISHED' && (!t.pipeline_id || !t.pipeline_id.startsWith('http'))) {
+        try { return await api.checkOnlineTableStatus(t.id); } catch { return t; }
+      }
+      return t;
+    }));
+    setOnlineTables(refreshed);
+    setDeployments(dep);
+  }, [projectId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Poll for PROVISIONING online tables and CREATING endpoints
+  useEffect(() => {
+    const provisioningOt = onlineTables.filter(ot => ot.status === 'PROVISIONING');
+    const creatingDep = deployments.filter(d => d.endpoint_status === 'CREATING');
+    if (provisioningOt.length === 0 && creatingDep.length === 0) {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    if (pollRef.current) return;
+    pollRef.current = setInterval(async () => {
+      let changed = false;
+      for (const ot of provisioningOt) {
+        try {
+          const updated = await api.checkOnlineTableStatus(ot.id);
+          if (updated.status !== 'PROVISIONING') changed = true;
+        } catch { /* ignore */ }
+      }
+      for (const d of creatingDep) {
+        try {
+          const updated = await api.checkDeploymentStatus(d.id);
+          if (updated.endpoint_status !== 'CREATING') changed = true;
+        } catch { /* ignore */ }
+      }
+      if (changed) load();
+    }, 15000);
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+  }, [onlineTables, deployments, load]);
+
+  // Derive all distinct source tables from all feature entries across all datasets
+  const allFeatureTables = (() => {
+    const tableMap = new Map<string, { table: string; lookupKey: string[]; timestampKey: string | null; datasetNames: string[] }>();
+    for (const fd of features) {
+      const refDatasets = datasets.filter(d => d.feature_definition_id === fd.id).map(d => d.name);
+      for (const entry of fd.entries) {
+        if (!entry.table_name) continue;
+        const existing = tableMap.get(entry.table_name);
+        if (existing) {
+          for (const ds of refDatasets) {
+            if (!existing.datasetNames.includes(ds)) existing.datasetNames.push(ds);
+          }
+        } else {
+          tableMap.set(entry.table_name, {
+            table: entry.table_name,
+            lookupKey: entry.lookup_key || [],
+            timestampKey: entry.timestamp_lookup_key,
+            datasetNames: [...refDatasets],
+          });
+        }
+      }
+    }
+    return Array.from(tableMap.values());
+  })();
+
+  // Map source_table → online table record
+  const onlineTableMap = new Map(onlineTables.map(ot => [ot.source_table, ot]));
+
+  // For a selected deployment, compute its required tables
+  const selectedDep = deployments.find(d => d.id === selectedDepId);
+  const requiredTables = (() => {
+    if (!selectedDep) return new Set<string>();
+    const run = runs.find(r => r.id === selectedDep.run_id);
+    if (!run) return new Set<string>();
+    const dataset = datasets.find(d => d.id === run.dataset_id);
+    if (!dataset) return new Set<string>();
+    const fd = features.find(f => f.id === dataset.feature_definition_id);
+    if (!fd) return new Set<string>();
+    return new Set(fd.entries.map(e => e.table_name).filter(Boolean) as string[]);
+  })();
+
+  const registeredRuns = runs.filter(r => r.model_name && r.model_version);
+
+  const publishTable = async (table: string, lookupKey: string[], timestampKey: string | null) => {
+    try {
+      await api.publishOnlineTable(projectId, {
+        source_table: table,
+        primary_key_columns: lookupKey,
+        timeseries_key: timestampKey,
+        sync_mode: 'triggered',
+      });
+      load();
+    } catch (e: any) { alert(`Publish failed: ${e.message}`); }
+  };
+
+  const removeOnlineTable = async (ot: OnlineTable) => {
+    if (!confirm(`Remove synced table for ${ot.source_table}?`)) return;
+    try {
+      await api.deleteOnlineTable(ot.id);
+      load();
+    } catch (e: any) { alert(`Delete failed: ${e.message}`); }
+  };
+
+  const submitDeployment = async () => {
+    if (!form.name || !form.run_id || !form.endpoint_name) return;
+    await api.createDeployment(projectId, {
+      name: form.name,
+      run_id: parseInt(form.run_id),
+      endpoint_name: form.endpoint_name,
+    });
+    setForm({ name: '', run_id: '', endpoint_name: '' });
+    setShowForm(false);
+    load();
+  };
+
+  const publishAllRequired = async (depId: number) => {
+    try {
+      const result = await api.publishDeploymentTables(depId);
+      if (result.published > 0) load();
+    } catch (e: any) { alert(`Publish failed: ${e.message}`); }
+  };
+
+  const createEndpoint = async (depId: number) => {
+    try {
+      await api.createDeploymentEndpoint(depId);
+      load();
+    } catch (e: any) { alert(`Endpoint creation failed: ${e.message}`); }
+  };
+
+  // Get entity columns for a deployment (EOL entity columns = inference input keys)
+  const getEntityColumns = (dep: Deployment): string[] => {
+    const run = runs.find(r => r.id === dep.run_id);
+    if (!run) return [];
+    const dataset = datasets.find(d => d.id === run.dataset_id);
+    if (!dataset) return [];
+    const fd = features.find(f => f.id === dataset.feature_definition_id);
+    if (!fd) return [];
+    const eol = eols.find(e => e.id === fd.eol_id);
+    if (!eol) return [];
+    const cols = eol.entity_columns;
+    if (Array.isArray(cols)) return cols;
+    if (typeof cols === 'string') return (cols as string).replace(/^\{|\}$/g, '').split(',').filter(Boolean);
+    return [];
+  };
+
+  const runTest = async (depId: number) => {
+    setTestResult(null); setTestError('');
+    try {
+      const record: Record<string, any> = {};
+      for (const [k, v] of Object.entries(testInputs)) {
+        // Try to parse as number, otherwise keep as string
+        const num = Number(v);
+        record[k] = v !== '' && !isNaN(num) ? num : v;
+      }
+      const payload = { dataframe_records: [record] };
+      const result = await api.testDeploymentEndpoint(depId, payload);
+      setTestResult(result);
+    } catch (e: any) {
+      setTestError(e.message);
+    }
+  };
+
+  // Check if all required tables for a deployment are ONLINE
+  const allTablesOnline = (dep: Deployment) => {
+    const run = runs.find(r => r.id === dep.run_id);
+    if (!run) return false;
+    const dataset = datasets.find(d => d.id === run.dataset_id);
+    if (!dataset) return false;
+    const fd = features.find(f => f.id === dataset.feature_definition_id);
+    if (!fd) return true;
+    const tables = fd.entries.map(e => e.table_name).filter(Boolean);
+    return tables.every(t => onlineTableMap.get(t!)?.status === 'ONLINE');
+  };
+
+  const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
+
+  return (
+    <div>
+      {/* ── Online Feature Tables ── */}
+      <div className="mb-8">
+        <h2 className="text-lg font-medium mb-4">Feature Tables (Online Store)</h2>
+        {selectedDep && (
+          <div className="mb-3 p-2 bg-blue-50 rounded text-sm text-blue-700">
+            Highlighting tables required by deployment <span className="font-medium">{selectedDep.name}</span>
+            <button className="ml-2 text-blue-500 hover:underline text-xs" onClick={() => setSelectedDepId(null)}>Clear</button>
+          </div>
+        )}
+        <div className="bg-white rounded-lg shadow overflow-hidden">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-4 py-3 font-medium text-gray-500">Source Table</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Sync Status</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Datasets</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Pipeline</th>
+                <th className="px-4 py-3 font-medium text-gray-500"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {allFeatureTables.map(ft => {
+                const ot = onlineTableMap.get(ft.table);
+                const isRequired = selectedDep ? requiredTables.has(ft.table) : false;
+                const rowClass = selectedDep ? (isRequired ? 'bg-blue-50' : 'opacity-40') : '';
+                return (
+                  <tr key={ft.table} className={`hover:bg-gray-50 ${rowClass}`}>
+                    <td className="px-4 py-3 font-mono text-xs">{ft.table}</td>
+                    <td className="px-4 py-3">
+                      {ot ? (
+                        <StatusBadge status={ot.status} />
+                      ) : (
+                        <span className="text-xs text-gray-400">Not synced</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-gray-500">{ft.datasetNames.join(', ')}</td>
+                    <td className="px-4 py-3 text-xs">
+                      {ot?.pipeline_id?.startsWith('http') ? (
+                        <a href={ot.pipeline_id} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">View</a>
+                      ) : (
+                        <span className="text-gray-400">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-xs space-x-2">
+                      {!ot && (
+                        <button
+                          onClick={() => publishTable(ft.table, ft.lookupKey, ft.timestampKey)}
+                          className="px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
+                        >Sync</button>
+                      )}
+                      {ot && ot.status === 'PROVISIONING' && (
+                        <button
+                          onClick={() => api.checkOnlineTableStatus(ot.id).then(load)}
+                          className="px-2 py-1 bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
+                        >Check</button>
+                      )}
+                      {ot && ot.status === 'FAILED' && (
+                        <button
+                          onClick={() => { removeOnlineTable(ot); }}
+                          className="px-2 py-1 bg-orange-100 text-orange-700 rounded hover:bg-orange-200"
+                        >Remove & Retry</button>
+                      )}
+                      {ot && ot.status === 'ONLINE' && (
+                        <button onClick={() => removeOnlineTable(ot)} className="text-red-500 hover:underline">Remove</button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {allFeatureTables.length === 0 && (
+                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">No feature tables — create datasets with feature definitions first</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── Deployments ── */}
+      <div>
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-lg font-medium">Deployments</h2>
+          <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+            {showForm ? 'Cancel' : 'New Deployment'}
+          </button>
+        </div>
+
+        {showForm && (
+          <div className="mb-4 p-4 border rounded-lg bg-white shadow">
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <input className="w-full px-3 py-2 border rounded" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. production" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Model (registered run)</label>
+                <select className="w-full px-3 py-2 border rounded" value={form.run_id} onChange={e => {
+                  const runId = e.target.value;
+                  const run = registeredRuns.find(r => r.id === parseInt(runId));
+                  setForm({
+                    ...form,
+                    run_id: runId,
+                    endpoint_name: form.endpoint_name || (run ? `mlops-${run.model_name?.split('.').pop() || ''}` : ''),
+                  });
+                }}>
+                  <option value="">Select model...</option>
+                  {registeredRuns.map(r => (
+                    <option key={r.id} value={r.id}>
+                      {r.model_name?.split('.').pop()} v{r.model_version} (run #{r.id})
+                    </option>
+                  ))}
+                </select>
+                {registeredRuns.length === 0 && <div className="text-xs text-gray-400 mt-1">No registered models — register a model from the Training tab first</div>}
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Endpoint Name</label>
+                <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.endpoint_name} onChange={e => setForm({ ...form, endpoint_name: e.target.value })} placeholder="mlops-model-name" />
+              </div>
+            </div>
+            <div className="mt-3 flex gap-2">
+              <button onClick={submitDeployment} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.run_id || !form.endpoint_name}>Create</button>
+              <button onClick={() => setShowForm(false)} className="px-4 py-2 bg-gray-200 rounded text-sm">Cancel</button>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-4">
+          {deployments.map(dep => {
+            const run = runs.find(r => r.id === dep.run_id);
+            const dataset = run ? datasets.find(d => d.id === run.dataset_id) : null;
+            const isSelected = selectedDepId === dep.id;
+            const tablesReady = allTablesOnline(dep);
+
+            return (
+              <div key={dep.id} className={`p-4 bg-white rounded-lg shadow ${isSelected ? 'ring-2 ring-blue-400' : ''}`}>
+                <div className="flex justify-between items-start">
+                  <div>
+                    <h3 className="font-medium">
+                      {dep.name} <StatusBadge status={dep.endpoint_status} />
+                    </h3>
+                    <div className="text-sm text-gray-500 mt-1">
+                      Model: {run?.model_name ? (
+                        <a
+                          href={`${host}/explore/data/models/${run.model_name.replace(/\./g, '/')}${run.model_version ? `/version/${run.model_version}` : ''}`}
+                          target="_blank" rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline font-mono"
+                        >{run.model_name.split('.').pop()} v{run.model_version}</a>
+                      ) : 'unknown'}
+                      {dataset && <> | Dataset: <span className="font-mono">{dataset.name}</span></>}
+                    </div>
+                    <div className="text-sm text-gray-500">
+                      Endpoint: <span className="font-mono">{dep.endpoint_name}</span>
+                    </div>
+                  </div>
+                  <div className="flex gap-2 items-start">
+                    <button
+                      onClick={() => setSelectedDepId(isSelected ? null : dep.id)}
+                      className={`px-2 py-1 text-xs rounded ${isSelected ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                    >{isSelected ? 'Hide Tables' : 'Show Tables'}</button>
+
+                    {dep.endpoint_status === 'NOT_CREATED' && !tablesReady && (
+                      <button onClick={() => publishAllRequired(dep.id)} className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700">
+                        Sync All Tables
+                      </button>
+                    )}
+                    {dep.endpoint_status === 'NOT_CREATED' && tablesReady && (
+                      <button onClick={() => createEndpoint(dep.id)} className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">
+                        Create Endpoint
+                      </button>
+                    )}
+                    {dep.endpoint_status === 'NOT_CREATED' && !tablesReady && (
+                      <span className="text-xs text-yellow-600 py-1">Tables not synced</span>
+                    )}
+                    {dep.endpoint_status === 'CREATING' && (
+                      <button onClick={() => api.checkDeploymentStatus(dep.id).then(load)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">
+                        Check Status
+                      </button>
+                    )}
+                    {dep.endpoint_status !== 'NOT_CREATED' && host && (
+                      <a href={`${host}/ml/endpoints/${dep.endpoint_name}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline">Endpoint UI</a>
+                    )}
+                    <button onClick={() => { api.deleteDeployment(dep.id).then(load); }} className="text-red-500 text-sm">Delete</button>
+                  </div>
+                </div>
+
+                {/* Test interface for READY endpoints */}
+                {dep.endpoint_status === 'READY' && <TestEndpoint dep={dep} entityColumns={getEntityColumns(dep)} />}
+              </div>
+            );
+          })}
+          {deployments.length === 0 && (
+            <div className="text-center py-8 text-gray-400">No deployments yet</div>
+          )}
+        </div>
       </div>
     </div>
   );
