@@ -5,10 +5,11 @@ export interface Project {
   catalog: string;
   schema: string;
   model_name: string;
-  git_url: string;
-  notebook_path: string;
-  training_notebook: string;
-  evaluation_notebook: string;
+  // Legacy git fields (deprecated — notebooks are now app-managed)
+  git_url?: string;
+  notebook_path?: string;
+  training_notebook?: string;
+  evaluation_notebook?: string;
 }
 
 export interface EOL {
@@ -23,7 +24,7 @@ export interface EOL {
 
 export interface FeatureEntry {
   id: number;
-  feature_definition_id: number;
+  training_spec_id: number;
   feature_type: 'lookup' | 'declarative';
   table_name: string | null;
   feature_names: string[] | null;
@@ -34,6 +35,20 @@ export interface FeatureEntry {
   declarative_spec: Record<string, any> | null;
 }
 
+export interface TrainingSpec {
+  id: number;
+  project_id: number;
+  eol_id: number | null;
+  name: string;
+  task_type: 'classification' | 'regression';
+  split_strategy: 'none' | 'train_eval' | 'train_eval_test';
+  split_method: 'random' | 'temporal' | null;
+  split_config: Record<string, any> | null;
+  parameters: Record<string, any> | null;
+  entries: FeatureEntry[];
+}
+
+// Legacy — kept for backward compat with old runs
 export interface FeatureDefinition {
   id: number;
   project_id: number;
@@ -61,7 +76,8 @@ export interface Dataset {
 export interface Run {
   id: number;
   project_id: number;
-  dataset_id: number;
+  training_spec_id: number | null;
+  dataset_id?: number; // Legacy
   job_id: number | null;
   run_id: number | null;
   mlflow_experiment_id: string | null;
@@ -73,6 +89,9 @@ export interface Run {
   model_uri: string | null;
   model_name: string | null;
   model_version: number | null;
+  training_table: string | null;
+  eval_table: string | null;
+  test_table: string | null;
   databricks_run_url: string | null;
   error_message: string | null;
   started_at: string | null;

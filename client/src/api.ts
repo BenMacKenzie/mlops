@@ -1,4 +1,4 @@
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment } from './types';
+import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -37,6 +37,32 @@ export const listNotebooks = (repoUrl: string, notebookPath: string) =>
     `/api/github/notebooks?repo_url=${encodeURIComponent(repoUrl)}&notebook_path=${encodeURIComponent(notebookPath)}`
   );
 
+// ── Training Specs ──
+export const getTrainingSpecs = (projectId: number) =>
+  request<(TrainingSpec & { run_count: number })[]>(`/api/projects/${projectId}/training-specs`);
+export const createTrainingSpec = (projectId: number, data: Partial<TrainingSpec>) =>
+  request<TrainingSpec>(`/api/projects/${projectId}/training-specs`, { method: 'POST', body: JSON.stringify(data) });
+export const updateTrainingSpec = (id: number, data: Partial<TrainingSpec>) =>
+  request<TrainingSpec>(`/api/training-specs/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const deleteTrainingSpec = (id: number) =>
+  request<{ ok: boolean }>(`/api/training-specs/${id}`, { method: 'DELETE' });
+export const copyTrainingSpec = (id: number, name?: string) =>
+  request<TrainingSpec>(`/api/training-specs/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
+export const createTrainingSpecEntry = (specId: number, data: any) =>
+  request<FeatureEntry>(`/api/training-specs/${specId}/entries`, { method: 'POST', body: JSON.stringify(data) });
+export const deleteTrainingSpecEntry = (id: number) =>
+  request<{ ok: boolean }>(`/api/training-spec-entries/${id}`, { method: 'DELETE' });
+
+// ── Spec Runs ──
+export const getSpecRuns = (projectId: number) =>
+  request<Run[]>(`/api/projects/${projectId}/spec-runs`);
+export const createSpecRun = (specId: number) =>
+  request<Run>(`/api/training-specs/${specId}/runs`, { method: 'POST' });
+export const launchSpecRun = (runId: number) =>
+  request<{ job_id: number; run_id: number; run_url: string }>(`/api/spec-runs/${runId}/launch`, { method: 'POST' });
+export const checkSpecRunStatus = (runId: number) =>
+  request<Run>(`/api/spec-runs/${runId}/check-status`, { method: 'POST' });
+
 // ── EOLs ──
 export const getEOLs = (projectId: number) =>
   request<EOL[]>(`/api/projects/${projectId}/eols`);
@@ -60,7 +86,7 @@ export const copyFeature = (id: number, name?: string) =>
   request<FeatureDefinition>(`/api/features/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
 
 // ── Feature Entries ──
-export const createFeatureEntry = (featureId: number, data: Omit<FeatureEntry, 'id' | 'feature_definition_id'>) =>
+export const createFeatureEntry = (featureId: number, data: any) =>
   request<FeatureEntry>(`/api/features/${featureId}/entries`, { method: 'POST', body: JSON.stringify(data) });
 export const deleteFeatureEntry = (id: number) =>
   request<{ ok: boolean }>(`/api/feature-entries/${id}`, { method: 'DELETE' });

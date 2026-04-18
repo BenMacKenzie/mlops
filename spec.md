@@ -7,7 +7,6 @@
 **Lakebase Instance:** mlops
 **Owner:** Ben MacKenzie
 **Prior Art:** https://github.com/BenMacKenzie/mlops/tree/main (Dash-based prototype — reference for data model, job patterns, feature lookup UI)
-**Reference Notebooks:** https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks (training/evaluation notebook contract)
 
 ---
 
@@ -16,12 +15,11 @@
 Managing the full lifecycle of ML models — from feature definition through training to deployment — requires coordinating across multiple systems (Unity Catalog feature tables, MLflow experiments, model registry, serving endpoints, Databricks Jobs). The current prototype (Dash/Python) proved the concept but needs a rewrite as a proper Databricks App using React + AppKit with Lakebase for persistence.
 
 The app should let a user:
-1. Define a **project** that points to training/evaluation notebooks in a git repo
-2. Define **datasets** using either standard `FeatureLookup` or declarative `Feature` definitions (beta)
-3. **Materialize** datasets as Unity Catalog tables via Databricks Jobs
-4. **Train** models by launching notebook jobs against materialized datasets
-5. **Track** experiments, compare runs, and register models via MLflow
-6. **Deploy** registered models to serving endpoints
+1. Define a **project** with a catalog/schema for ML assets
+2. Define an **EOL** (entity/observation/label) — the SQL "spine" for training data
+3. Create a **training spec** — features, split strategy, task type, and parameters — all in one place
+4. **Run** training — a single job that materializes the dataset, trains the model, and logs with feature specs via `fe.log_model()`
+5. **Register** models to Unity Catalog and **deploy** to serving endpoints with auto feature lookup
 
 ## Architecture
 
@@ -45,10 +43,9 @@ The app should let a user:
 │  Lakebase        │  │  Unity Catalog   │  │  MLflow          │
 │  (mlops)         │  │                  │  │                  │
 │  - projects      │  │  - Feature tables│  │  - Experiments   │
-│  - datasets      │  │  - Training tbls │  │  - Runs          │
-│  - feature defs  │  │  - Models        │  │  - Model Registry│
-│  - training runs │  │  - Online tables │  │                  │
-│  - online tables │  │                  │  │                  │
+│  - training specs│  │  - Models        │  │  - Runs          │
+│  - runs          │  │  - Synced tables │  │  - Model Registry│
+│  - synced tables │  │                  │  │                  │
 │  - deployments   │  │                  │  │                  │
 └─────────────────┘  └──────────────────┘  └──────────────────┘
           │                    │                      │
@@ -56,8 +53,9 @@ The app should let a user:
                                ▼
 ┌──────────────────┐  ┌──────────────────────────────┐
 │  Databricks Jobs │  │  Databricks Model Serving    │
-│  - Materialize   │  │  - Auto feature lookup       │
-│  - Train         │  │    (from online tables)       │
+│  - Train         │  │  - Auto feature lookup       │
+│  (materialize +  │  │    (from synced tables)       │
+│   train + log)   │  │                               │
 └──────────────────┘  └──────────────────────────────┘
 ```
 
@@ -72,20 +70,14 @@ The app should let a user:
 | Feature Tables | Unity Catalog (Databricks Feature Engineering) |
 | Experiment Tracking | MLflow (via Databricks workspace) |
 | Model Registry | Unity Catalog Model Registry |
-| Compute | Databricks Jobs (materialize + train notebooks) |
-| Online Feature Store | Databricks Online Tables (synced from UC feature tables) |
+| Compute | Databricks Jobs (app-managed notebooks: train, register) |
+| Online Feature Store | Lakebase Synced Tables (synced from UC feature tables) |
 | Serving | Databricks Model Serving endpoints (with auto feature lookup) |
 | Auth | AppKit dual-identity (service principal + user OBO) |
 
 ## Data Model (Lakebase)
 
-Evolves the existing schema from the prototype. Key changes:
-- Feature definitions are **containers** (name + EOL reference) with multiple **feature entries** inside
-- Each feature entry is either a standard FeatureLookup or a declarative Feature — entries can reference different tables
-- A dataset materializes a single feature definition (which may contain many entries from many tables)
-- Model version tracking linked to training runs
-- Online table tracking for feature tables published to Databricks Online Tables
-- Deployment tracking links registered models to serving endpoints with request-time feature configuration
+The data model is designed around a consolidated **training spec** that combines feature definitions, split configuration, and training parameters into a single entity. This eliminates the previous separate feature_definition and dataset tables, simplifying the workflow from EOL → training spec → run → model.
 
 ### Tables
 
@@ -98,13 +90,9 @@ Evolves the existing schema from the prototype. Key changes:
 | catalog | VARCHAR(255) | Unity Catalog catalog for this project's assets |
 | schema | VARCHAR(255) | UC schema within catalog |
 | model_name | VARCHAR(255) | Name for UC model registry (defaults to project name) |
-| git_url | TEXT | GitHub repo URL (e.g. `https://github.com/user/repo`) |
-| notebook_path | TEXT | Path within repo where notebooks live (e.g. `notebooks`) |
-| training_notebook | TEXT | Notebook filename selected from git repo (e.g. `01_Train_Classification_Model.py`) |
-| evaluation_notebook | TEXT | Notebook filename selected from git repo (e.g. `02_Eval_Model.py`) |
 
-#### `app.entity_observation_label` (was `eol_definition`)
-Defines the base entity/observation/label SQL — the "spine" of a training set.
+#### `app.entity_observation_label`
+Defines the base entity/observation/label SQL — the "spine" of a training set. Reusable across multiple training specs within a project.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -116,23 +104,49 @@ Defines the base entity/observation/label SQL — the "spine" of a training set.
 | entity_columns | TEXT[] | Primary key / entity columns |
 | timestamp_column | VARCHAR(255) | Timestamp column (for point-in-time joins) |
 
-#### `app.feature_definition`
-A named feature spec container. References an EOL and contains multiple feature entries. Immutable after creation — to modify, copy to a new version.
+#### `app.training_spec`
+A complete, immutable training configuration: features + split + task type. Combines what was previously feature_definition + dataset. To experiment, copy an existing spec and modify.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
 | project_id | BIGINT FK → project | |
-| eol_id | BIGINT FK → entity_observation_label | The spine this feature spec is built against |
-| name | VARCHAR(255) | e.g. `customer_churn_features_v2` |
+| eol_id | BIGINT FK → entity_observation_label | The spine |
+| name | VARCHAR(255) | e.g. `customer_churn_v2` |
+| task_type | VARCHAR(50) | `'classification'` or `'regression'` |
+| split_strategy | VARCHAR(50) | `'none'`, `'train_eval'`, `'train_eval_test'` |
+| split_method | VARCHAR(50) | `'random'`, `'temporal'` (null when strategy is `none`) |
+| split_config | JSONB | See below |
+| parameters | JSONB | Hyperparameters passed to the training notebook |
+
+**Split strategies:**
+- **None** — no split, single dataset. Training notebook uses cross-validation internally.
+- **Train / Eval** — two-way split. Standard model selection: train to fit, eval to assess.
+- **Train / Eval / Test** — three-way split. For hyperparameter search: eval for tuning, test for final unbiased estimate.
+
+**Split methods** (when strategy is not `none`):
+- **Random** — stratified random split on the label column (from EOL). Maintains class proportions. Seeded for reproducibility.
+- **Temporal** — sort by EOL's timestamp column, latest records to eval/test. Prevents future data leaking into training. Not stratified.
+
+**`split_config` JSONB:**
+```json
+{ "eval_pct": 20, "test_pct": 10, "seed": 42 }
+```
+
+**Split strategy determines which app-managed notebook runs:**
+- `none` → `notebooks/train_cv.py` (cross-validation)
+- `train_eval` → `notebooks/train_standard.py` (train + eval)
+- `train_eval_test` → `notebooks/train_hpsearch.py` (hyperparameter search, future)
+
+Each notebook handles both classification and regression via the `task_type` parameter.
 
 #### `app.feature_entry`
-An individual feature lookup or declarative feature within a feature definition. A feature definition can have many entries, each pulling from a different table.
+An individual feature lookup or declarative feature within a training spec. A training spec can have many entries, each pulling from a different table.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
-| feature_definition_id | BIGINT FK → feature_definition | Parent container |
+| training_spec_id | BIGINT FK → training_spec | Parent spec |
 | feature_type | VARCHAR(50) | `'lookup'` or `'declarative'` |
 | table_name | VARCHAR(255) | UC feature table (for lookup type) |
 | feature_names | TEXT[] | Columns to look up |
@@ -141,99 +155,46 @@ An individual feature lookup or declarative feature within a feature definition.
 | default_values | JSONB | Default values for missing features |
 | declarative_spec | JSONB | Full declarative Feature spec (for declarative type) |
 
-#### `app.dataset`
-A materialized feature definition. Split strategy controls how the data is divided for training and evaluation.
-
-**Split strategies:**
-- **None** — single output table, no split. For small datasets with cross-validation (CV handles train/val internally in the notebook).
-- **Train / Eval** — two tables. Standard model selection: train to fit, eval to assess.
-- **Train / Eval / Test** — three tables. For hyperparameter search: eval for tuning, test for final unbiased performance estimate (never used during development).
-
-**Split methods** (when strategy is not `none`):
-- **Random** — percentage-based stratified random split. Always stratified on the label column (from EOL) to maintain class proportions across splits. Uses a fixed seed for reproducibility.
-- **Temporal** — sort by the EOL's timestamp column, latest records go to eval (and test). Most realistic for production ML — prevents future data leaking into training. Not stratified (time ordering takes precedence).
-
-| Column                 | Type                                 | Notes                                                     |
-| ---------------------- | ------------------------------------ | --------------------------------------------------------- |
-| id                     | BIGSERIAL PK                         |                                                           |
-| project_id             | BIGINT FK → project                  |                                                           |
-| name                   | VARCHAR(255)                         |                                                           |
-| feature_definition_id  | BIGINT FK → feature_definition       | The feature spec to materialize (includes EOL + entries)  |
-| split_strategy         | VARCHAR(50)                          | `'none'`, `'train_eval'`, `'train_eval_test'`             |
-| split_method           | VARCHAR(50)                          | `'random'`, `'temporal'` (null when strategy is `none`)   |
-| split_config           | JSONB                                | See below                                                 |
-| status                 | VARCHAR(50)                          | `'NOT_STARTED'`, `'MATERIALIZING'`, `'READY'`, `'FAILED'` |
-| training_table         | VARCHAR(255)                         | UC table name once materialized (always present)          |
-| eval_table             | VARCHAR(255)                         | UC table name (null when strategy is `none`)              |
-| test_table             | VARCHAR(255)                         | UC table name (only for `train_eval_test`)                |
-| materialize_job_id     | BIGINT                               | Databricks job ID                                         |
-| materialize_run_id     | BIGINT                               | Databricks run ID                                         |
-| materialize_run_url    | TEXT                                 |                                                           |
-| row_count              | BIGINT                               | Row count after materialization                           |
-
-**`split_config` JSONB structure by method:**
-
-*Random:*
-```json
-{
-  "eval_pct": 20,
-  "test_pct": 10,
-  "seed": 42
-}
-```
-`test_pct` only present for `train_eval_test` strategy. Train gets the remainder.
-Stratification on the label column (from EOL) is automatic — no config needed.
-
-*Temporal:*
-```json
-{
-  "eval_pct": 20,
-  "test_pct": 10
-}
-```
-Rows sorted by EOL's `timestamp_column`. Latest `test_pct`% → test, next `eval_pct`% → eval, rest → train. Percentages define the proportion of rows, not date ranges.
-
 #### `app.run`
-A single run that trains a model then evaluates it, executed as a multi-task Databricks job (train → evaluate) within one MLflow experiment.
+A single end-to-end execution: materialize dataset → train model → log with `fe.log_model()`. One Databricks Job does everything.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
 | project_id | BIGINT FK → project | |
-| dataset_id | BIGINT FK → dataset | |
-| job_id | BIGINT | Databricks job ID (reused across runs) |
+| training_spec_id | BIGINT FK → training_spec | |
+| job_id | BIGINT | Databricks job ID |
 | run_id | BIGINT | Databricks run ID (for this execution) |
-| mlflow_experiment_id | VARCHAR(255) | MLflow experiment name |
+| mlflow_experiment_id | VARCHAR(255) | MLflow experiment ID |
 | mlflow_run_id | VARCHAR(255) | |
-| parameters | JSONB | Hyperparameters passed to training notebook |
-| training_metrics | JSONB | Metrics from training task |
-| eval_metrics | JSONB | Metrics from evaluation task |
+| training_metrics | JSONB | Metrics from training |
+| eval_metrics | JSONB | Metrics from evaluation |
 | status | VARCHAR(50) | `'PENDING'`, `'RUNNING'`, `'SUCCESS'`, `'FAILED'` |
 | model_uri | TEXT | MLflow model URI if registered |
 | model_name | VARCHAR(255) | Registered model name in UC |
 | model_version | INTEGER | Version in model registry |
+| training_table | VARCHAR(255) | Materialized training table |
+| eval_table | VARCHAR(255) | Materialized eval table (null for `none` split) |
+| test_table | VARCHAR(255) | Materialized test table (null unless 3-way split) |
 | databricks_run_url | TEXT | |
 | error_message | TEXT | |
 | started_at | TIMESTAMP | |
 | ended_at | TIMESTAMP | |
 
-#### `app.online_table`
-Tracks feature tables published to Databricks Online Tables. Project-level — shared across all deployments that reference the same source table.
+#### `app.synced_table`
+Tracks feature tables synced to Lakebase for online serving. Project-level — shared across all deployments.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
 | project_id | BIGINT FK → project | |
-| source_table | VARCHAR(255) | Fully-qualified UC table name (e.g. `catalog.schema.customer_features`) |
-| online_table_name | VARCHAR(255) | Online table name in UC (convention: `{source_table}_online`) |
-| primary_key_columns | TEXT[] | Entity/lookup key columns (from feature entry's `lookup_key`) |
-| timeseries_key | VARCHAR(255) | For point-in-time lookups (from feature entry's `timestamp_lookup_key`) |
-| sync_mode | VARCHAR(50) | `'triggered'` or `'continuous'` |
-| status | VARCHAR(50) | `'NOT_PUBLISHED'`, `'PROVISIONING'`, `'ONLINE'`, `'FAILED'` |
-| pipeline_id | VARCHAR(255) | Databricks pipeline ID for the online table |
+| source_table | VARCHAR(255) | Fully-qualified UC table name |
+| synced_table_name | VARCHAR(255) | Destination UC name (`{catalog}.{schema}.{name}_online`) |
+| status | VARCHAR(50) | `'PROVISIONING'`, `'ONLINE'`, `'FAILED'` |
+| pipeline_id | VARCHAR(255) | Lakebase sync pipeline URL |
 
 #### `app.deployment`
-Links a registered model version to a serving endpoint. All feature tables from the model's dataset must have online tables before the endpoint can be created.
+Links a registered model version to a serving endpoint. All feature tables from the model's training spec must be synced before the endpoint can be created.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -243,36 +204,34 @@ Links a registered model version to a serving endpoint. All feature tables from 
 | run_id | BIGINT FK → run | Must have `model_name`/`model_version` set |
 | endpoint_name | VARCHAR(255) | Serving endpoint name |
 | endpoint_status | VARCHAR(50) | `'NOT_CREATED'`, `'CREATING'`, `'READY'`, `'FAILED'` |
-| endpoint_config | JSONB | Instance type, scaling (min/max instances), etc. |
+| endpoint_config | JSONB | Instance type, scaling, etc. |
 | created_at | TIMESTAMP | |
 
 ### Entity Relationship Summary
 
 ```
 project 1──* entity_observation_label
-project 1──* feature_definition
-project 1──* dataset
+project 1──* training_spec
 project 1──* run
-project 1──* online_table
+project 1──* synced_table
 project 1──* deployment
 
-entity_observation_label 1──* feature_definition
-feature_definition 1──* feature_entry
-feature_definition 1──* dataset
-dataset 1──* run
+entity_observation_label 1──* training_spec
+training_spec 1──* feature_entry
+training_spec 1──* run
 run 1──* deployment
 ```
 
 ## UI Pages
 
 ### 1. Projects List
-- Table of all projects with status summary (datasets, runs)
+- Table of all projects with status summary (training specs, runs)
 - Create / edit / delete projects
-- When creating a project, user enters a GitHub repo URL; the app uses the GitHub API to list `.py` and `.ipynb` files in the repo's notebook path, then presents dropdowns for selecting training and evaluation notebooks
+- Project fields: name, description, catalog, schema, model name
 
 ### 2. Project Detail
-- Overview: git repo, catalog/schema, notebooks
-- Tabs for the sub-entities below
+- Overview: catalog/schema, model name, summary counts
+- Tabs: **EOL**, **Training**, **Deployment**
 
 ### 3. EOL Builder (within project)
 - Write SQL definition for the entity/observation/label "spine"
@@ -281,129 +240,89 @@ run 1──* deployment
 - **View:** Click an existing EOL to expand and see its full definition (read-only)
 - **Copy:** Duplicate an existing EOL to create a new version that can be modified before saving
 
-### 4. Feature Definition Builder (within project)
-A feature definition is a **named container** that references an EOL and holds one or more **feature entries**. Each entry pulls features from a different table. This lets you build a complete feature spec in one place.
+### 4. Training (within project)
+Consolidates feature definitions, dataset configuration, and model training into a single workflow. A **training spec** defines everything needed to produce a model: features, split, task type, and parameters.
 
-**Creating a feature definition:**
-1. Give it a name (e.g. `customer_churn_features_v2`)
-2. Select an **EOL** from dropdown (scoped to project) — this is the spine all entries join against
+**Creating a training spec:**
+1. Give it a name (e.g. `customer_churn_v2`)
+2. Select an **EOL** from dropdown
+3. Select **task type**: classification or regression
+4. Configure **split strategy**: None (CV), Train/Eval, or Train/Eval/Test
+5. Configure **split method** (when not None): Random (stratified) or Temporal
+6. Set split percentages and seed
+7. Optionally set hyperparameters (JSON)
 
-**Adding feature entries** (one or more per definition):
+**Adding feature entries** (one or more per spec):
 
 *Standard FeatureLookup entry:*
 1. Select a **feature table** via cascading dropdowns: Catalog → Schema → Table
-   - Dropdowns populated from Unity Catalog metadata via SQL warehouse (`SHOW CATALOGS`, `SHOW SCHEMAS IN {catalog}`, `SHOW TABLES IN {catalog}.{schema}`)
-2. Select **feature columns** from the chosen table (multi-select, populated from `DESCRIBE TABLE`)
-3. Select **lookup key(s)** from the EOL's entity columns (maps feature table to EOL)
+   - Dropdowns populated from Unity Catalog metadata via SQL warehouse
+2. Select **feature columns** from the chosen table (multi-select)
+3. Select **lookup key(s)** from the EOL's entity columns
 4. Optionally set **timestamp lookup key** and **default values**
 
 *Declarative Feature entry (beta):*
-1. Enter declarative feature spec as JSON (source tables, entity/time columns, feature SQL)
+1. Configure via guided form: source table, input column, function, time window
 
 **View & Copy:**
-- **View:** Click an existing feature definition to expand and see its EOL reference and all entries (read-only)
-- **Copy:** Duplicate an existing feature definition (with all its entries) to create a new version that can be modified before saving
+- **View:** Click an existing spec to expand and see all details (read-only)
+- **Copy:** Duplicate an existing spec (with all entries) to create a new version. Use this to experiment with different features, splits, or parameters.
 
-Feature definitions are immutable after creation — to change the feature spec, copy to a new version, modify, and save. This preserves lineage: a dataset always points to the exact feature spec that produced it.
+Training specs are **locked** once a run has been created against them — no edits to features, split, or parameters after that point. This preserves lineage: a model always traces back to the exact spec that produced it. To iterate, copy the spec.
 
-### 5. Dataset Builder (within project)
-- Select a **feature definition** from dropdown (which already references an EOL and contains all feature entries)
-- Configure **split strategy**:
-  - **None** — no split, single output table. Best for small datasets where the training notebook uses cross-validation internally.
-  - **Train / Eval** — two-way split. Standard for model selection.
-  - **Train / Eval / Test** — three-way split. For hyperparameter search workflows where eval is used during tuning and test is held out for final assessment.
-- Configure **split method** (when strategy is not "none"):
-  - **Random** — stratified random split on the label column (from EOL). Maintains class proportions across splits. User sets eval % (and test % for 3-way) plus a seed for reproducibility.
-  - **Temporal** — sort by EOL's timestamp column, latest records go to eval/test. Recommended when data has a time dimension to prevent future leakage. User sets eval % (and test %).
-  - If the EOL has no timestamp column, temporal is disabled in the UI.
-- **Materialize:** Launch Databricks job that executes all feature entries in the definition, splits per config, poll for status, show results
-- Display: show output table names with links, row counts per split, job link
+**Running:**
+- Click **Run** on a training spec → launches a single Databricks Job that:
+  1. Executes EOL SQL → spine DataFrame
+  2. Builds `FeatureLookup` objects → `fe.create_training_set()` → `load_df()`
+  3. Splits per strategy/method
+  4. Trains model (CatBoost, configured by task_type + parameters)
+  5. Logs with `fe.log_model()` (embeds feature specs for serving)
+- View runs with status, metrics, job/MLflow links
+- **Register model:** One-click registration via app-managed notebook (`register_model.py`)
+- Auto-polls running jobs every 10s
+- Delete runs to clean up
 
-Server endpoints needed for the cascading dropdowns:
+**App-managed training notebooks** (in `notebooks/` folder, uploaded to workspace before each run):
+- `train_cv.py` — cross-validation (split_strategy = `none`)
+- `train_standard.py` — standard train/eval (split_strategy = `train_eval`)
+- `train_hpsearch.py` — hyperparameter search (split_strategy = `train_eval_test`, future)
+
+Each notebook handles both classification and regression via the `task_type` parameter. The app selects the right notebook automatically based on split_strategy.
+
+Server endpoints for cascading dropdowns:
 - `GET /api/uc/catalogs` — list catalogs via SQL warehouse
 - `GET /api/uc/schemas?catalog=X` — list schemas in catalog
 - `GET /api/uc/tables?catalog=X&schema=Y` — list tables in schema
 - `GET /api/uc/columns?catalog=X&schema=Y&table=Z` — list columns in table
 
-### 6. Training (within project)
-A single "run" trains and evaluates a model in one Databricks Job, logging to one MLflow experiment.
+### 5. Deployment (within project)
 
-- Select a materialized dataset
-- Configure hyperparameters (or use notebook defaults)
-- Launch run — creates a single-task job running the training notebook (which includes evaluation via `mlflow.evaluate()` or cross-validation)
-- View running/completed runs with status and test/eval metrics (single Metrics column; training metrics hidden)
-- **Register model:** One-click registration to Unity Catalog as `{catalog}.{schema}.{model_name}` (model name configured at project level). Creates registered model if needed, then creates a version from the MLflow run artifact. Registered models link to UC model explorer.
-- Links to Databricks job and MLflow experiment (resolved by numeric ID) for each run
-- Delete runs to clean up stale/failed entries
-- Auto-polls running jobs every 10s; status updated to SUCCESS/FAILED once terminal
-- Job reuse: first run creates the job definition, subsequent runs reuse it with `run-now`
+Manages synced tables (online feature store) and serving endpoints.
 
-### 7. MLflow Integration
-- **Experiment Viewer:** List experiments for the project, show runs with metrics/params
-- **Run Comparison:** Side-by-side metric comparison for selected runs
-- **Model Registry:** List registered models, versions, stage transitions
-- Use MLflow REST API / Databricks SDK (not embedded iframe)
-
-### 8. Deployment (within project)
-
-Manages the full workflow from registered model to live serving endpoint: specifying request-time features, publishing feature tables to the online store, and creating/monitoring serving endpoints.
-
-Since training notebooks use `FeatureEngineeringClient.log_model()`, models have their feature specs embedded. When served, Databricks automatically resolves feature lookups from online tables at inference time. If the requesting system supplies a feature in the request payload, it is used instead of looking it up from the online table — this is built-in Databricks serving behavior.
+Since training notebooks use `fe.log_model()`, models have feature specs embedded. Databricks serving endpoints automatically resolve feature lookups from synced tables at inference time. If the requesting system supplies a feature in the request payload, it is used instead of the lookup — built-in Databricks behavior.
 
 **Two sections in the tab:**
 
-1. **Online Tables** (project-level) — shows all distinct source tables referenced by feature entries across **all** datasets in the project. For each table: online table status (not published / provisioning / online / failed) and which datasets reference it. This gives a full picture of the project's feature table landscape and online readiness.
-2. **Deployments** — each deployment links a registered model version to a serving endpoint. When viewing a deployment, the online tables list highlights which tables are required for that deployment's model (derived from the model's run → dataset → feature_definition → feature_entries). Tables not needed by the selected deployment are shown but de-emphasized.
+1. **Synced Tables** (project-level) — all distinct source tables from feature entries across all training specs. Shows sync status, pipeline link, and which training specs reference each table. When a deployment is selected, highlights tables required by that model.
+2. **Deployments** — each links a registered model to a serving endpoint.
 
 **Creating a deployment:**
-1. Give it a name (e.g. `production`, `staging-v2`)
-2. Select a **registered model version** from dropdown (runs that have `model_name`/`model_version`)
-3. Online tables list highlights the required tables for this model's dataset and shows their status
-4. All required feature tables must be ONLINE before the endpoint can be created
+1. Give it a name (e.g. `production`)
+2. Select a registered model version from dropdown
+3. All required feature tables must be synced (ONLINE) before endpoint creation
+4. Link to Databricks endpoint UI for management (stop/start)
 
-**Publishing online tables:**
-- One-click publish for tables that need online sync (creates Databricks Online Table via `POST /api/2.0/online-tables`)
-- Online table spec derived from feature entry metadata:
-  - `source_table_full_name` — from feature entry's `table_name`
-  - `primary_key_columns` — from feature entry's `lookup_key`
-  - `timeseries_key` — from feature entry's `timestamp_lookup_key` (if present)
-  - `run_triggered` or `run_continuously` — user-selectable sync mode
-- Online table naming convention: `{source_table}_online` (configurable)
-- Status tracking: PROVISIONING → ONLINE (or FAILED), polled via `GET /api/2.0/online-tables/{name}`
-- A "Publish All Required" button to publish all missing tables at once
+**Syncing tables:**
+- One-click sync via Lakebase Projects API (`POST /api/2.0/postgres/synced_tables`)
+- PK columns read from UC `information_schema.constraint_column_usage`
+- CDF auto-enabled on source tables before sync
+- Naming: `{project_catalog}.{project_schema}.{short_name}_online`
+- "Sync All Required" button per deployment
 
-**Creating the serving endpoint:**
-- Prereq: all required online tables must be ONLINE
-- Create via `POST /api/2.0/serving-endpoints` with the registered model's UC name and version
-- Endpoint config: workload size, scale-to-zero, traffic routing
-- The model's embedded feature spec (from `fe.log_model()`) handles feature resolution automatically
-
-**Monitoring & testing:**
-- Poll endpoint status via `GET /api/2.0/serving-endpoints/{name}`: NOT_READY → READY (or FAILED)
-- Show endpoint URL when ready
-- **Test interface:** send JSON payload with entity keys, display prediction response
-- Delete deployment: tears down endpoint (online tables are project-level and remain)
-
-**Online table view (project-level section):**
-- Lists all distinct source tables from feature entries across all datasets in the project
-- Columns: source table, online table name, sync mode, status, datasets that reference this table
-- When a deployment is selected, rows needed by that deployment's model are visually highlighted
-- Per-row actions: **Publish** (create online table) or **Remove** (delete online table, with warning if active deployments depend on it)
-- "Publish All Required" button when a deployment is selected — publishes all missing tables needed by that model
-- Status is interactive: user can publish or remove online tables at any time to control what's in the online store
-
-Server endpoints needed:
-- `GET /api/projects/:projectId/online-tables` — list online tables for project
-- `POST /api/projects/:projectId/online-tables` — publish a new online table
-- `POST /api/online-tables/:id/check-status` — poll provisioning status
-- `DELETE /api/online-tables/:id` — remove an online table
-- `GET /api/projects/:projectId/deployments` — list deployments
-- `POST /api/projects/:projectId/deployments` — create a deployment
-- `POST /api/deployments/:id/publish-tables` — publish all required online tables for this deployment
-- `POST /api/deployments/:id/create-endpoint` — create the serving endpoint
-- `POST /api/deployments/:id/check-status` — poll endpoint status
-- `POST /api/deployments/:id/test` — send test inference request to endpoint
-- `DELETE /api/deployments/:id` — delete deployment and endpoint
+**Test interface:**
+- Entity key inputs populated from sample data (queried from EOL SQL)
+- Constructs `{"dataframe_records": [{...}]}` payload automatically
+- Displays prediction response
 
 ## MLflow Integration Details
 
@@ -424,63 +343,65 @@ The app interacts with MLflow via the Databricks REST API (from the Express back
 | Get online table status | `GET /api/2.0/online-tables/{name}` | Poll provisioning status |
 | Delete online table | `DELETE /api/2.0/online-tables/{name}` | Remove online table |
 
-## Databricks Jobs
+## App-Managed Notebooks
 
-The app does NOT contain training or evaluation notebooks. Users provide their own notebooks via a git repo URL + path (configured per project). The app launches these notebooks as Databricks Jobs, passing standardized widget parameters.
+All training notebooks live in this codebase under `notebooks/` and are uploaded to the workspace via the Workspace Import API before each job run. Users do not provide their own notebooks.
 
-### Notebook Contract
+### Training Notebooks
 
-Training and evaluation notebooks must accept these `dbutils.widgets`:
+Each notebook handles the full pipeline: materialize → split → train → log with `fe.log_model()`.
 
-**Training notebook** (includes evaluation via `mlflow.evaluate()` or cross-validation):
-- `target` — label column name
-- `training_table_name` — UC table with training data
-- `eval_table_name` — UC table with eval data (empty string if split strategy is `none`)
-- `test_table_name` — UC table with held-out test data (empty string if not 3-way split)
-- `split_strategy` — `'none'`, `'train_eval'`, or `'train_eval_test'` — tells the notebook how to handle evaluation
-- `experiment_name` — MLflow experiment name (short name; notebook prepends `/Users/<username>/`)
-- `catalog` — Unity Catalog catalog (for volume access, e.g. TMPDIR)
-- `schema` — UC schema within catalog
-- `feature_lookups_json` — JSON array of feature lookup definitions from the dataset's feature entries. Used by `fe.log_model()` to embed feature specs into the model for auto feature lookup at serving time. Format: `[{"table_name": "...", "feature_names": [...], "lookup_key": [...], "timestamp_lookup_key": "..."}]`
+| Notebook | Split Strategy | Description |
+|----------|---------------|-------------|
+| `train_cv.py` | `none` | Cross-validation. No separate eval set — CV handles splitting internally. |
+| `train_standard.py` | `train_eval` | Standard train/eval. Train on one split, evaluate on the other. |
+| `train_hpsearch.py` | `train_eval_test` | Hyperparameter search. Eval for tuning, test for final assessment. (Future) |
 
-**Notebook behavior by split strategy:**
-- `none` — notebook receives a single table; should use cross-validation internally for evaluation
-- `train_eval` — train on `training_table_name`, evaluate on `eval_table_name`
-- `train_eval_test` — train on `training_table_name`, tune/evaluate on `eval_table_name`, final assessment on `test_table_name`
+Each notebook handles both classification and regression via the `task_type` parameter.
 
-**Important:** Training notebooks must log models using `FeatureEngineeringClient.log_model()` (not `mlflow.sklearn.log_model()` or other flavor-specific methods). This embeds the feature spec into the model, enabling Databricks serving endpoints to automatically look up features from online tables at inference time. Without `fe.log_model()`, the deployment workflow cannot create auto-feature-lookup endpoints.
+### Notebook Parameters (widget contract)
 
-See https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks for reference implementations.
+All training notebooks accept:
+- `eol_sql` — the spine SQL (entity keys + label)
+- `label_column` — target column name
+- `entity_columns_json` — JSON array of entity key column names
+- `feature_lookups_json` — JSON array of feature lookup definitions
+- `task_type` — `'classification'` or `'regression'`
+- `split_method` — `'random'` or `'temporal'` (ignored for CV)
+- `split_config_json` — `{"eval_pct": 20, "test_pct": 10, "seed": 42}`
+- `parameters_json` — hyperparameters (e.g. `{"iterations": 100}`)
+- `catalog` — Unity Catalog catalog
+- `schema` — UC schema
+- `experiment_name` — MLflow experiment name (short; notebook prepends `/Users/<username>/`)
+
+### Notebook Pipeline (what each notebook does)
+
+1. Execute EOL SQL → spine DataFrame
+2. Build `FeatureLookup` objects from `feature_lookups_json`
+3. `fe.create_training_set(spine, feature_lookups, label)` → training_set
+4. `training_set.load_df()` → full DataFrame with features
+5. Split per `split_method` + `split_config` (or skip for CV)
+6. Train model (CatBoost, configured by `task_type` + `parameters_json`)
+7. `fe.log_model(model, training_set=training_set, ...)` → model with feature specs embedded
+8. Return metrics + table names via `dbutils.notebook.exit()`
+
+### Registration Notebook
+
+`register_model.py` — separate app-managed notebook for model registration. Called when user clicks "Register" on a successful run.
+- **Params:** `run_id`, `model_name`
+- **Logic:** `mlflow.register_model(f"runs:/{run_id}/model", model_name)`
+- Required because the REST API cannot resolve artifact paths when DBFS root is disabled.
 
 ### Job Execution Pattern
 
-All compute-intensive work (materialize, train, evaluate) runs as **Databricks Jobs**, not in the app process. The app server uses the Databricks REST API to:
+All compute runs as **Databricks Jobs** (serverless), not in the app process:
 
-1. **Create a job** (`POST /api/2.1/jobs/create`) — persistent job definition with git source, notebook path, and base parameters
-2. **Run the job** (`POST /api/2.1/jobs/run-now`) — trigger execution with `notebook_params`
-3. **Poll for completion** (`GET /api/2.1/jobs/runs/get`) — check status, update Lakebase when done
-4. **Store the job_id** in Lakebase so it can be rerun without recreating
-
-Note: Notebook paths should strip `.py` extension when passed to the Databricks Jobs API (the API expects the path without extension).
-
-### Materialize Job
-- **Notebook:** App-managed — lives in this codebase at `notebooks/materialize.py`, uploaded to workspace by the app
-- **Params:** `eol_sql`, `feature_lookup_json`, `catalog`, `schema`, `training_table_name`, `eval_table_name`, `test_table_name`, `split_strategy`, `split_method`, `split_config_json`
-- **Process:** Executes EOL SQL, applies FeatureLookups via `FeatureEngineeringClient.create_training_set()`, splits per strategy/method, writes to UC tables
-- **Split logic in notebook:**
-  - `none` — write full dataset to `training_table_name`, skip eval/test
-  - `random` — stratified split on label column using `sampleBy` (maintains class proportions), seeded for reproducibility. 2-way or 3-way per strategy.
-  - `temporal` — sort by timestamp column, latest rows to eval/test by percentage. No stratification.
-- **Output:** App updates dataset status + table names + row count in Lakebase
-
-### Training Job
-- **Notebook:** User-provided, referenced from the user's git repo
-- **Git source:** Project's `git_url` + `notebook_path/training_notebook` (job-level `git_source`, relative paths)
-- **Params:** `target`, `training_table_name`, `eval_table_name`, `test_table_name`, `split_strategy`, `experiment_name`, `catalog`, `schema`
-- **Output:** Notebook trains model, evaluates via `mlflow.evaluate()` or cross-validation (depending on `split_strategy`), and logs everything to MLflow. App resolves the MLflow experiment numeric ID via `GET /api/2.0/mlflow/experiments/get-by-name` for direct linking.
-
-### Job creation and execution code
-The job orchestration is **app server logic**, implemented as Express API endpoints. The user's git repo contains only the training notebook — not any job orchestration code. The reference implementation at https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks shows the notebook contract (widget params) that user notebooks must follow.
+1. **Upload notebook** to workspace via `POST /api/2.0/workspace/import`
+2. **Create job** (`POST /api/2.1/jobs/create`) — workspace notebook, environment with `databricks-feature-engineering`
+3. **Run job** (`POST /api/2.1/jobs/run-now`) with `notebook_params`
+4. **Poll for completion** (`GET /api/2.1/jobs/runs/get`)
+5. **Parse output** (`GET /api/2.1/jobs/runs/get-output` on task run_id)
+6. **Update Lakebase** with metrics, model info, table names
 
 ## app.yaml
 
@@ -514,27 +435,25 @@ See `deploy.sh` for the full deployment script.
 
 1. **AppKit over APX** — AppKit is the official Databricks SDK with built-in Lakebase plugin, type-safe queries, and active maintenance. React + Express is the standard pattern.
 
-2. **Lakebase for app state, UC for ML artifacts** — App metadata (projects, dataset definitions, run tracking) lives in Lakebase. Actual data (feature tables, training tables, models) lives in Unity Catalog. Clean separation of concerns.
+2. **Lakebase for app state, UC for ML artifacts** — App metadata (projects, training specs, run tracking) lives in Lakebase. Actual data (feature tables, models) lives in Unity Catalog. Clean separation of concerns.
 
-3. **Declarative features stored as JSONB** — Since the declarative feature API is in beta and the spec may evolve, storing the full definition as JSONB in `feature_entry.declarative_spec` is more flexible than normalizing into separate tables. The `feature_type` discriminator column lets the UI and backend handle both paths.
+3. **Consolidated training spec** — Feature definitions, dataset split config, task type, and parameters are combined into a single `training_spec` entity. This eliminates the previous separate `feature_definition` and `dataset` tables and reduces the UI from 4 tabs (EOL, Features, Datasets, Training) to 2 tabs (EOL, Training). Experimentation is done by copying a training spec and modifying it.
 
-4. **MLflow via REST API, not SDK** — The Express backend calls MLflow REST endpoints directly. This avoids Python SDK dependency and works naturally with the Node.js/TypeScript stack. The training notebooks (Python) use the MLflow Python SDK directly.
+4. **App-managed training notebooks** — Training notebooks live in the app's `notebooks/` folder, not in a user's git repo. The app selects the right notebook based on `split_strategy` (CV, standard, or hyperparameter search). Each notebook handles both classification and regression via the `task_type` parameter. This gives the app full control over the training pipeline and ensures `fe.log_model()` is always used correctly.
 
-5. **Notebook-driven training** — The app doesn't contain training or evaluation logic. Users provide their own notebooks (in a git repo) that follow a standard widget parameter contract (`target`, `training_table_name`, `eval_table_name`, `experiment_name`, etc.). The app launches them as Databricks Jobs. See [db-model-trainer](https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks) for reference implementations.
+5. **Single-job training pipeline** — Each run executes one Databricks Job that does everything: EOL SQL → feature lookups → `fe.create_training_set()` → split → train → `fe.log_model()`. No separate materialize step. The `training_set` object flows through the entire pipeline, ensuring the model's feature specs are embedded for serving.
 
-6. **Feature definition is a container with entries** — A `feature_definition` is a named container (with EOL reference) that holds multiple `feature_entry` rows. Each entry can be a lookup or declarative feature from a different table. This lets users build a complete feature spec in one place. Datasets point to one feature definition, which may have many entries.
+6. **`fe.log_model()` enables auto-feature-lookup** — Training notebooks log models with `FeatureEngineeringClient.log_model()`, embedding the feature spec. Databricks serving endpoints automatically look up features from synced tables at inference time.
 
-7. **EOL renamed for clarity** — `eol_definition` → `entity_observation_label` to be more self-documenting.
+7. **Declarative features stored as JSONB** — Since the declarative feature API is in beta, storing the full definition as JSONB in `feature_entry.declarative_spec` is more flexible than normalizing.
 
-8. **Immutable feature definitions** — Feature definitions cannot be edited after creation. To modify, users copy an existing definition to a new version. This preserves lineage: a dataset always points to the exact feature spec that produced it.
+8. **Training specs lock on first run** — A training spec can be edited freely until its first run is created. After that, it's locked — features, split config, and parameters are frozen to preserve lineage. The UI disables editing and shows a "Copy" action instead. This is enforced server-side: PUT/POST endpoints reject changes to specs that have runs.
 
-9. **Materialize notebook auto-uploaded** — The app-managed `notebooks/materialize.py` is uploaded to the workspace via the Workspace Import API before each materialize job runs. This ensures the notebook is always in sync with the app code.
+9. **Synced tables (not online tables)** — Feature tables are synced to Lakebase via `POST /api/2.0/postgres/synced_tables`. PK columns are read from UC `information_schema.constraint_column_usage`. CDF is auto-enabled on source tables. Synced tables are project-level, shared across deployments.
 
-10. **Online tables are project-level, not per-deployment** — A feature table (e.g. `catalog.schema.customer_features`) is published to the online store once and shared by all deployments that reference it. This avoids duplicate syncs when multiple models use the same source tables. The `online_table` table tracks these at the project level.
+10. **Notebook-based model registration** — Model registration uses an app-managed notebook (`register_model.py`) that calls `mlflow.register_model()`. The REST API cannot resolve artifact paths when DBFS root is disabled — the Python SDK has internal access.
 
-11. **All feature tables must be online before deployment** — All source tables from a dataset's feature entries must be published as online tables before the model can be deployed. No per-feature request-time selection is needed — if the requesting system supplies a feature in the request payload, Databricks serving uses it instead of the online table lookup. This is built-in serving behavior, so the app doesn't need to track which features are request-time.
-
-12. **`fe.log_model()` in training notebooks enables auto-feature-lookup** — Because training notebooks log models with `FeatureEngineeringClient.log_model()`, the model's feature spec is embedded. Databricks serving endpoints automatically look up features from online tables at inference time — no custom serving logic needed in the app.
+11. **MLflow via REST API for reads, notebooks for writes** — The Express backend calls MLflow REST endpoints for reading (experiments, runs, metrics). Model logging and registration require the Python SDK and run inside notebooks.
 
 ---
 
@@ -564,16 +483,19 @@ See `deploy.sh` for the full deployment script.
 - [x] Add model_name as project-level field (backfill existing projects with project name) — 2026-04-17
 - [x] Pass catalog/schema as training notebook params (for volume TMPDIR) — 2026-04-17
 - [x] Consolidate metrics display to single column (test/eval only, hide training metrics) — 2026-04-17
-- [ ] End-to-end test: create project → EOL → features → dataset → train — 2026-04-12
-- [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime, esbuild bundle has plugin manifest issue) — 2026-04-12
+- [x] Build Deployment tab: synced tables, endpoint creation, test inference — 2026-04-17
+- [x] Synced table provisioning via Lakebase Projects API — 2026-04-17
+- [x] Model registration via app-managed notebook (register_model.py) — 2026-04-17
+- [x] Serving endpoint creation + status polling — 2026-04-17
+- [x] Test inference interface with entity key inputs and sample data — 2026-04-17
+- [ ] Consolidate UI: merge Features/Datasets/Training tabs into single Training tab — 2026-04-17
+- [ ] Create `app.training_spec` table, migrate from feature_definition + dataset — 2026-04-17
+- [ ] Write `train_cv.py` notebook (full pipeline: EOL → features → CV → fe.log_model) — 2026-04-17
+- [ ] Write `train_standard.py` notebook (train/eval split) — 2026-04-17
+- [ ] Remove git_url/notebook_path from project, remove GitHub notebook listing — 2026-04-17
+- [ ] End-to-end test: create project → EOL → training spec → run → register → deploy — 2026-04-17
+- [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime) — 2026-04-12
 - [ ] Build MLflow experiment viewer + run comparison UI — 2026-04-12
-- [ ] Add `app.online_table` and `app.deployment` Lakebase tables — 2026-04-17
-- [ ] Build server endpoints: online table CRUD, publish, status polling — 2026-04-17
-- [ ] Build server endpoints: deployment CRUD, endpoint creation, test inference — 2026-04-17
-- [ ] Build Deployment tab UI: online tables view + deployment creation + status monitoring — 2026-04-17
-- [ ] Online table provisioning via Databricks Online Tables API — 2026-04-17
-- [ ] Serving endpoint creation + status polling — 2026-04-17
-- [ ] Test inference interface (send entity keys, show prediction) — 2026-04-17
 - [ ] Fix local dev Lakebase auth (SASL issue with AppKit token refresh) — 2026-04-12
 
 ## Decisions
@@ -610,6 +532,9 @@ See `deploy.sh` for the full deployment script.
 - 2026-04-17: Training notebooks already use `FeatureEngineeringClient.log_model()` — models have feature specs embedded. Serving endpoints auto-resolve feature lookups from online tables at inference time. No notebook contract changes needed for deployment.
 - 2026-04-17: Online table naming convention: `{project_catalog}.{project_schema}.{short_table_name}_online`. Synced table creation uses `POST /api/2.0/postgres/synced_tables` with PK columns read from UC `information_schema.constraint_column_usage`. CDF enabled automatically on source tables before sync.
 - 2026-04-17: Dataset split redesign — three strategies (none, train/eval, train/eval/test) × two methods (random stratified, temporal). Random splits always stratified on label column to maintain class proportions. Temporal splits sorted by EOL timestamp column, latest records to eval/test. "None" strategy for CV workflows where the notebook handles splitting internally. Replaces the original `eval_split_type`/`eval_split_config` design.
+- 2026-04-17: Consolidated training spec — merged feature_definition + dataset + training config into single `training_spec` entity. UI reduced from 4 tabs to 2 (EOL + Training). Split strategy determines notebook: none→CV, train_eval→standard, train_eval_test→hpsearch. Copy workflow for experimentation.
+- 2026-04-17: App-managed training notebooks — training notebooks live in `notebooks/` folder, not user git repos. App selects notebook based on split_strategy. Each notebook handles full pipeline: EOL → features → create_training_set → split → train → fe.log_model(). Ensures feature specs always embedded correctly. Project no longer needs git_url/notebook_path fields.
+- 2026-04-17: Single-job training — no separate materialize step. Each run does everything in one notebook/job. The `training_set` object from `fe.create_training_set()` flows through to `fe.log_model()`, embedding feature specs for serving. Eliminates the need to cache/manage materialized tables separately.
 
 ## Meeting Notes
 See `meetings/` folder for dated meeting notes.

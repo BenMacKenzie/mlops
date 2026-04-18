@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment } from './types';
+import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec } from './types';
 import * as api from './api';
 
 // ── Simple hash-based routing ──
@@ -212,26 +212,24 @@ function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
 function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: string; navigate: (p: Page) => void }) {
   const [project, setProject] = useState<Project | null>(null);
   const [eols, setEols] = useState<EOL[]>([]);
-  const [features, setFeatures] = useState<FeatureDefinition[]>([]);
-  const [datasets, setDatasets] = useState<Dataset[]>([]);
-  const [runs, setRuns] = useState<Run[]>([]);
+  const [trainingSpecs, setTrainingSpecs] = useState<(TrainingSpec & { run_count: number })[]>([]);
+  const [specRuns, setSpecRuns] = useState<Run[]>([]);
 
   const load = useCallback(async () => {
-    const [p, e, f, d, r] = await Promise.all([
+    const [p, e, ts, sr] = await Promise.all([
       api.getProject(projectId),
       api.getEOLs(projectId),
-      api.getFeatures(projectId),
-      api.getDatasets(projectId),
-      api.getRuns(projectId),
+      api.getTrainingSpecs(projectId),
+      api.getSpecRuns(projectId),
     ]);
-    setProject(p); setEols(e); setFeatures(f); setDatasets(d); setRuns(r);
+    setProject(p); setEols(e); setTrainingSpecs(ts); setSpecRuns(sr);
   }, [projectId]);
 
   useEffect(() => { load(); }, [load]);
 
   if (!project) return <div className="text-center py-8">Loading...</div>;
 
-  const tabs = ['overview', 'eols', 'features', 'datasets', 'training', 'deployment'];
+  const tabs = ['overview', 'eols', 'training', 'deployment'];
 
   return (
     <div>
@@ -250,19 +248,17 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
         ))}
       </div>
 
-      {tab === 'overview' && <OverviewTab project={project} eols={eols} features={features} datasets={datasets} runs={runs} />}
+      {tab === 'overview' && <OverviewTab project={project} eols={eols} trainingSpecs={trainingSpecs} specRuns={specRuns} />}
       {tab === 'eols' && <EOLsTab projectId={projectId} eols={eols} reload={load} />}
-      {tab === 'features' && <FeaturesTab projectId={projectId} eols={eols} features={features} reload={load} />}
-      {tab === 'datasets' && <DatasetsTab projectId={projectId} features={features} datasets={datasets} reload={load} />}
-      {tab === 'training' && <RunsTab projectId={projectId} datasets={datasets} runs={runs} reload={load} />}
-      {tab === 'deployment' && <DeploymentTab projectId={projectId} eols={eols} features={features} datasets={datasets} runs={runs} />}
+      {tab === 'training' && <TrainingSpecTab projectId={projectId} eols={eols} specs={trainingSpecs} runs={specRuns} reload={load} />}
+      {tab === 'deployment' && <DeploymentTab projectId={projectId} eols={eols} trainingSpecs={trainingSpecs} runs={specRuns} />}
     </div>
   );
 }
 
 // ── Overview Tab ──
-function OverviewTab({ project, eols, features, datasets, runs }: {
-  project: Project; eols: EOL[]; features: FeatureDefinition[]; datasets: Dataset[]; runs: Run[];
+function OverviewTab({ project, eols, trainingSpecs, specRuns }: {
+  project: Project; eols: EOL[]; trainingSpecs: TrainingSpec[]; specRuns: Run[];
 }) {
   return (
     <div className="grid grid-cols-2 gap-6">
@@ -272,19 +268,14 @@ function OverviewTab({ project, eols, features, datasets, runs }: {
           <div><dt className="text-gray-500">Catalog</dt><dd className="font-mono">{project.catalog}</dd></div>
           <div><dt className="text-gray-500">Schema</dt><dd className="font-mono">{project.schema}</dd></div>
           <div><dt className="text-gray-500">Model Name</dt><dd className="font-mono">{project.model_name || project.name}</dd></div>
-          <div><dt className="text-gray-500">Git URL</dt><dd className="font-mono break-all">{project.git_url || '-'}</dd></div>
-          <div><dt className="text-gray-500">Notebook Path</dt><dd className="font-mono">{project.notebook_path || '-'}</dd></div>
-          <div><dt className="text-gray-500">Training Notebook</dt><dd className="font-mono">{project.training_notebook || '-'}</dd></div>
-          <div><dt className="text-gray-500">Evaluation Notebook</dt><dd className="font-mono">{project.evaluation_notebook || '-'}</dd></div>
         </dl>
       </div>
       <div className="bg-white p-4 rounded-lg shadow">
         <h3 className="font-medium mb-3">Summary</h3>
-        <div className="grid grid-cols-2 gap-4 text-center">
+        <div className="grid grid-cols-3 gap-4 text-center">
           <div className="p-3 bg-gray-50 rounded"><div className="text-2xl font-bold">{eols.length}</div><div className="text-xs text-gray-500">EOLs</div></div>
-          <div className="p-3 bg-gray-50 rounded"><div className="text-2xl font-bold">{features.length}</div><div className="text-xs text-gray-500">Features</div></div>
-          <div className="p-3 bg-gray-50 rounded"><div className="text-2xl font-bold">{datasets.length}</div><div className="text-xs text-gray-500">Datasets</div></div>
-          <div className="p-3 bg-gray-50 rounded"><div className="text-2xl font-bold">{runs.length}</div><div className="text-xs text-gray-500">Runs</div></div>
+          <div className="p-3 bg-gray-50 rounded"><div className="text-2xl font-bold">{trainingSpecs.length}</div><div className="text-xs text-gray-500">Training Specs</div></div>
+          <div className="p-3 bg-gray-50 rounded"><div className="text-2xl font-bold">{specRuns.length}</div><div className="text-xs text-gray-500">Runs</div></div>
         </div>
       </div>
     </div>
@@ -435,7 +426,7 @@ function EOLsTab({ projectId, eols, reload }: { projectId: number; eols: EOL[]; 
 }
 
 // ── Feature Entry Form — reusable cascading dropdown form for adding a lookup or declarative entry ──
-function FeatureEntryForm({ featureId, eolId, eols, onSaved }: { featureId: number; eolId: number | null; eols: EOL[]; onSaved: () => void }) {
+function FeatureEntryForm({ featureId, eolId, eols, onSaved, isTrainingSpec }: { featureId: number; eolId: number | null; eols: EOL[]; onSaved: () => void; isTrainingSpec?: boolean }) {
   const [featureType, setFeatureType] = useState<'lookup' | 'declarative'>('lookup');
   const [form, setForm] = useState({
     catalog: '', schema: '', table: '',
@@ -547,7 +538,8 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved }: { featureId: numb
       };
     }
 
-    await api.createFeatureEntry(featureId, {
+    const createFn = isTrainingSpec ? api.createTrainingSpecEntry : api.createFeatureEntry;
+    await createFn(featureId, {
       feature_type: featureType,
       table_name: fullTableName,
       feature_names: featureType === 'lookup' ? form.selectedFeatures : null,
@@ -1308,6 +1300,287 @@ function RunsTab({ projectId, datasets, runs, reload }: {
 }
 
 // ════════════════════════════════════════════
+//  TRAINING SPEC TAB
+// ════════════════════════════════════════════
+function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
+  projectId: number; eols: EOL[]; specs: (TrainingSpec & { run_count: number })[]; runs: Run[]; reload: () => void;
+}) {
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' });
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [addingEntryTo, setAddingEntryTo] = useState<number | null>(null);
+  const [registerError, setRegisterError] = useState('');
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Poll running runs
+  useEffect(() => {
+    const active = runs.filter(r => r.status === 'RUNNING');
+    if (active.length === 0) {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    if (pollRef.current) return;
+    pollRef.current = setInterval(async () => {
+      let changed = false;
+      for (const r of active) {
+        try {
+          const updated = await api.checkSpecRunStatus(r.id);
+          if (updated.status !== 'RUNNING') changed = true;
+        } catch { /* ignore */ }
+      }
+      if (changed) reload();
+    }, 10000);
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+  }, [runs, reload]);
+
+  const submitSpec = async () => {
+    const splitConfig = form.split_strategy !== 'none' ? { eval_pct: parseFloat(form.eval_pct), seed: parseInt(form.seed) } : null;
+    await api.createTrainingSpec(projectId, {
+      name: form.name,
+      eol_id: form.eol_id ? parseInt(form.eol_id) : null,
+      task_type: form.task_type as any,
+      split_strategy: form.split_strategy as any,
+      split_method: form.split_strategy !== 'none' ? form.split_method as any : null,
+      split_config: splitConfig,
+      parameters: form.parameters ? JSON.parse(form.parameters) : null,
+    });
+    setForm({ name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' });
+    setShowForm(false);
+    reload();
+  };
+
+  const launchRun = async (specId: number) => {
+    try {
+      const run = await api.createSpecRun(specId);
+      await api.launchSpecRun(run.id);
+      reload();
+    } catch (e: any) { alert(`Launch failed: ${e.message}`); }
+  };
+
+  const registerModel = async (runId: number) => {
+    setRegisterError('');
+    try {
+      await api.registerModel(runId);
+      reload();
+    } catch (e: any) { setRegisterError(e.message); }
+  };
+
+  const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
+
+  const formatMetrics = (metrics: Record<string, any> | null) => {
+    if (!metrics) return '-';
+    return Object.entries(metrics).map(([k, v]) => `${k}=${typeof v === 'number' ? v.toFixed(4) : v}`).join(', ');
+  };
+
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="text-lg font-medium">Training Specs</h2>
+        <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+          {showForm ? 'Cancel' : 'New Training Spec'}
+        </button>
+      </div>
+
+      {showForm && (
+        <div className="mb-4 p-4 border rounded-lg bg-white shadow">
+          <div className="grid grid-cols-3 gap-3">
+            <div><label className="block text-sm font-medium mb-1">Name</label><input className="w-full px-3 py-2 border rounded" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. customer_churn_v1" /></div>
+            <div>
+              <label className="block text-sm font-medium mb-1">EOL (spine)</label>
+              <select className="w-full px-3 py-2 border rounded" value={form.eol_id} onChange={e => setForm({ ...form, eol_id: e.target.value })}>
+                <option value="">Select EOL...</option>
+                {eols.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Task Type</label>
+              <select className="w-full px-3 py-2 border rounded" value={form.task_type} onChange={e => setForm({ ...form, task_type: e.target.value })}>
+                <option value="classification">Classification</option>
+                <option value="regression">Regression</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Split Strategy</label>
+              <select className="w-full px-3 py-2 border rounded" value={form.split_strategy} onChange={e => setForm({ ...form, split_strategy: e.target.value })}>
+                <option value="none">None (CV)</option>
+                <option value="train_eval">Train / Eval</option>
+                <option value="train_eval_test">Train / Eval / Test</option>
+              </select>
+            </div>
+            {form.split_strategy !== 'none' && (
+              <>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Split Method</label>
+                  <select className="w-full px-3 py-2 border rounded" value={form.split_method} onChange={e => setForm({ ...form, split_method: e.target.value })}>
+                    <option value="random">Random (stratified)</option>
+                    <option value="temporal">Temporal</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Eval % / Seed</label>
+                  <div className="flex gap-2">
+                    <input type="number" className="w-20 px-2 py-2 border rounded" value={form.eval_pct} onChange={e => setForm({ ...form, eval_pct: e.target.value })} />
+                    <input type="number" className="w-20 px-2 py-2 border rounded" value={form.seed} onChange={e => setForm({ ...form, seed: e.target.value })} placeholder="seed" />
+                  </div>
+                </div>
+              </>
+            )}
+            <div className="col-span-3">
+              <label className="block text-sm font-medium mb-1">Parameters (JSON, optional)</label>
+              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.parameters} onChange={e => setForm({ ...form, parameters: e.target.value })} placeholder='{"iterations": 100}' />
+            </div>
+          </div>
+          <div className="mt-3">
+            <button onClick={submitSpec} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.eol_id}>Create</button>
+          </div>
+        </div>
+      )}
+
+      {registerError && (
+        <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex justify-between items-center">
+          <span>Registration failed: {registerError}</span>
+          <button onClick={() => setRegisterError('')} className="text-red-400 hover:text-red-600 text-xs ml-4">Dismiss</button>
+        </div>
+      )}
+
+      <div className="space-y-4">
+        {specs.map(spec => {
+          const eol = eols.find(e => e.id === spec.eol_id);
+          const isExpanded = expandedId === spec.id;
+          const isLocked = spec.run_count > 0;
+          const specRuns = runs.filter(r => r.training_spec_id === spec.id);
+
+          return (
+            <div key={spec.id} className="bg-white rounded-lg shadow">
+              {/* Header */}
+              <div className="p-4 flex justify-between items-start">
+                <div className="cursor-pointer flex-1" onClick={() => setExpandedId(isExpanded ? null : spec.id)}>
+                  <h3 className="font-medium">
+                    <span className="text-gray-400 mr-1">{isExpanded ? '▾' : '▸'}</span>
+                    {spec.name}
+                    {isLocked && <span className="ml-2 text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded">locked</span>}
+                  </h3>
+                  <div className="text-sm text-gray-500 ml-4">
+                    EOL: <span className="font-mono">{eol?.name || '—'}</span>
+                    <span className="mx-2">|</span>{spec.task_type}
+                    <span className="mx-2">|</span>{spec.split_strategy === 'none' ? 'CV' : spec.split_strategy.replace('_', '/')}
+                    <span className="mx-2">|</span>{spec.entries.length} {spec.entries.length === 1 ? 'feature' : 'features'}
+                    <span className="mx-2">|</span>{spec.run_count} {spec.run_count === 1 ? 'run' : 'runs'}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  {!isLocked && spec.entries.length > 0 && (
+                    <button onClick={() => launchRun(spec.id)} className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">Run</button>
+                  )}
+                  {!isLocked && (
+                    <button onClick={() => setAddingEntryTo(addingEntryTo === spec.id ? null : spec.id)} className="px-2 py-1 bg-blue-50 text-blue-600 text-xs rounded hover:bg-blue-100">
+                      {addingEntryTo === spec.id ? 'Cancel' : '+ Feature'}
+                    </button>
+                  )}
+                  <button onClick={() => api.copyTrainingSpec(spec.id).then(reload)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Copy</button>
+                  {!isLocked && <button onClick={() => api.deleteTrainingSpec(spec.id).then(reload)} className="text-red-500 text-sm">Delete</button>}
+                </div>
+              </div>
+
+              {/* Feature entry form */}
+              {addingEntryTo === spec.id && (
+                <div className="px-4 pb-4">
+                  <FeatureEntryForm featureId={spec.id} eolId={spec.eol_id} eols={eols} onSaved={() => { setAddingEntryTo(null); reload(); }} isTrainingSpec />
+                </div>
+              )}
+
+              {/* Expanded detail */}
+              {isExpanded && (
+                <div className="border-t px-4 pb-4 pt-3">
+                  {/* Config summary */}
+                  <div className="grid grid-cols-4 gap-2 text-sm mb-3">
+                    <div><span className="text-gray-500">Task:</span> {spec.task_type}</div>
+                    <div><span className="text-gray-500">Split:</span> {spec.split_strategy === 'none' ? 'None (CV)' : `${spec.split_strategy.replace('_', '/')} — ${spec.split_method}`}</div>
+                    {spec.split_config && <div><span className="text-gray-500">Eval:</span> {spec.split_config.eval_pct}% (seed {spec.split_config.seed})</div>}
+                    {spec.parameters && Object.keys(spec.parameters).length > 0 && (
+                      <div><span className="text-gray-500">Params:</span> <span className="font-mono text-xs">{JSON.stringify(spec.parameters)}</span></div>
+                    )}
+                  </div>
+
+                  {/* Feature entries */}
+                  {spec.entries.length > 0 ? (
+                    <div className="space-y-2 mb-4">
+                      <div className="text-xs font-medium text-gray-500">Feature Entries</div>
+                      {spec.entries.map(entry => (
+                        <div key={entry.id} className="flex justify-between items-center p-2 bg-gray-50 rounded text-sm">
+                          <div>
+                            <span className="text-xs px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded mr-2">{entry.feature_type}</span>
+                            <span className="font-mono text-gray-600">{entry.table_name}</span>
+                            {entry.feature_type === 'lookup' && <span className="text-gray-400"> → {entry.feature_names?.join(', ')}</span>}
+                          </div>
+                          {!isLocked && (
+                            <button onClick={() => api.deleteTrainingSpecEntry(entry.id).then(reload)} className="text-red-400 text-xs hover:text-red-600">remove</button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-gray-400 mb-4">No feature entries — click "+ Feature" to add</div>
+                  )}
+
+                  {/* Runs */}
+                  {specRuns.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-gray-500 mb-2">Runs</div>
+                      <table className="w-full text-left text-sm">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-3 py-2 font-medium text-gray-500">ID</th>
+                            <th className="px-3 py-2 font-medium text-gray-500">Status</th>
+                            <th className="px-3 py-2 font-medium text-gray-500">Model</th>
+                            <th className="px-3 py-2 font-medium text-gray-500">Metrics</th>
+                            <th className="px-3 py-2 font-medium text-gray-500">Links</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {specRuns.map(r => (
+                            <tr key={r.id} className="hover:bg-gray-50">
+                              <td className="px-3 py-2">{r.id}</td>
+                              <td className="px-3 py-2">
+                                <StatusBadge status={r.status} />
+                                {r.status === 'RUNNING' && (
+                                  <button className="ml-2 px-2 py-0.5 bg-gray-200 text-gray-600 text-xs rounded" onClick={() => api.checkSpecRunStatus(r.id).then(reload)}>Check</button>
+                                )}
+                                {r.error_message && <div className="text-xs text-red-500 mt-1">{r.error_message}</div>}
+                              </td>
+                              <td className="px-3 py-2 font-mono text-xs">
+                                {r.model_name ? (
+                                  <a href={`${host}/explore/data/models/${r.model_name.replace(/\./g, '/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                                    {r.model_name.split('.').pop()} v{r.model_version}
+                                  </a>
+                                ) : r.status === 'SUCCESS' ? (
+                                  <button className="px-2 py-1 bg-purple-600 text-white text-xs rounded hover:bg-purple-700" onClick={() => registerModel(r.id)}>Register</button>
+                                ) : '-'}
+                              </td>
+                              <td className="px-3 py-2 font-mono text-xs">{formatMetrics(r.eval_metrics)}</td>
+                              <td className="px-3 py-2 text-xs space-x-2">
+                                {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
+                                {r.mlflow_experiment_id && <a href={`${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
+                                <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {specs.length === 0 && <div className="text-center py-8 text-gray-400">No training specs yet</div>}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════
 //  TEST ENDPOINT
 // ════════════════════════════════════════════
 function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: string[] }) {
@@ -1392,17 +1665,14 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
 // ════════════════════════════════════════════
 //  DEPLOYMENT TAB
 // ════════════════════════════════════════════
-function DeploymentTab({ projectId, eols, features, datasets, runs }: {
-  projectId: number; eols: EOL[]; features: FeatureDefinition[]; datasets: Dataset[]; runs: Run[];
+function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
+  projectId: number; eols: EOL[]; trainingSpecs: TrainingSpec[]; runs: Run[];
 }) {
   const [onlineTables, setOnlineTables] = useState<OnlineTable[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', run_id: '', endpoint_name: '' });
   const [selectedDepId, setSelectedDepId] = useState<number | null>(null);
-  const [testInputs, setTestInputs] = useState<Record<string, string>>({});
-  const [testResult, setTestResult] = useState<any>(null);
-  const [testError, setTestError] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const load = useCallback(async () => {
@@ -1451,24 +1721,21 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
     return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
   }, [onlineTables, deployments, load]);
 
-  // Derive all distinct source tables from all feature entries across all datasets
+  // Derive all distinct source tables from all feature entries across all training specs
   const allFeatureTables = (() => {
-    const tableMap = new Map<string, { table: string; lookupKey: string[]; timestampKey: string | null; datasetNames: string[] }>();
-    for (const fd of features) {
-      const refDatasets = datasets.filter(d => d.feature_definition_id === fd.id).map(d => d.name);
-      for (const entry of fd.entries) {
+    const tableMap = new Map<string, { table: string; lookupKey: string[]; timestampKey: string | null; specNames: string[] }>();
+    for (const spec of trainingSpecs) {
+      for (const entry of spec.entries) {
         if (!entry.table_name) continue;
         const existing = tableMap.get(entry.table_name);
         if (existing) {
-          for (const ds of refDatasets) {
-            if (!existing.datasetNames.includes(ds)) existing.datasetNames.push(ds);
-          }
+          if (!existing.specNames.includes(spec.name)) existing.specNames.push(spec.name);
         } else {
           tableMap.set(entry.table_name, {
             table: entry.table_name,
             lookupKey: entry.lookup_key || [],
             timestampKey: entry.timestamp_lookup_key,
-            datasetNames: [...refDatasets],
+            specNames: [spec.name],
           });
         }
       }
@@ -1485,11 +1752,9 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
     if (!selectedDep) return new Set<string>();
     const run = runs.find(r => r.id === selectedDep.run_id);
     if (!run) return new Set<string>();
-    const dataset = datasets.find(d => d.id === run.dataset_id);
-    if (!dataset) return new Set<string>();
-    const fd = features.find(f => f.id === dataset.feature_definition_id);
-    if (!fd) return new Set<string>();
-    return new Set(fd.entries.map(e => e.table_name).filter(Boolean) as string[]);
+    const spec = trainingSpecs.find(s => s.id === run.training_spec_id);
+    if (!spec) return new Set<string>();
+    return new Set(spec.entries.map(e => e.table_name).filter(Boolean) as string[]);
   })();
 
   const registeredRuns = runs.filter(r => r.model_name && r.model_version);
@@ -1544,11 +1809,9 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
   const getEntityColumns = (dep: Deployment): string[] => {
     const run = runs.find(r => r.id === dep.run_id);
     if (!run) return [];
-    const dataset = datasets.find(d => d.id === run.dataset_id);
-    if (!dataset) return [];
-    const fd = features.find(f => f.id === dataset.feature_definition_id);
-    if (!fd) return [];
-    const eol = eols.find(e => e.id === fd.eol_id);
+    const spec = trainingSpecs.find(s => s.id === run.training_spec_id);
+    if (!spec) return [];
+    const eol = eols.find(e => e.id === spec.eol_id);
     if (!eol) return [];
     const cols = eol.entity_columns;
     if (Array.isArray(cols)) return cols;
@@ -1556,32 +1819,13 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
     return [];
   };
 
-  const runTest = async (depId: number) => {
-    setTestResult(null); setTestError('');
-    try {
-      const record: Record<string, any> = {};
-      for (const [k, v] of Object.entries(testInputs)) {
-        // Try to parse as number, otherwise keep as string
-        const num = Number(v);
-        record[k] = v !== '' && !isNaN(num) ? num : v;
-      }
-      const payload = { dataframe_records: [record] };
-      const result = await api.testDeploymentEndpoint(depId, payload);
-      setTestResult(result);
-    } catch (e: any) {
-      setTestError(e.message);
-    }
-  };
-
   // Check if all required tables for a deployment are ONLINE
   const allTablesOnline = (dep: Deployment) => {
     const run = runs.find(r => r.id === dep.run_id);
     if (!run) return false;
-    const dataset = datasets.find(d => d.id === run.dataset_id);
-    if (!dataset) return false;
-    const fd = features.find(f => f.id === dataset.feature_definition_id);
-    if (!fd) return true;
-    const tables = fd.entries.map(e => e.table_name).filter(Boolean);
+    const spec = trainingSpecs.find(s => s.id === run.training_spec_id);
+    if (!spec) return true;
+    const tables = spec.entries.map(e => e.table_name).filter(Boolean);
     return tables.every(t => onlineTableMap.get(t!)?.status === 'ONLINE');
   };
 
@@ -1624,7 +1868,7 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
                         <span className="text-xs text-gray-400">Not synced</span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-xs text-gray-500">{ft.datasetNames.join(', ')}</td>
+                    <td className="px-4 py-3 text-xs text-gray-500">{ft.specNames.join(', ')}</td>
                     <td className="px-4 py-3 text-xs">
                       {ot?.pipeline_id?.startsWith('http') ? (
                         <a href={ot.pipeline_id} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">View</a>
@@ -1659,7 +1903,7 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
                 );
               })}
               {allFeatureTables.length === 0 && (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">No feature tables — create datasets with feature definitions first</td></tr>
+                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">No feature tables yet — create training specs with feature entries first</td></tr>
               )}
             </tbody>
           </table>
@@ -1717,7 +1961,7 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
         <div className="space-y-4">
           {deployments.map(dep => {
             const run = runs.find(r => r.id === dep.run_id);
-            const dataset = run ? datasets.find(d => d.id === run.dataset_id) : null;
+            const spec = run ? trainingSpecs.find(s => s.id === run.training_spec_id) : null;
             const isSelected = selectedDepId === dep.id;
             const tablesReady = allTablesOnline(dep);
 
@@ -1736,7 +1980,7 @@ function DeploymentTab({ projectId, eols, features, datasets, runs }: {
                           className="text-blue-600 hover:underline font-mono"
                         >{run.model_name.split('.').pop()} v{run.model_version}</a>
                       ) : 'unknown'}
-                      {dataset && <> | Dataset: <span className="font-mono">{dataset.name}</span></>}
+                      {spec && <> | Spec: <span className="font-mono">{spec.name}</span></>}
                     </div>
                     <div className="text-sm text-gray-500">
                       Endpoint: <span className="font-mono">{dep.endpoint_name}</span>

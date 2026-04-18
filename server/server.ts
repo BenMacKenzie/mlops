@@ -369,7 +369,339 @@ appkit.server.extend((app) => {
   });
 
   // ════════════════════════════════════════════
-  //  FEATURE DEFINITIONS (container: name + EOL)
+  //  TRAINING SPECS (consolidated: features + split + params)
+  // ════════════════════════════════════════════
+  app.get('/api/projects/:projectId/training-specs', async (req, res) => {
+    try {
+      const result = await db.query(
+        'SELECT * FROM app.training_spec WHERE project_id = $1 ORDER BY id',
+        [req.params.projectId]
+      );
+      const specs = [];
+      for (const spec of result.rows) {
+        const entries = await db.query(
+          'SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id',
+          [spec.id]
+        );
+        const runCount = await db.query(
+          'SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1',
+          [spec.id]
+        );
+        specs.push({ ...spec, entries: entries.rows, run_count: parseInt(runCount.rows[0].count) });
+      }
+      res.json(specs);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/projects/:projectId/training-specs', async (req, res) => {
+    try {
+      const { eol_id, name, task_type, split_strategy, split_method, split_config, parameters } = req.body;
+      const result = await db.query(
+        `INSERT INTO app.training_spec (project_id, eol_id, name, task_type, split_strategy, split_method, split_config, parameters)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [req.params.projectId, eol_id, name, task_type || 'classification',
+         split_strategy || 'none', split_method || null,
+         split_config ? JSON.stringify(split_config) : null,
+         parameters ? JSON.stringify(parameters) : null]
+      );
+      res.status(201).json({ ...result.rows[0], entries: [], run_count: 0 });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.put('/api/training-specs/:id', async (req, res) => {
+    try {
+      // Lock check: reject edits if spec has runs
+      const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [req.params.id]);
+      if (parseInt(runCount.rows[0].count) > 0) {
+        res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
+      }
+      const { eol_id, name, task_type, split_strategy, split_method, split_config, parameters } = req.body;
+      const result = await db.query(
+        `UPDATE app.training_spec SET eol_id=$1, name=$2, task_type=$3, split_strategy=$4, split_method=$5, split_config=$6, parameters=$7
+         WHERE id=$8 RETURNING *`,
+        [eol_id, name, task_type, split_strategy, split_method,
+         split_config ? JSON.stringify(split_config) : null,
+         parameters ? JSON.stringify(parameters) : null, req.params.id]
+      );
+      res.json(result.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete('/api/training-specs/:id', async (req, res) => {
+    try {
+      await db.query('DELETE FROM app.training_spec WHERE id = $1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Copy a training spec with all feature entries
+  app.post('/api/training-specs/:id/copy', async (req, res) => {
+    try {
+      const src = await db.query('SELECT * FROM app.training_spec WHERE id = $1', [req.params.id]);
+      if (src.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
+      const s = src.rows[0];
+      const newName = req.body.name || `${s.name} (copy)`;
+      const specResult = await db.query(
+        `INSERT INTO app.training_spec (project_id, eol_id, name, task_type, split_strategy, split_method, split_config, parameters)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [s.project_id, s.eol_id, newName, s.task_type, s.split_strategy, s.split_method, s.split_config, s.parameters]
+      );
+      const newSpec = specResult.rows[0];
+      const entries = await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1', [req.params.id]);
+      const copiedEntries = [];
+      for (const e of entries.rows) {
+        const entryResult = await db.query(
+          `INSERT INTO app.feature_entry
+           (training_spec_id, feature_type, table_name, feature_names, lookup_key,
+            timestamp_lookup_key, output_name, default_values, declarative_spec)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+          [newSpec.id, e.feature_type, e.table_name, e.feature_names, e.lookup_key,
+           e.timestamp_lookup_key, e.output_name, e.default_values, e.declarative_spec]
+        );
+        copiedEntries.push(entryResult.rows[0]);
+      }
+      res.status(201).json({ ...newSpec, entries: copiedEntries, run_count: 0 });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Feature entries for training specs
+  app.post('/api/training-specs/:specId/entries', async (req, res) => {
+    try {
+      // Lock check
+      const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [req.params.specId]);
+      if (parseInt(runCount.rows[0].count) > 0) {
+        res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
+      }
+      const {
+        feature_type, table_name, feature_names, lookup_key,
+        timestamp_lookup_key, output_name, default_values, declarative_spec
+      } = req.body;
+      const result = await db.query(
+        `INSERT INTO app.feature_entry
+         (training_spec_id, feature_type, table_name, feature_names, lookup_key,
+          timestamp_lookup_key, output_name, default_values, declarative_spec)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [req.params.specId, feature_type, table_name, feature_names, lookup_key,
+         timestamp_lookup_key, output_name, default_values ? JSON.stringify(default_values) : null,
+         declarative_spec ? JSON.stringify(declarative_spec) : null]
+      );
+      res.status(201).json(result.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete('/api/training-spec-entries/:id', async (req, res) => {
+    try {
+      // Check lock via the entry's parent spec
+      const entry = await db.query('SELECT training_spec_id FROM app.feature_entry WHERE id = $1', [req.params.id]);
+      if (entry.rows.length > 0 && entry.rows[0].training_spec_id) {
+        const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [entry.rows[0].training_spec_id]);
+        if (parseInt(runCount.rows[0].count) > 0) {
+          res.status(400).json({ error: 'Training spec is locked — it has runs.' }); return;
+        }
+      }
+      await db.query('DELETE FROM app.feature_entry WHERE id = $1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Runs for training specs ──
+  app.get('/api/projects/:projectId/spec-runs', async (req, res) => {
+    try {
+      const result = await db.query(
+        'SELECT * FROM app.run WHERE project_id = $1 AND training_spec_id IS NOT NULL ORDER BY id DESC',
+        [req.params.projectId]
+      );
+      res.json(result.rows);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/training-specs/:specId/runs', async (req, res) => {
+    try {
+      const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [req.params.specId])).rows[0];
+      if (!spec) { res.status(404).json({ error: 'Training spec not found' }); return; }
+      const result = await db.query(
+        `INSERT INTO app.run (project_id, training_spec_id, status)
+         VALUES ($1,$2,'PENDING') RETURNING *`,
+        [spec.project_id, req.params.specId]
+      );
+      res.status(201).json(result.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Launch a training spec run — single job: materialize + train + fe.log_model()
+  app.post('/api/spec-runs/:runId/launch', async (req, res) => {
+    try {
+      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.runId]);
+      if (runResult.rows.length === 0) { res.status(404).json({ error: 'Run not found' }); return; }
+      const run = runResult.rows[0];
+
+      const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [run.training_spec_id])).rows[0];
+      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [run.project_id])).rows[0];
+      const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
+      const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [spec.id])).rows;
+
+      const featureLookups = entries
+        .filter((e: any) => e.feature_type === 'lookup')
+        .map((e: any) => ({
+          table_name: e.table_name,
+          feature_names: e.feature_names,
+          lookup_key: e.lookup_key,
+          timestamp_lookup_key: e.timestamp_lookup_key || null,
+        }));
+
+      const entityColumns = Array.isArray(eol.entity_columns)
+        ? eol.entity_columns
+        : (eol.entity_columns || '').replace(/^\{|\}$/g, '').split(',').filter(Boolean);
+
+      const experimentName = project.name;
+      const userName = await getUsername(req);
+
+      // Select notebook based on split_strategy
+      let notebookFile: string;
+      if (spec.split_strategy === 'train_eval') {
+        notebookFile = 'train_standard.py';
+      } else if (spec.split_strategy === 'train_eval_test') {
+        notebookFile = 'train_hpsearch.py'; // future
+      } else {
+        notebookFile = 'train_cv.py';
+      }
+
+      const notebookPath = `/Workspace/Users/${userName}/.mlops/${stripPyExt(notebookFile)}`;
+      const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', notebookFile);
+      await uploadNotebook(req, localNotebook, notebookPath);
+
+      // Build table names for standard/hpsearch splits
+      const specSlug = spec.name.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+      const trainingTableName = `${project.catalog}.${project.schema}.${specSlug}_train`;
+      const evalTableName = spec.split_strategy !== 'none' ? `${project.catalog}.${project.schema}.${specSlug}_eval` : '';
+      const testTableName = spec.split_strategy === 'train_eval_test' ? `${project.catalog}.${project.schema}.${specSlug}_test` : '';
+
+      const params: Record<string, string> = {
+        eol_sql: eol.sql_definition,
+        label_column: eol.label_column || '',
+        entity_columns_json: JSON.stringify(entityColumns),
+        feature_lookups_json: JSON.stringify(featureLookups),
+        task_type: spec.task_type || 'classification',
+        parameters_json: JSON.stringify(spec.parameters || {}),
+        catalog: project.catalog,
+        schema: project.schema,
+        experiment_name: experimentName,
+      };
+
+      // Add split params for standard/hpsearch
+      if (spec.split_strategy !== 'none') {
+        params.split_method = spec.split_method || 'random';
+        params.split_config_json = JSON.stringify(spec.split_config || { eval_pct: 20, seed: 42 });
+        params.training_table_name = trainingTableName;
+        params.eval_table_name = evalTableName;
+        if (testTableName) params.test_table_name = testTableName;
+      }
+
+      console.log(`[spec-run] Launching ${notebookFile} for spec "${spec.name}" (${spec.task_type}, ${spec.split_strategy})`);
+
+      const { job_id, run_id: jobRunId, run_url } = await createOrRunJob(
+        req, `mlops-${project.name}-${specSlug}`, notebookPath, params
+      );
+
+      // Look up MLflow experiment ID
+      const host = process.env.DATABRICKS_HOST || '';
+      const token = getToken(req);
+      let mlflowExperimentId: string | null = null;
+      try {
+        const experimentFullPath = `/Users/${userName}/${experimentName}`;
+        const expResp = await fetch(`${host}/api/2.0/mlflow/experiments/get-by-name?experiment_name=${encodeURIComponent(experimentFullPath)}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const expData: any = await expResp.json();
+        if (expData.experiment?.experiment_id) mlflowExperimentId = expData.experiment.experiment_id;
+      } catch { /* ignore */ }
+
+      await db.query(
+        `UPDATE app.run SET status='RUNNING', job_id=$1, run_id=$2, mlflow_experiment_id=$3,
+         databricks_run_url=$4, training_table=$5, eval_table=$6, test_table=$7, started_at=NOW()
+         WHERE id=$8`,
+        [job_id, jobRunId, mlflowExperimentId, run_url,
+         trainingTableName, evalTableName || null, testTableName || null, run.id]
+      );
+      res.json({ job_id, run_id: jobRunId, run_url });
+    } catch (e: any) {
+      console.error(`[spec-run] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Check status for a spec run — parse notebook output for metrics + mlflow_run_id
+  app.post('/api/spec-runs/:id/check-status', async (req, res) => {
+    try {
+      const result = await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.status(404).json({ error: 'Run not found' }); return; }
+      const run = result.rows[0];
+
+      if (run.status === 'SUCCESS' || run.status === 'FAILED') { res.json(run); return; }
+      if (!run.run_id) { res.json(run); return; }
+
+      const jobRun = await databricksApi(req, 'GET', `jobs/runs/get?run_id=${run.run_id}`);
+      const state = jobRun.state;
+      const lifeCycleState = state?.life_cycle_state;
+      const resultState = state?.result_state;
+
+      if (lifeCycleState === 'TERMINATED' && resultState === 'SUCCESS') {
+        // Parse notebook output from the task run
+        let mlflowRunId: string | null = null;
+        let evalMetrics: Record<string, any> | null = null;
+        let trainingTable: string | null = run.training_table;
+        let evalTable: string | null = run.eval_table;
+        try {
+          const taskRunId = jobRun.tasks?.[0]?.run_id || run.run_id;
+          const output = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${taskRunId}`);
+          const nbResult = JSON.parse(output.notebook_output?.result || '{}');
+          mlflowRunId = nbResult.mlflow_run_id || null;
+          evalMetrics = nbResult.metrics || null;
+          if (nbResult.training_table) trainingTable = nbResult.training_table;
+          if (nbResult.eval_table) evalTable = nbResult.eval_table;
+        } catch (e: any) {
+          console.error(`[spec-run] Output parse error: ${e.message}`);
+        }
+
+        await db.query(
+          `UPDATE app.run SET status='SUCCESS', mlflow_run_id=$1, eval_metrics=$2,
+           training_table=$3, eval_table=$4, ended_at=NOW() WHERE id=$5`,
+          [mlflowRunId, evalMetrics ? JSON.stringify(evalMetrics) : null,
+           trainingTable, evalTable, run.id]
+        );
+      } else if (lifeCycleState === 'TERMINATED') {
+        await db.query(
+          `UPDATE app.run SET status='FAILED', error_message=$1, ended_at=NOW() WHERE id=$2`,
+          [state?.state_message || resultState || 'Unknown error', run.id]
+        );
+      }
+      const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ════════════════════════════════════════════
+  //  LEGACY: FEATURE DEFINITIONS (kept for backward compat)
   // ════════════════════════════════════════════
   app.get('/api/projects/:projectId/features', async (req, res) => {
     try {
@@ -1600,12 +1932,24 @@ db.query(`
     eol_id BIGINT REFERENCES app.entity_observation_label(id) ON DELETE SET NULL,
     name VARCHAR(255) NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS app.training_spec (
+    id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
+    eol_id BIGINT REFERENCES app.entity_observation_label(id) ON DELETE SET NULL,
+    name VARCHAR(255) NOT NULL,
+    task_type VARCHAR(50) NOT NULL DEFAULT 'classification',
+    split_strategy VARCHAR(50) NOT NULL DEFAULT 'none',
+    split_method VARCHAR(50),
+    split_config JSONB,
+    parameters JSONB
+  );
   CREATE TABLE IF NOT EXISTS app.feature_entry (
-    id BIGSERIAL PRIMARY KEY, feature_definition_id BIGINT NOT NULL REFERENCES app.feature_definition(id) ON DELETE CASCADE,
+    id BIGSERIAL PRIMARY KEY, feature_definition_id BIGINT REFERENCES app.feature_definition(id) ON DELETE CASCADE,
+    training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE,
     feature_type VARCHAR(50) NOT NULL DEFAULT 'lookup',
     table_name VARCHAR(255), feature_names TEXT[], lookup_key TEXT[],
     timestamp_lookup_key VARCHAR(255), output_name VARCHAR(255), default_values JSONB, declarative_spec JSONB
   );
+  ALTER TABLE app.feature_entry ADD COLUMN IF NOT EXISTS training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE;
   CREATE TABLE IF NOT EXISTS app.dataset (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL, feature_definition_id BIGINT REFERENCES app.feature_definition(id) ON DELETE SET NULL,
@@ -1615,14 +1959,21 @@ db.query(`
   );
   CREATE TABLE IF NOT EXISTS app.run (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
-    dataset_id BIGINT NOT NULL REFERENCES app.dataset(id) ON DELETE CASCADE,
+    dataset_id BIGINT REFERENCES app.dataset(id) ON DELETE CASCADE,
+    training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE,
     job_id BIGINT, run_id BIGINT, mlflow_experiment_id VARCHAR(255), mlflow_run_id VARCHAR(255),
     parameters JSONB, training_metrics JSONB, eval_metrics JSONB,
     status VARCHAR(50) DEFAULT 'PENDING',
     model_uri TEXT, model_name VARCHAR(255), model_version INTEGER,
+    training_table VARCHAR(255), eval_table VARCHAR(255), test_table VARCHAR(255),
     databricks_run_url TEXT, error_message TEXT,
     started_at TIMESTAMP, ended_at TIMESTAMP
   );
+  ALTER TABLE app.run ADD COLUMN IF NOT EXISTS training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE;
+  ALTER TABLE app.run ADD COLUMN IF NOT EXISTS training_table VARCHAR(255);
+  ALTER TABLE app.run ADD COLUMN IF NOT EXISTS eval_table VARCHAR(255);
+  ALTER TABLE app.run ADD COLUMN IF NOT EXISTS test_table VARCHAR(255);
+  ALTER TABLE app.run ALTER COLUMN dataset_id DROP NOT NULL;
   CREATE TABLE IF NOT EXISTS app.online_table (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
     source_table VARCHAR(255) NOT NULL, online_table_name VARCHAR(255) NOT NULL,
