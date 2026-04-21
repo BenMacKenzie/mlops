@@ -1439,66 +1439,91 @@ appkit.server.extend((app) => {
   app.post('/api/projects/:projectId/online-tables', async (req, res) => {
     try {
       const { source_table, primary_key_columns, timeseries_key, sync_mode } = req.body;
-      if (!source_table || !primary_key_columns?.length) {
-        res.status(400).json({ error: 'source_table and primary_key_columns required' }); return;
+      if (!source_table) {
+        res.status(400).json({ error: 'source_table required' }); return;
       }
 
-      // Look up project catalog/schema for the destination synced table
       const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [req.params.projectId]);
       if (projResult.rows.length === 0) { res.status(404).json({ error: 'Project not found' }); return; }
       const project = projResult.rows[0];
 
-      const syncMode = sync_mode || 'triggered';
-      const schedulingPolicy = syncMode === 'continuous' ? 'CONTINUOUS' : 'TRIGGERED';
-
-      // Destination: project schema with _online suffix (e.g. catalog.project_schema.table_name_online)
+      const publishMode = (sync_mode || 'triggered').toUpperCase();
       const shortName = source_table.split('.').pop();
-      const syncedTableId = `${project.catalog}.${project.schema}.${shortName}_online`;
+      const onlineTableName = `${project.catalog}.${project.schema}.${shortName}_online`;
+      const onlineStoreName = project.catalog; // must match UC catalog for serving endpoint lookup
 
-      // Enable Change Data Feed on source table (required for TRIGGERED/CONTINUOUS sync)
+      // Enable CDF on source table (required for TRIGGERED/CONTINUOUS)
       try {
         await executeSql(req, `ALTER TABLE ${source_table} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
-        console.log(`[synced-table] Enabled CDF on ${source_table}`);
+        console.log(`[publish] Enabled CDF on ${source_table}`);
       } catch (e: any) {
-        console.warn(`[synced-table] CDF enable warning (may already be set): ${e.message}`);
+        console.warn(`[publish] CDF enable warning: ${e.message}`);
       }
 
-      // Resolve PK columns from Unity Catalog's information_schema
-      const parts = source_table.split('.');
-      const pkRows = await executeSql(req,
-        `SELECT column_name FROM ${parts[0]}.information_schema.constraint_column_usage
-         WHERE table_catalog='${parts[0]}' AND table_schema='${parts[1]}' AND table_name='${parts[2]}'`);
-      const pkColumns = pkRows.map((r: any) => r.column_name);
-      if (pkColumns.length === 0) {
-        throw new Error(`No primary key constraint found on ${source_table}. Add one with: ALTER TABLE ${source_table} ADD CONSTRAINT pk PRIMARY KEY (col1, col2)`);
+      // Ensure PK NOT NULL constraints (required by online store)
+      try {
+        const parts = source_table.split('.');
+        const pkRows = await executeSql(req,
+          `SELECT column_name FROM ${parts[0]}.information_schema.constraint_column_usage
+           WHERE table_catalog='${parts[0]}' AND table_schema='${parts[1]}' AND table_name='${parts[2]}'`);
+        for (const pk of pkRows) {
+          await executeSql(req, `ALTER TABLE ${source_table} ALTER COLUMN ${pk.column_name} SET NOT NULL`);
+        }
+      } catch (e: any) {
+        console.warn(`[publish] PK NOT NULL warning: ${e.message}`);
       }
 
-      const spec: any = {
-        source_table_full_name: source_table,
-        branch: LAKEBASE_BRANCH,
-        primary_key_columns: pkColumns,
-        scheduling_policy: schedulingPolicy,
-        postgres_database: LAKEBASE_PG_DATABASE,
-        create_database_objects_if_missing: true,
+      // Upload and run the publish_table notebook
+      const userName = await getUsername(req);
+      const notebookPath = `/Workspace/Users/${userName}/.mlops/publish_table`;
+      const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'publish_table.py');
+      await uploadNotebook(req, localNotebook, notebookPath);
+
+      const params = {
+        online_store_name: onlineStoreName,
+        source_table_name: source_table,
+        online_table_name: onlineTableName,
+        publish_mode: publishMode,
       };
 
-      console.log(`[synced-table] Creating ${syncedTableId} from ${source_table} (pk: ${pkColumns.join(', ')})`);
-      const apiResult = await databricksApi(req, 'POST',
-        `postgres/synced_tables?synced_table_id=${encodeURIComponent(syncedTableId)}`,
-        { spec }, 'api/2.0');
+      console.log(`[publish] Publishing ${source_table} → ${onlineTableName} (store: ${onlineStoreName})`);
+      const { job_id, run_id: jobRunId, run_url } = await createOrRunJob(
+        req, `mlops-publish-${shortName}`, notebookPath, params
+      );
 
-      if (apiResult.error_code) throw new Error(`Synced table create failed: ${apiResult.message}`);
-      const pipelineId = apiResult.name || apiResult.status?.pipeline_id || null;
-
+      // Insert tracking record as PROVISIONING
       const result = await db.query(
         `INSERT INTO app.online_table (project_id, source_table, online_table_name, primary_key_columns, timeseries_key, sync_mode, status, pipeline_id)
          VALUES ($1,$2,$3,$4,$5,$6,'PROVISIONING',$7) RETURNING *`,
-        [req.params.projectId, source_table, syncedTableId, pkColumns, timeseries_key || null, syncMode, pipelineId]
+        [req.params.projectId, source_table, onlineTableName, primary_key_columns || [], timeseries_key || null, sync_mode || 'triggered', run_url]
       );
-      console.log(`[synced-table] Created: ${syncedTableId}`);
-      res.status(201).json(result.rows[0]);
+
+      // Poll for notebook completion (publish jobs are usually fast)
+      let attempts = 0;
+      while (attempts < 60) {
+        await new Promise(r => setTimeout(r, 5000));
+        attempts++;
+        const jobRun = await databricksApi(req, 'GET', `jobs/runs/get?run_id=${jobRunId}`);
+        const lifeCycleState = jobRun.state?.life_cycle_state;
+        const resultState = jobRun.state?.result_state;
+
+        if (lifeCycleState === 'TERMINATED' && resultState === 'SUCCESS') {
+          await db.query('UPDATE app.online_table SET status=$1, pipeline_id=$2 WHERE id=$3',
+            ['ONLINE', run_url, result.rows[0].id]);
+          const updated = await db.query('SELECT * FROM app.online_table WHERE id = $1', [result.rows[0].id]);
+          console.log(`[publish] Published: ${onlineTableName}`);
+          res.status(201).json(updated.rows[0]);
+          return;
+        } else if (lifeCycleState === 'TERMINATED') {
+          const errMsg = jobRun.state?.state_message || resultState || 'Unknown error';
+          await db.query('UPDATE app.online_table SET status=$1, pipeline_id=$2 WHERE id=$3',
+            ['FAILED', errMsg, result.rows[0].id]);
+          throw new Error(`Publish failed: ${errMsg}`);
+        }
+      }
+      throw new Error('Publish timed out after 5 minutes');
     } catch (e: any) {
-      console.error(`[synced-table] Error: ${e.message}`);
+      console.error(`[publish] Error: ${e.message}`);
       res.status(500).json({ error: e.message });
     }
   });
@@ -1509,43 +1534,8 @@ appkit.server.extend((app) => {
       if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       const ot = result.rows[0];
 
-      if (ot.status === 'NOT_PUBLISHED') { res.json(ot); return; }
-
-      // Always re-query for PROVISIONING and FAILED (to capture error messages)
-      const syncedTableId = ot.online_table_name || ot.source_table;
-      const apiResult = await databricksApi(req, 'GET',
-        `postgres/synced_tables/${encodeURIComponent(syncedTableId)}`,
-        undefined, 'api/2.0');
-      console.log(`[synced-table] Status response for ${syncedTableId}:`, JSON.stringify(apiResult).slice(0, 500));
-
-      let newStatus = ot.status;
-      let errorMessage: string | null = null;
-
-      // The response may be a long-running operation or the synced table state
-      const detailedState = apiResult.status?.detailed_state
-        || apiResult.state
-        || (apiResult.done === true ? 'ONLINE' : '')
-        || '';
-      const stateStr = String(detailedState).toUpperCase();
-
-      // Extract pipeline URL from status message
-      const statusMessage = apiResult.status?.message || '';
-      const pipelineUrl = statusMessage.match(/https?:\/\/\S+/)?.[0]?.replace(/\.$/, '') || null;
-
-      if (stateStr.includes('ONLINE') || stateStr === 'ACTIVE' || apiResult.done === true) {
-        newStatus = 'ONLINE';
-      } else if (stateStr.includes('FAIL') || stateStr.includes('ERROR') || apiResult.error_code) {
-        newStatus = 'FAILED';
-        errorMessage = statusMessage || stateStr;
-      }
-
-      // Always update pipeline_id with the pipeline URL if available
-      await db.query('UPDATE app.online_table SET status=$1, pipeline_id=COALESCE($2, pipeline_id) WHERE id=$3',
-        [newStatus, pipelineUrl, ot.id]);
-
-      const updated = await db.query('SELECT * FROM app.online_table WHERE id = $1', [ot.id]);
-      const row = updated.rows[0];
-      res.json(errorMessage ? { ...row, error_message: errorMessage } : row);
+      // Status is set by the publish job — just return current state
+      res.json(ot);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -1553,21 +1543,6 @@ appkit.server.extend((app) => {
 
   app.delete('/api/online-tables/:id', async (req, res) => {
     try {
-      const result = await db.query('SELECT * FROM app.online_table WHERE id = $1', [req.params.id]);
-      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
-      const ot = result.rows[0];
-
-      // Delete synced table from Databricks (ignore errors if already gone)
-      const syncedTableId = ot.online_table_name || ot.source_table;
-      try {
-        await databricksApi(req, 'DELETE',
-          `postgres/synced_tables/${encodeURIComponent(syncedTableId)}`,
-          undefined, 'api/2.0');
-        console.log(`[synced-table] Deleted from Databricks: ${syncedTableId}`);
-      } catch (e: any) {
-        console.warn(`[synced-table] Databricks delete warning: ${e.message}`);
-      }
-
       await db.query('DELETE FROM app.online_table WHERE id = $1', [req.params.id]);
       res.json({ ok: true });
     } catch (e: any) {
@@ -1614,17 +1589,13 @@ appkit.server.extend((app) => {
       if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
       const dep = depResult.rows[0];
 
-      // Trace: deployment → run → dataset → feature_definition → feature_entries
+      // Trace: deployment → run → training_spec → feature_entries
       const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id]);
       const run = runResult.rows[0];
-      const dsResult = await db.query('SELECT * FROM app.dataset WHERE id = $1', [run.dataset_id]);
-      const dataset = dsResult.rows[0];
-      const entriesResult = await db.query(
-        `SELECT fe.* FROM app.feature_entry fe
-         JOIN app.feature_definition fd ON fe.feature_definition_id = fd.id
-         WHERE fd.id = $1 AND fe.table_name IS NOT NULL`,
-        [dataset.feature_definition_id]
-      );
+      const specId = run.training_spec_id;
+      const entriesResult = specId
+        ? await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 AND table_name IS NOT NULL', [specId])
+        : { rows: [] };
 
       // Get existing online tables for this project
       const existingOt = await db.query(
@@ -1633,7 +1604,15 @@ appkit.server.extend((app) => {
       );
       const existingTables = new Set(existingOt.rows.map((r: any) => r.source_table));
 
-      // Publish missing tables
+      // Publish missing tables using the publish_table notebook
+      const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id]);
+      const project = projResult.rows[0];
+      const userName = await getUsername(req);
+      const notebookPath = `/Workspace/Users/${userName}/.mlops/publish_table`;
+      const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'publish_table.py');
+      await uploadNotebook(req, localNotebook, notebookPath);
+
+      const onlineStoreName = project.catalog; // must match UC catalog for serving endpoint lookup
       let published = 0;
       const seen = new Set<string>();
       for (const entry of entriesResult.rows) {
@@ -1641,48 +1620,28 @@ appkit.server.extend((app) => {
         if (seen.has(sourceTable) || existingTables.has(sourceTable)) continue;
         seen.add(sourceTable);
 
-        // Look up project for destination schema
-        const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id]);
-        const project = projResult.rows[0];
         const shortName = sourceTable.split('.').pop();
-        const syncedTableId = `${project.catalog}.${project.schema}.${shortName}_online`;
-        const syncMode = 'triggered';
-        // Enable CDF and resolve PK from UC information_schema
+        const onlineTableName = `${project.catalog}.${project.schema}.${shortName}_online`;
+
+        // Enable CDF
         try {
           await executeSql(req, `ALTER TABLE ${sourceTable} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
         } catch { /* may already be set */ }
-        const srcParts = sourceTable.split('.');
-        const pkRows = await executeSql(req,
-          `SELECT column_name FROM ${srcParts[0]}.information_schema.constraint_column_usage
-           WHERE table_catalog='${srcParts[0]}' AND table_schema='${srcParts[1]}' AND table_name='${srcParts[2]}'`);
-        const pkCols = pkRows.map((r: any) => r.column_name);
-        if (pkCols.length === 0) {
-          console.error(`[publish-tables] No PK constraint on ${sourceTable}, skipping`);
-          continue;
-        }
 
-        const spec: any = {
-          source_table_full_name: sourceTable,
-          branch: LAKEBASE_BRANCH,
-          primary_key_columns: pkCols,
-          scheduling_policy: 'TRIGGERED',
-          postgres_database: LAKEBASE_PG_DATABASE,
-          create_database_objects_if_missing: true,
+        const params = {
+          online_store_name: onlineStoreName,
+          source_table_name: sourceTable,
+          online_table_name: onlineTableName,
+          publish_mode: 'TRIGGERED',
         };
 
-        console.log(`[publish-tables] Creating synced table: ${syncedTableId} from ${sourceTable}`);
-        const apiResult = await databricksApi(req, 'POST',
-          `postgres/synced_tables?synced_table_id=${encodeURIComponent(syncedTableId)}`,
-          { spec }, 'api/2.0');
-        if (apiResult.error_code) {
-          console.error(`[publish-tables] Failed: ${apiResult.message}`);
-          continue;
-        }
-        const pipelineId = apiResult.name || apiResult.status?.pipeline_id || null;
+        console.log(`[publish-tables] Publishing ${sourceTable} → ${onlineTableName}`);
+        const { run_url } = await createOrRunJob(req, `mlops-publish-${shortName}`, notebookPath, params);
+
         await db.query(
-          `INSERT INTO app.online_table (project_id, source_table, online_table_name, primary_key_columns, timeseries_key, sync_mode, status, pipeline_id)
-           VALUES ($1,$2,$3,$4,$5,$6,'PROVISIONING',$7)`,
-          [dep.project_id, sourceTable, syncedTableId, entry.lookup_key || [], entry.timestamp_lookup_key || null, syncMode, pipelineId]
+          `INSERT INTO app.online_table (project_id, source_table, online_table_name, sync_mode, status, pipeline_id)
+           VALUES ($1,$2,$3,'triggered','PROVISIONING',$4)`,
+          [dep.project_id, sourceTable, onlineTableName, run_url]
         );
         published++;
       }
@@ -1790,11 +1749,19 @@ appkit.server.extend((app) => {
       if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
       const dep = depResult.rows[0];
 
-      // Trace: deployment → run → dataset → feature_definition → EOL
+      // Trace: deployment → run → training_spec → EOL
       const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
-      const dataset = (await db.query('SELECT * FROM app.dataset WHERE id = $1', [run.dataset_id])).rows[0];
-      const fd = (await db.query('SELECT * FROM app.feature_definition WHERE id = $1', [dataset.feature_definition_id])).rows[0];
-      const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [fd.eol_id])).rows[0];
+      let eol: any;
+      if (run.training_spec_id) {
+        const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [run.training_spec_id])).rows[0];
+        eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
+      } else if (run.dataset_id) {
+        // Legacy path
+        const dataset = (await db.query('SELECT * FROM app.dataset WHERE id = $1', [run.dataset_id])).rows[0];
+        const fd = (await db.query('SELECT * FROM app.feature_definition WHERE id = $1', [dataset.feature_definition_id])).rows[0];
+        eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [fd.eol_id])).rows[0];
+      }
+      if (!eol) { res.json([]); return; }
 
       const entityCols = Array.isArray(eol.entity_columns)
         ? eol.entity_columns
@@ -1840,6 +1807,60 @@ appkit.server.extend((app) => {
   });
 
   // Stop a deployment's serving endpoint (deletes the endpoint, keeps the deployment record)
+  // Update a deployment's serving endpoint to a different model version
+  app.post('/api/deployments/:id/update-endpoint', async (req, res) => {
+    try {
+      const { run_id } = req.body;
+      if (!run_id) { res.status(400).json({ error: 'run_id required' }); return; }
+
+      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
+      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
+      const dep = depResult.rows[0];
+
+      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [run_id]);
+      if (runResult.rows.length === 0) { res.status(404).json({ error: 'Run not found' }); return; }
+      const run = runResult.rows[0];
+      if (!run.model_name || !run.model_version) {
+        res.status(400).json({ error: 'Run has no registered model' }); return;
+      }
+
+      // Check model version is READY
+      const host = process.env.DATABRICKS_HOST || '';
+      const token = getToken(req);
+      const mvResp = await fetch(
+        `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const mvData: any = await mvResp.json();
+      if (mvData.model_version?.status && mvData.model_version.status !== 'READY') {
+        res.status(400).json({ error: `Model version status is ${mvData.model_version.status}. Wait for READY.` }); return;
+      }
+
+      // Update the endpoint config with the new model version
+      const config = dep.endpoint_config || {};
+      await databricksApi(req, 'PUT', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}/config`, {
+        served_entities: [{
+          entity_name: run.model_name,
+          entity_version: String(run.model_version),
+          workload_size: config.workload_size || 'Small',
+          scale_to_zero_enabled: config.scale_to_zero_enabled !== false,
+        }],
+      }, 'api/2.0');
+
+      console.log(`[endpoint] Updated ${dep.endpoint_name} → ${run.model_name} v${run.model_version}`);
+
+      await db.query(
+        `UPDATE app.deployment SET run_id=$1, endpoint_status='CREATING' WHERE id=$2`,
+        [run_id, dep.id]
+      );
+      const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      console.error(`[endpoint] Update error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.post('/api/deployments/:id/stop-endpoint', async (req, res) => {
     try {
       const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
@@ -1950,6 +1971,7 @@ db.query(`
     timestamp_lookup_key VARCHAR(255), output_name VARCHAR(255), default_values JSONB, declarative_spec JSONB
   );
   ALTER TABLE app.feature_entry ADD COLUMN IF NOT EXISTS training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE;
+  ALTER TABLE app.feature_entry ALTER COLUMN feature_definition_id DROP NOT NULL;
   CREATE TABLE IF NOT EXISTS app.dataset (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL, feature_definition_id BIGINT REFERENCES app.feature_definition(id) ON DELETE SET NULL,

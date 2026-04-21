@@ -507,8 +507,10 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved, isTrainingSpec }: {
   };
 
   const submit = async () => {
+    if (!form.catalog || !form.schema || !form.table) { alert('Select a table first'); return; }
+    if (featureType === 'lookup' && form.selectedFeatures.length === 0) { alert('Select at least one feature column'); return; }
+    if (featureType === 'lookup' && form.selectedLookupKeys.length === 0) { alert('Select at least one lookup key'); return; }
     if (featureType === 'declarative') {
-      if (!form.catalog || !form.schema || !form.table) { alert('Select a source table'); return; }
       if (!form.declarative_input) { alert('Select an input column'); return; }
       if (!form.declarative_function) { alert('Select a function'); return; }
       if (!form.declarative_window_type) { alert('Select a time window type'); return; }
@@ -538,19 +540,23 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved, isTrainingSpec }: {
       };
     }
 
-    const createFn = isTrainingSpec ? api.createTrainingSpecEntry : api.createFeatureEntry;
-    await createFn(featureId, {
-      feature_type: featureType,
-      table_name: fullTableName,
-      feature_names: featureType === 'lookup' ? form.selectedFeatures : null,
-      lookup_key: featureType === 'lookup' ? form.selectedLookupKeys : null,
-      timestamp_lookup_key: form.timestamp_lookup_key || null,
-      output_name: form.output_name || null,
-      default_values: form.default_values ? JSON.parse(form.default_values) : null,
-      declarative_spec: declarativeSpec,
-    });
-    setForm({ catalog: '', schema: '', table: '', selectedFeatures: [], selectedLookupKeys: [], timestamp_lookup_key: '', output_name: '', default_values: '', declarative_spec: '', declarative_input: '', declarative_function: '', declarative_window_type: '', declarative_window_duration: '', declarative_slide_duration: '', declarative_filter: '' });
-    onSaved();
+    try {
+      const createFn = isTrainingSpec ? api.createTrainingSpecEntry : api.createFeatureEntry;
+      await createFn(featureId, {
+        feature_type: featureType,
+        table_name: fullTableName,
+        feature_names: featureType === 'lookup' ? form.selectedFeatures : null,
+        lookup_key: featureType === 'lookup' ? form.selectedLookupKeys : null,
+        timestamp_lookup_key: form.timestamp_lookup_key || null,
+        output_name: form.output_name || null,
+        default_values: form.default_values ? JSON.parse(form.default_values) : null,
+        declarative_spec: declarativeSpec,
+      });
+      setForm({ catalog: '', schema: '', table: '', selectedFeatures: [], selectedLookupKeys: [], timestamp_lookup_key: '', output_name: '', default_values: '', declarative_spec: '', declarative_input: '', declarative_function: '', declarative_window_type: '', declarative_window_duration: '', declarative_slide_duration: '', declarative_filter: '' });
+      onSaved();
+    } catch (e: any) {
+      alert(`Failed to add entry: ${e.message}`);
+    }
   };
 
   return (
@@ -1883,20 +1889,8 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
                           className="px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
                         >Sync</button>
                       )}
-                      {ot && ot.status === 'PROVISIONING' && (
-                        <button
-                          onClick={() => api.checkOnlineTableStatus(ot.id).then(load)}
-                          className="px-2 py-1 bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
-                        >Check</button>
-                      )}
-                      {ot && ot.status === 'FAILED' && (
-                        <button
-                          onClick={() => { removeOnlineTable(ot); }}
-                          className="px-2 py-1 bg-orange-100 text-orange-700 rounded hover:bg-orange-200"
-                        >Remove & Retry</button>
-                      )}
-                      {ot && ot.status === 'ONLINE' && (
-                        <button onClick={() => removeOnlineTable(ot)} className="text-red-500 hover:underline">Remove</button>
+                      {ot && (
+                        <button onClick={() => removeOnlineTable(ot)} className="text-red-500 text-xs hover:underline">Remove</button>
                       )}
                     </td>
                   </tr>
@@ -2009,6 +2003,25 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
                       <button onClick={() => api.checkDeploymentStatus(dep.id).then(load)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">
                         Check Status
                       </button>
+                    )}
+                    {(dep.endpoint_status === 'READY' || dep.endpoint_status === 'CREATING') && registeredRuns.length > 0 && (
+                      <select
+                        className="px-2 py-1 border rounded text-xs"
+                        value=""
+                        onChange={e => {
+                          const newRunId = parseInt(e.target.value);
+                          if (newRunId && newRunId !== dep.run_id) {
+                            api.updateDeploymentEndpoint(dep.id, newRunId).then(load).catch(err => alert(err.message));
+                          }
+                        }}
+                      >
+                        <option value="">Update model...</option>
+                        {registeredRuns.filter(r => r.id !== dep.run_id).map(r => (
+                          <option key={r.id} value={r.id}>
+                            {r.model_name?.split('.').pop()} v{r.model_version} (run #{r.id})
+                          </option>
+                        ))}
+                      </select>
                     )}
                     {dep.endpoint_status !== 'NOT_CREATED' && host && (
                       <a href={`${host}/ml/endpoints/${dep.endpoint_name}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline">Endpoint UI</a>

@@ -146,6 +146,8 @@ export const getDeploymentSamples = (deploymentId: number) =>
   request<Record<string, any>[]>(`/api/deployments/${deploymentId}/samples`);
 export const testDeploymentEndpoint = (deploymentId: number, data: Record<string, any>) =>
   request<any>(`/api/deployments/${deploymentId}/test`, { method: 'POST', body: JSON.stringify(data) });
+export const updateDeploymentEndpoint = (id: number, runId: number) =>
+  request<Deployment>(`/api/deployments/${id}/update-endpoint`, { method: 'POST', body: JSON.stringify({ run_id: runId }) });
 export const stopDeploymentEndpoint = (id: number) =>
   request<Deployment>(`/api/deployments/${id}/stop-endpoint`, { method: 'POST' });
 export const deleteDeployment = (id: number) =>

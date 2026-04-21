@@ -494,6 +494,7 @@ See `deploy.sh` for the full deployment script.
 - [ ] Write `train_standard.py` notebook (train/eval split) — 2026-04-17
 - [ ] Remove git_url/notebook_path from project, remove GitHub notebook listing — 2026-04-17
 - [ ] End-to-end test: create project → EOL → training spec → run → register → deploy — 2026-04-17
+- [ ] **BLOCKER: Online store Postgres DB mismatch** — `fe.publish_table()` writes to `databricks_postgres` but serving endpoint looks in `serverless_stable_1dpktm_catalog`. Need to align the Lakebase database name with the UC catalog. Investigate with Feature Store / Lakebase team or file ES ticket. — 2026-04-20
 - [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime) — 2026-04-12
 - [ ] Build MLflow experiment viewer + run comparison UI — 2026-04-12
 - [ ] Fix local dev Lakebase auth (SASL issue with AppKit token refresh) — 2026-04-12
