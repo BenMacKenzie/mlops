@@ -16,6 +16,7 @@ dbutils.widgets.text("eol_sql", "")
 dbutils.widgets.text("label_column", "")
 dbutils.widgets.text("entity_columns_json", "[]")
 dbutils.widgets.text("feature_entries_json", "[]")
+dbutils.widgets.text("excluded_features_json", "[]")
 dbutils.widgets.text("task_type", "classification")
 dbutils.widgets.text("parameters_json", "{}")
 dbutils.widgets.text("catalog", "")
@@ -32,6 +33,7 @@ eol_sql = dbutils.widgets.get("eol_sql")
 label_column = dbutils.widgets.get("label_column")
 entity_columns = json.loads(dbutils.widgets.get("entity_columns_json"))
 feature_entries_raw = json.loads(dbutils.widgets.get("feature_entries_json"))
+excluded_features = json.loads(dbutils.widgets.get("excluded_features_json"))
 task_type = dbutils.widgets.get("task_type")
 user_params = json.loads(dbutils.widgets.get("parameters_json"))
 catalog = dbutils.widgets.get("catalog")
@@ -101,12 +103,15 @@ for entry in feature_entries_raw:
 
 print(f"Built {len(features)} features (FeatureLookups + FeatureFunctions)")
 
-# Exclude entity columns + timestamp lookup keys from the training data
+# Exclude entity columns + timestamp lookup keys + user-excluded features from the training data
 exclude = list(entity_columns) if entity_columns else []
 for entry in feature_entries_raw:
     ts_key = entry.get("timestamp_lookup_key")
     if ts_key and ts_key not in exclude:
         exclude.append(ts_key)
+for col in excluded_features:
+    if col not in exclude:
+        exclude.append(col)
 
 training_set = fe.create_training_set(
     df=eol_df,

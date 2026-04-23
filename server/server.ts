@@ -424,14 +424,15 @@ appkit.server.extend((app) => {
 
   app.post('/api/projects/:projectId/training-specs', async (req, res) => {
     try {
-      const { eol_id, name, task_type, split_strategy, split_method, split_config, parameters } = req.body;
+      const { eol_id, name, task_type, split_strategy, split_method, split_config, parameters, excluded_features } = req.body;
       const result = await db.query(
-        `INSERT INTO app.training_spec (project_id, eol_id, name, task_type, split_strategy, split_method, split_config, parameters)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        `INSERT INTO app.training_spec (project_id, eol_id, name, task_type, split_strategy, split_method, split_config, parameters, excluded_features)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
         [req.params.projectId, eol_id, name, task_type || 'classification',
          split_strategy || 'none', split_method || null,
          split_config ? JSON.stringify(split_config) : null,
-         parameters ? JSON.stringify(parameters) : null]
+         parameters ? JSON.stringify(parameters) : null,
+         excluded_features || null]
       );
       res.status(201).json({ ...result.rows[0], entries: [], run_count: 0 });
     } catch (e: any) {
@@ -447,7 +448,7 @@ appkit.server.extend((app) => {
         res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
       }
       const jsonCols = new Set(['split_config', 'parameters']);
-      const allowed = ['eol_id', 'name', 'task_type', 'split_strategy', 'split_method', 'split_config', 'parameters'];
+      const allowed = ['eol_id', 'name', 'task_type', 'split_strategy', 'split_method', 'split_config', 'parameters', 'excluded_features'];
       const sets: string[] = [];
       const values: any[] = [];
       for (const key of allowed) {
@@ -481,17 +482,25 @@ appkit.server.extend((app) => {
     }
   });
 
-  // Copy a training spec with all feature entries
+  // Copy a training spec with all feature entries.
+  // Body can override any of: name, eol_id, task_type, split_strategy, split_method, split_config, parameters, excluded_features
   app.post('/api/training-specs/:id/copy', async (req, res) => {
     try {
       const src = await db.query('SELECT * FROM app.training_spec WHERE id = $1', [req.params.id]);
       if (src.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       const s = src.rows[0];
-      const newName = req.body.name || `${s.name} (copy)`;
+      const b = req.body || {};
+      const pick = <K extends keyof typeof s>(k: K) => (Object.prototype.hasOwnProperty.call(b, k) ? b[k] : s[k]);
+      const newName = b.name || `${s.name} (copy)`;
+      const newSplitConfig = Object.prototype.hasOwnProperty.call(b, 'split_config')
+        ? (b.split_config ? JSON.stringify(b.split_config) : null) : s.split_config;
+      const newParameters = Object.prototype.hasOwnProperty.call(b, 'parameters')
+        ? (b.parameters ? JSON.stringify(b.parameters) : null) : s.parameters;
       const specResult = await db.query(
-        `INSERT INTO app.training_spec (project_id, eol_id, name, task_type, split_strategy, split_method, split_config, parameters)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-        [s.project_id, s.eol_id, newName, s.task_type, s.split_strategy, s.split_method, s.split_config, s.parameters]
+        `INSERT INTO app.training_spec (project_id, eol_id, name, task_type, split_strategy, split_method, split_config, parameters, excluded_features)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [s.project_id, pick('eol_id'), newName, pick('task_type'), pick('split_strategy'), pick('split_method'),
+         newSplitConfig, newParameters, pick('excluded_features')]
       );
       const newSpec = specResult.rows[0];
       const entries = await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1', [req.params.id]);
@@ -685,6 +694,7 @@ appkit.server.extend((app) => {
         label_column: eol.label_column || '',
         entity_columns_json: JSON.stringify(entityColumns),
         feature_entries_json: JSON.stringify(featureEntries),
+        excluded_features_json: JSON.stringify(spec.excluded_features || []),
         task_type: spec.task_type || 'classification',
         parameters_json: JSON.stringify(spec.parameters || {}),
         catalog: project.catalog,
@@ -2047,8 +2057,10 @@ db.query(`
     split_strategy VARCHAR(50) NOT NULL DEFAULT 'none',
     split_method VARCHAR(50),
     split_config JSONB,
-    parameters JSONB
+    parameters JSONB,
+    excluded_features TEXT[]
   );
+  ALTER TABLE app.training_spec ADD COLUMN IF NOT EXISTS excluded_features TEXT[];
   CREATE TABLE IF NOT EXISTS app.feature_entry (
     id BIGSERIAL PRIMARY KEY, feature_definition_id BIGINT REFERENCES app.feature_definition(id) ON DELETE CASCADE,
     training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE,

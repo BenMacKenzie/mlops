@@ -50,6 +50,7 @@ export interface TrainingSpec {
   split_method: 'random' | 'temporal' | null;
   split_config: Record<string, any> | null;
   parameters: Record<string, any> | null;
+  excluded_features: string[] | null;
   entries: FeatureEntry[];
 }
 

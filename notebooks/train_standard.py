@@ -16,6 +16,7 @@ dbutils.widgets.text("eol_sql", "")
 dbutils.widgets.text("label_column", "")
 dbutils.widgets.text("entity_columns_json", "[]")
 dbutils.widgets.text("feature_entries_json", "[]")
+dbutils.widgets.text("excluded_features_json", "[]")
 dbutils.widgets.text("task_type", "classification")
 dbutils.widgets.text("split_method", "random")
 dbutils.widgets.text("split_config_json", '{"eval_pct": 20, "seed": 42}')
@@ -36,6 +37,7 @@ eol_sql = dbutils.widgets.get("eol_sql")
 label_column = dbutils.widgets.get("label_column")
 entity_columns = json.loads(dbutils.widgets.get("entity_columns_json"))
 feature_entries_raw = json.loads(dbutils.widgets.get("feature_entries_json"))
+excluded_features = json.loads(dbutils.widgets.get("excluded_features_json"))
 task_type = dbutils.widgets.get("task_type")
 split_method = dbutils.widgets.get("split_method")
 split_config = json.loads(dbutils.widgets.get("split_config_json"))
@@ -98,6 +100,9 @@ for entry in feature_entries_raw:
     ts_key = entry.get("timestamp_lookup_key")
     if ts_key and ts_key not in exclude:
         exclude.append(ts_key)
+for col in excluded_features:
+    if col not in exclude:
+        exclude.append(col)
 
 eol_df = spark.sql(eol_sql)
 

@@ -425,6 +425,86 @@ function EOLsTab({ projectId, eols, reload }: { projectId: number; eols: EOL[]; 
   );
 }
 
+// ── Feature Summary — global include/exclude across all entries ──
+function FeatureSummary({ spec, onChanged, locked }: {
+  spec: TrainingSpec & { run_count: number };
+  onChanged: () => void;
+  locked: boolean;
+}) {
+  type Output = { name: string; source: string; sourceType: 'lookup' | 'on_demand' };
+  const outputs: Output[] = [];
+  for (const e of spec.entries) {
+    if (e.feature_type === 'lookup') {
+      const tbl = e.table_name?.split('.').pop() || 'lookup';
+      for (const col of e.feature_names || []) {
+        outputs.push({ name: col, source: tbl, sourceType: 'lookup' });
+      }
+    } else if (e.feature_type === 'on_demand' && e.output_name) {
+      const fn = e.function_name?.split('.').pop() || 'function';
+      outputs.push({ name: e.output_name, source: fn, sourceType: 'on_demand' });
+    }
+  }
+
+  const excluded = new Set(spec.excluded_features || []);
+  const included = outputs.filter(o => !excluded.has(o.name));
+
+  const toggle = async (name: string) => {
+    const next = new Set(excluded);
+    if (next.has(name)) next.delete(name); else next.add(name);
+    try {
+      await api.updateTrainingSpec(spec.id, { excluded_features: [...next] });
+      onChanged();
+    } catch (err: any) {
+      alert(`Update failed: ${err.message}`);
+    }
+  };
+
+  if (outputs.length === 0) return null;
+
+  return (
+    <div className="mt-4 border-t pt-3">
+      <div className="text-xs font-medium text-gray-500 mb-2">
+        Training Features ({included.length} of {outputs.length} included)
+        {locked && <span className="ml-2 text-gray-400">— locked</span>}
+      </div>
+      <table className="w-full text-left text-sm border rounded overflow-hidden">
+        <thead className="bg-gray-50">
+          <tr>
+            <th className="px-3 py-1.5 font-medium text-gray-500 w-16">Include</th>
+            <th className="px-3 py-1.5 font-medium text-gray-500">Column</th>
+            <th className="px-3 py-1.5 font-medium text-gray-500">Source</th>
+            <th className="px-3 py-1.5 font-medium text-gray-500">Type</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y">
+          {outputs.map((o, i) => {
+            const isExcluded = excluded.has(o.name);
+            return (
+              <tr key={`${o.name}-${o.source}-${i}`} className={isExcluded ? 'bg-gray-50 text-gray-400' : ''}>
+                <td className="px-3 py-1.5">
+                  <input
+                    type="checkbox"
+                    checked={!isExcluded}
+                    onChange={() => toggle(o.name)}
+                    disabled={locked}
+                  />
+                </td>
+                <td className="px-3 py-1.5 font-mono text-xs">{o.name}</td>
+                <td className="px-3 py-1.5 font-mono text-xs">{o.source}</td>
+                <td className="px-3 py-1.5">
+                  {o.sourceType === 'lookup'
+                    ? <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">Lookup</span>
+                    : <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">On-Demand</span>}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── Feature Builder — master-detail UI for managing feature entries ──
 function FeatureBuilder({ specId, eolId, eols, entries, onChanged, locked }: {
   specId: number; eolId: number | null; eols: EOL[];
@@ -1413,7 +1493,9 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
   projectId: number; eols: EOL[]; specs: (TrainingSpec & { run_count: number })[]; runs: Run[]; reload: () => void;
 }) {
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' });
+  const [copyingFromId, setCopyingFromId] = useState<number | null>(null);
+  const emptyForm = { name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' };
+  const [form, setForm] = useState(emptyForm);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [registerError, setRegisterError] = useState('');
   const [renamingId, setRenamingId] = useState<number | null>(null);
@@ -1455,7 +1537,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
 
   const submitSpec = async () => {
     const splitConfig = form.split_strategy !== 'none' ? { eval_pct: parseFloat(form.eval_pct), seed: parseInt(form.seed) } : null;
-    await api.createTrainingSpec(projectId, {
+    const payload = {
       name: form.name,
       eol_id: form.eol_id ? parseInt(form.eol_id) : null,
       task_type: form.task_type as any,
@@ -1463,10 +1545,42 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
       split_method: form.split_strategy !== 'none' ? form.split_method as any : null,
       split_config: splitConfig,
       parameters: form.parameters ? JSON.parse(form.parameters) : null,
-    });
-    setForm({ name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' });
+    };
+    try {
+      if (copyingFromId != null) {
+        await api.copyTrainingSpec(copyingFromId, payload as any);
+      } else {
+        await api.createTrainingSpec(projectId, payload);
+      }
+    } catch (e: any) {
+      alert(`Save failed: ${e.message}`);
+      return;
+    }
+    setForm(emptyForm);
     setShowForm(false);
+    setCopyingFromId(null);
     reload();
+  };
+
+  const startCopy = (spec: TrainingSpec & { run_count: number }) => {
+    setCopyingFromId(spec.id);
+    setForm({
+      name: `${spec.name} (copy)`,
+      eol_id: spec.eol_id != null ? String(spec.eol_id) : '',
+      task_type: spec.task_type,
+      split_strategy: spec.split_strategy,
+      split_method: spec.split_method || 'random',
+      eval_pct: String(spec.split_config?.eval_pct ?? '20'),
+      seed: String(spec.split_config?.seed ?? '42'),
+      parameters: spec.parameters ? JSON.stringify(spec.parameters) : '',
+    });
+    setShowForm(true);
+  };
+
+  const cancelForm = () => {
+    setShowForm(false);
+    setCopyingFromId(null);
+    setForm(emptyForm);
   };
 
   const launchRun = async (specId: number) => {
@@ -1496,13 +1610,18 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
     <div>
       <div className="flex justify-between items-center mb-4">
         <h2 className="text-lg font-medium">Training Specs</h2>
-        <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+        <button onClick={() => showForm ? cancelForm() : setShowForm(true)} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
           {showForm ? 'Cancel' : 'New Training Spec'}
         </button>
       </div>
 
       {showForm && (
         <div className="mb-4 p-4 border rounded-lg bg-white shadow">
+          {copyingFromId != null && (
+            <div className="text-sm text-gray-600 mb-3">
+              Copying from <span className="font-mono">{specs.find(s => s.id === copyingFromId)?.name}</span> — edit fields before saving.
+            </div>
+          )}
           <div className="grid grid-cols-3 gap-3">
             <div><label className="block text-sm font-medium mb-1">Name</label><input className="w-full px-3 py-2 border rounded" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. customer_churn_v1" /></div>
             <div>
@@ -1551,7 +1670,9 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
             </div>
           </div>
           <div className="mt-3">
-            <button onClick={submitSpec} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.eol_id}>Create</button>
+            <button onClick={submitSpec} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.eol_id}>
+              {copyingFromId != null ? 'Save Copy' : 'Create'}
+            </button>
           </div>
         </div>
       )}
@@ -1618,7 +1739,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                   {!isLocked && spec.entries.length > 0 && (
                     <button onClick={() => launchRun(spec.id)} className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">Run</button>
                   )}
-                  <button onClick={() => api.copyTrainingSpec(spec.id).then(reload)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Copy</button>
+                  <button onClick={() => startCopy(spec)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Copy</button>
                   {!isLocked && <button onClick={() => api.deleteTrainingSpec(spec.id).then(reload)} className="text-red-500 text-sm">Delete</button>}
                 </div>
               </div>
@@ -1638,6 +1759,9 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
 
                   {/* Feature Builder — master-detail */}
                   <FeatureBuilder specId={spec.id} eolId={spec.eol_id} eols={eols} entries={spec.entries} onChanged={reload} locked={isLocked} />
+
+                  {/* Training Features summary — global include/exclude */}
+                  <FeatureSummary spec={spec} onChanged={reload} locked={isLocked} />
 
                   {/* Runs */}
                   {specRuns.length > 0 && (

@@ -50,8 +50,8 @@ export const updateTrainingSpec = (id: number, data: Partial<TrainingSpec>) =>
   request<TrainingSpec>(`/api/training-specs/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteTrainingSpec = (id: number) =>
   request<{ ok: boolean }>(`/api/training-specs/${id}`, { method: 'DELETE' });
-export const copyTrainingSpec = (id: number, name?: string) =>
-  request<TrainingSpec>(`/api/training-specs/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
+export const copyTrainingSpec = (id: number, overrides?: Partial<TrainingSpec>) =>
+  request<TrainingSpec>(`/api/training-specs/${id}/copy`, { method: 'POST', body: JSON.stringify(overrides || {}) });
 export const createTrainingSpecEntry = (specId: number, data: any) =>
   request<FeatureEntry>(`/api/training-specs/${specId}/entries`, { method: 'POST', body: JSON.stringify(data) });
 export const updateTrainingSpecEntry = (id: number, data: any) =>
