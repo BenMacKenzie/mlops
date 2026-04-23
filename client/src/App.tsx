@@ -425,23 +425,213 @@ function EOLsTab({ projectId, eols, reload }: { projectId: number; eols: EOL[]; 
   );
 }
 
-// ── Feature Entry Form — reusable cascading dropdown form for adding a lookup or declarative entry ──
-function FeatureEntryForm({ featureId, eolId, eols, onSaved, isTrainingSpec }: { featureId: number; eolId: number | null; eols: EOL[]; onSaved: () => void; isTrainingSpec?: boolean }) {
-  const [featureType, setFeatureType] = useState<'lookup' | 'declarative'>('lookup');
+// ── Feature Builder — master-detail UI for managing feature entries ──
+function FeatureBuilder({ specId, eolId, eols, entries, onChanged, locked }: {
+  specId: number; eolId: number | null; eols: EOL[];
+  entries: FeatureEntry[]; onChanged: () => void; locked: boolean;
+}) {
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [adding, setAdding] = useState<'lookup' | 'on_demand' | 'declarative' | null>(null);
+  const [lastCatalog, setLastCatalog] = useState('');
+  const [lastSchema, setLastSchema] = useState('');
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const selectedEntry = entries.find(e => e.id === selectedId) || null;
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (ev: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(ev.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [menuOpen]);
+
+  // Track last used catalog/schema from entries
+  useEffect(() => {
+    if (entries.length > 0) {
+      const last = [...entries].reverse().find(e => e.table_name || e.function_name);
+      if (last) {
+        const parts = (last.table_name || last.function_name || '').split('.');
+        if (parts.length >= 2) { setLastCatalog(parts[0]); setLastSchema(parts[1]); }
+      }
+    }
+  }, [entries]);
+
+  const handleAdd = async (data: any) => {
+    try {
+      await api.createTrainingSpecEntry(specId, data);
+      setAdding(null);
+      onChanged();
+    } catch (e: any) {
+      alert(`Add failed: ${e.message}`);
+    }
+  };
+
+  const handleUpdate = async (id: number, data: any) => {
+    try {
+      await api.updateTrainingSpecEntry(id, data);
+      onChanged();
+    } catch (e: any) {
+      alert(`Update failed: ${e.message}`);
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (!confirm('Delete this feature entry?')) return;
+    await api.deleteTrainingSpecEntry(id);
+    if (selectedId === id) setSelectedId(null);
+    onChanged();
+  };
+
+  const entryLabel = (e: FeatureEntry) => {
+    if (e.feature_type === 'lookup') {
+      const short = e.table_name?.split('.').pop() || 'untitled';
+      return short;
+    }
+    if (e.feature_type === 'on_demand') return e.output_name || e.function_name?.split('.').pop() || 'untitled';
+    return 'declarative';
+  };
+
+  const typeBadge = (type: string) => {
+    if (type === 'lookup') return <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">Lookup</span>;
+    if (type === 'on_demand') return <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">On-Demand</span>;
+    return <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded">Declarative</span>;
+  };
+
+  return (
+    <div className="flex gap-4 mt-3" style={{ minHeight: 300 }}>
+      {/* Left panel — entry list */}
+      <div className="w-1/3 border rounded bg-white">
+        <div className="p-2 border-b flex items-center justify-between">
+          <span className="text-sm font-medium">Features ({entries.length})</span>
+          {!locked && (
+            <div className="relative" ref={menuRef}>
+              <button onClick={() => setMenuOpen(o => !o)} className="px-2 py-1 text-xs bg-green-600 text-white rounded">+ Add</button>
+              {menuOpen && (
+                <div className="absolute right-0 mt-1 bg-white border rounded shadow-lg z-10 min-w-[140px]">
+                  <button onClick={() => { setAdding('lookup'); setSelectedId(null); setMenuOpen(false); }} className="block w-full text-left px-3 py-1.5 text-sm hover:bg-gray-50">Lookup</button>
+                  <button onClick={() => { setAdding('on_demand'); setSelectedId(null); setMenuOpen(false); }} className="block w-full text-left px-3 py-1.5 text-sm hover:bg-gray-50">On-Demand</button>
+                  <button onClick={() => { setAdding('declarative'); setSelectedId(null); setMenuOpen(false); }} className="block w-full text-left px-3 py-1.5 text-sm hover:bg-gray-50">Declarative</button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="divide-y max-h-[400px] overflow-y-auto">
+          {entries.map(e => (
+            <div
+              key={e.id}
+              onClick={() => { setSelectedId(e.id); setAdding(null); }}
+              className={`flex items-center justify-between px-3 py-2 cursor-pointer text-sm ${selectedId === e.id ? 'bg-blue-50 border-l-2 border-blue-500' : 'hover:bg-gray-50'}`}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                {typeBadge(e.feature_type)}
+                <span className="font-mono text-xs truncate">{entryLabel(e)}</span>
+              </div>
+              {!locked && (
+                <button onClick={(ev) => { ev.stopPropagation(); handleDelete(e.id); }} className="text-red-400 hover:text-red-600 text-xs ml-2 shrink-0">x</button>
+              )}
+            </div>
+          ))}
+          {adding && (
+            <div className="flex items-center justify-between px-3 py-2 text-sm bg-blue-50 border-l-2 border-blue-500 border-dashed">
+              <div className="flex items-center gap-2 min-w-0">
+                {typeBadge(adding)}
+                <span className="font-mono text-xs italic text-gray-500 truncate">new {adding.replace('_', '-')}…</span>
+              </div>
+            </div>
+          )}
+          {entries.length === 0 && !adding && <div className="p-3 text-xs text-gray-400 text-center">No features yet</div>}
+        </div>
+      </div>
+
+      {/* Right panel — detail form */}
+      <div className="flex-1 border rounded bg-white p-3 overflow-y-auto max-h-[500px]">
+        {adding && (
+          <FeatureEntryEditor
+            mode="create"
+            featureType={adding}
+            eolId={eolId}
+            eols={eols}
+            allEntries={entries}
+            defaultCatalog={lastCatalog}
+            defaultSchema={lastSchema}
+            onSave={handleAdd}
+            onCancel={() => setAdding(null)}
+          />
+        )}
+        {!adding && selectedEntry && (
+          <FeatureEntryEditor
+            key={selectedEntry.id}
+            mode={locked ? 'view' : 'edit'}
+            featureType={selectedEntry.feature_type}
+            entry={selectedEntry}
+            eolId={eolId}
+            eols={eols}
+            allEntries={entries}
+            defaultCatalog={lastCatalog}
+            defaultSchema={lastSchema}
+            onSave={(data) => handleUpdate(selectedEntry.id, data)}
+            onCancel={() => setSelectedId(null)}
+          />
+        )}
+        {!adding && !selectedEntry && (
+          <div className="flex items-center justify-center h-full text-sm text-gray-400">
+            {entries.length > 0 ? 'Select an entry to view or edit' : 'Click + Add to create a feature entry'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Feature Entry Editor — handles create/edit/view for all entry types ──
+function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries, defaultCatalog, defaultSchema, onSave, onCancel }: {
+  mode: 'create' | 'edit' | 'view';
+  featureType: 'lookup' | 'on_demand' | 'declarative';
+  entry?: FeatureEntry;
+  eolId: number | null; eols: EOL[];
+  allEntries: FeatureEntry[];
+  defaultCatalog: string; defaultSchema: string;
+  onSave: (data: any) => void;
+  onCancel: () => void;
+}) {
+  const isReadOnly = mode === 'view';
+
+  // Parse existing entry for edit/view
+  const existingParts = entry?.table_name?.split('.') || entry?.function_name?.split('.') || [];
+  const initCatalog = existingParts[0] || defaultCatalog;
+  const initSchema = existingParts[1] || defaultSchema;
+  const initTable = existingParts[2] || '';
+  const initFunction = existingParts[2] || '';
+
   const [form, setForm] = useState({
-    catalog: '', schema: '', table: '',
-    selectedFeatures: [] as string[], selectedLookupKeys: [] as string[],
-    timestamp_lookup_key: '', output_name: '', default_values: '',
-    declarative_spec: '',
-    declarative_input: '', declarative_function: '', declarative_window_type: '',
-    declarative_window_duration: '', declarative_slide_duration: '',
-    declarative_filter: '',
+    catalog: initCatalog, schema: initSchema, table: initTable,
+    selectedFeatures: (entry?.feature_names || []) as string[],
+    selectedLookupKeys: (entry?.lookup_key || []) as string[],
+    timestamp_lookup_key: entry?.timestamp_lookup_key || '',
+    default_values: entry?.default_values ? JSON.stringify(entry.default_values) : '',
+    // On-demand fields
+    selectedFunction: initFunction,
+    outputName: entry?.output_name || '',
+    bindings: (entry?.input_bindings || {}) as Record<string, string>,
+    // Declarative fields
+    declarative_input: (entry?.declarative_spec as any)?.input || '',
+    declarative_function: (entry?.declarative_spec as any)?.function || '',
+    declarative_window_type: (entry?.declarative_spec as any)?.time_window?.type || '',
+    declarative_window_duration: (entry?.declarative_spec as any)?.time_window?.window_duration || '',
+    declarative_slide_duration: (entry?.declarative_spec as any)?.time_window?.slide_duration || '',
+    declarative_filter: (entry?.declarative_spec as any)?.filter_condition || '',
   });
 
   const [catalogs, setCatalogs] = useState<string[]>([]);
   const [schemas, setSchemas] = useState<string[]>([]);
   const [tables, setTables] = useState<string[]>([]);
   const [columns, setColumns] = useState<{ name: string; type: string }[]>([]);
+  const [ucFunctions, setUcFunctions] = useState<string[]>([]);
+  const [funcParams, setFuncParams] = useState<{ name: string; type: string }[]>([]);
   const [loadingUc, setLoadingUc] = useState('');
 
   // EOL columns for lookup key selection
@@ -453,399 +643,315 @@ function FeatureEntryForm({ featureId, eolId, eols, onSaved, isTrainingSpec }: {
       ? rawCols.replace(/^\{|\}$/g, '').split(',').filter(Boolean)
       : [];
 
+  // Collect all feature columns from sibling lookup entries (for on-demand bindings)
+  const lookupColumns: { table: string; columns: string[] }[] = allEntries
+    .filter(e => e.feature_type === 'lookup' && e.feature_names && e.id !== entry?.id)
+    .map(e => ({ table: e.table_name?.split('.').pop() || '', columns: e.feature_names || [] }));
+
   // Load catalogs on mount
   useEffect(() => {
-    if (catalogs.length === 0) {
-      setLoadingUc('catalogs');
-      api.getCatalogs().then(setCatalogs).catch(() => setCatalogs([])).finally(() => setLoadingUc(''));
-    }
+    api.getCatalogs().then(setCatalogs).catch(() => setCatalogs([]));
   }, []);
 
+  // Load schemas when catalog changes (only reset for new entries or actual catalog change)
+  const catalogRef = useRef(initCatalog);
   useEffect(() => {
     if (form.catalog) {
-      setLoadingUc('schemas');
-      setSchemas([]); setTables([]); setColumns([]);
-      setForm((f) => ({ ...f, schema: '', table: '', selectedFeatures: [] }));
-      api.getSchemas(form.catalog).then(setSchemas).catch(() => setSchemas([])).finally(() => setLoadingUc(''));
+      api.getSchemas(form.catalog).then(setSchemas).catch(() => setSchemas([]));
+      if (form.catalog !== catalogRef.current) {
+        catalogRef.current = form.catalog;
+        setTables([]); setColumns([]); setUcFunctions([]);
+        setForm(f => ({ ...f, schema: '', table: '', selectedFunction: '', selectedFeatures: [] }));
+      }
     }
   }, [form.catalog]);
 
+  // Load tables + functions when schema changes
+  const schemaRef = useRef(initSchema);
   useEffect(() => {
     if (form.catalog && form.schema) {
-      setLoadingUc('tables');
-      setTables([]); setColumns([]);
-      setForm((f) => ({ ...f, table: '', selectedFeatures: [] }));
-      api.getTables(form.catalog, form.schema).then(setTables).catch(() => setTables([])).finally(() => setLoadingUc(''));
+      api.getTables(form.catalog, form.schema).then(setTables).catch(() => setTables([]));
+      api.getFunctions(form.catalog, form.schema).then(setUcFunctions).catch(() => setUcFunctions([]));
+      if (form.schema !== schemaRef.current) {
+        schemaRef.current = form.schema;
+        setColumns([]);
+        setForm(f => ({ ...f, table: '', selectedFunction: '', selectedFeatures: [] }));
+      }
     }
-  }, [form.schema]);
+  }, [form.catalog, form.schema]);
 
+  // Load columns when table changes (for lookup)
   useEffect(() => {
     if (form.catalog && form.schema && form.table) {
-      setLoadingUc('columns');
-      setColumns([]);
-      setForm((f) => ({ ...f, selectedFeatures: [] }));
-      api.getColumns(form.catalog, form.schema, form.table).then(setColumns).catch(() => setColumns([])).finally(() => setLoadingUc(''));
+      api.getColumns(form.catalog, form.schema, form.table).then(setColumns).catch(() => setColumns([]));
     }
-  }, [form.table]);
+  }, [form.catalog, form.schema, form.table]);
+
+  // Load function params when function changes (for on-demand)
+  useEffect(() => {
+    if (form.catalog && form.schema && form.selectedFunction) {
+      api.getFunctionParams(form.catalog, form.schema, form.selectedFunction)
+        .then(setFuncParams).catch(() => setFuncParams([]));
+    } else {
+      setFuncParams([]);
+    }
+  }, [form.catalog, form.schema, form.selectedFunction]);
 
   const toggleFeatureCol = (col: string) => {
-    setForm((f) => ({
+    setForm(f => ({
       ...f,
       selectedFeatures: f.selectedFeatures.includes(col)
-        ? f.selectedFeatures.filter((c) => c !== col)
+        ? f.selectedFeatures.filter(c => c !== col)
         : [...f.selectedFeatures, col],
     }));
   };
 
   const toggleLookupKey = (col: string) => {
-    setForm((f) => ({
+    setForm(f => ({
       ...f,
       selectedLookupKeys: f.selectedLookupKeys.includes(col)
-        ? f.selectedLookupKeys.filter((c) => c !== col)
+        ? f.selectedLookupKeys.filter(c => c !== col)
         : [...f.selectedLookupKeys, col],
     }));
   };
 
-  const submit = async () => {
-    if (!form.catalog || !form.schema || !form.table) { alert('Select a table first'); return; }
-    if (featureType === 'lookup' && form.selectedFeatures.length === 0) { alert('Select at least one feature column'); return; }
-    if (featureType === 'lookup' && form.selectedLookupKeys.length === 0) { alert('Select at least one lookup key'); return; }
-    if (featureType === 'declarative') {
-      if (!form.declarative_input) { alert('Select an input column'); return; }
-      if (!form.declarative_function) { alert('Select a function'); return; }
-      if (!form.declarative_window_type) { alert('Select a time window type'); return; }
-      if (!form.declarative_window_duration) { alert('Enter a window duration (e.g. 30d, 12h)'); return; }
-      if (form.declarative_window_type === 'sliding' && !form.declarative_slide_duration) { alert('Sliding window requires a slide duration'); return; }
-    }
+  const submit = () => {
+    const fullName = `${form.catalog}.${form.schema}`;
 
-    const fullTableName = `${form.catalog}.${form.schema}.${form.table}`;
-
-    let declarativeSpec = null;
-    if (featureType === 'declarative') {
-      const windowSpec: Record<string, any> = {
-        type: form.declarative_window_type,
-        window_duration: form.declarative_window_duration,
-      };
-      if (form.declarative_window_type === 'sliding' && form.declarative_slide_duration) {
-        windowSpec.slide_duration = form.declarative_slide_duration;
-      }
-      declarativeSpec = {
-        source_table: fullTableName,
-        input: form.declarative_input,
-        function: form.declarative_function,
-        time_window: windowSpec,
-        lookup_key: form.selectedLookupKeys.length > 0 ? form.selectedLookupKeys : null,
+    if (featureType === 'lookup') {
+      if (!form.table) { alert('Select a table'); return; }
+      if (form.selectedFeatures.length === 0) { alert('Select at least one feature column'); return; }
+      if (form.selectedLookupKeys.length === 0) { alert('Select at least one lookup key'); return; }
+      onSave({
+        feature_type: 'lookup',
+        table_name: `${fullName}.${form.table}`,
+        feature_names: form.selectedFeatures,
+        lookup_key: form.selectedLookupKeys,
         timestamp_lookup_key: form.timestamp_lookup_key || null,
-        filter_condition: form.declarative_filter || null,
-      };
-    }
-
-    try {
-      const createFn = isTrainingSpec ? api.createTrainingSpecEntry : api.createFeatureEntry;
-      await createFn(featureId, {
-        feature_type: featureType,
-        table_name: fullTableName,
-        feature_names: featureType === 'lookup' ? form.selectedFeatures : null,
-        lookup_key: featureType === 'lookup' ? form.selectedLookupKeys : null,
-        timestamp_lookup_key: form.timestamp_lookup_key || null,
-        output_name: form.output_name || null,
         default_values: form.default_values ? JSON.parse(form.default_values) : null,
-        declarative_spec: declarativeSpec,
       });
-      setForm({ catalog: '', schema: '', table: '', selectedFeatures: [], selectedLookupKeys: [], timestamp_lookup_key: '', output_name: '', default_values: '', declarative_spec: '', declarative_input: '', declarative_function: '', declarative_window_type: '', declarative_window_duration: '', declarative_slide_duration: '', declarative_filter: '' });
-      onSaved();
-    } catch (e: any) {
-      alert(`Failed to add entry: ${e.message}`);
+    } else if (featureType === 'on_demand') {
+      if (!form.selectedFunction) { alert('Select a function'); return; }
+      if (!form.outputName) { alert('Enter an output column name'); return; }
+      const unboundParams = funcParams.filter(p => !form.bindings[p.name]);
+      if (unboundParams.length > 0) { alert(`Bind all parameters: ${unboundParams.map(p => p.name).join(', ')}`); return; }
+      onSave({
+        feature_type: 'on_demand',
+        function_name: `${fullName}.${form.selectedFunction}`,
+        input_bindings: form.bindings,
+        output_name: form.outputName,
+      });
+    } else if (featureType === 'declarative') {
+      if (!form.table || !form.declarative_input || !form.declarative_function || !form.declarative_window_type || !form.declarative_window_duration) {
+        alert('Fill in all required fields'); return;
+      }
+      const windowSpec: Record<string, any> = { type: form.declarative_window_type, window_duration: form.declarative_window_duration };
+      if (form.declarative_window_type === 'sliding' && form.declarative_slide_duration) windowSpec.slide_duration = form.declarative_slide_duration;
+      onSave({
+        feature_type: 'declarative',
+        table_name: `${fullName}.${form.table}`,
+        declarative_spec: {
+          source_table: `${fullName}.${form.table}`, input: form.declarative_input, function: form.declarative_function,
+          time_window: windowSpec, lookup_key: form.selectedLookupKeys.length > 0 ? form.selectedLookupKeys : null,
+          timestamp_lookup_key: form.timestamp_lookup_key || null, filter_condition: form.declarative_filter || null,
+        },
+      });
     }
   };
 
+  const sel = (v: string) => isReadOnly ? v : undefined;
+  const dis = isReadOnly;
+
   return (
-    <div className="mt-3 p-3 border border-dashed rounded bg-gray-50">
-      <div className="flex gap-4 mb-3">
-        <label className="flex items-center gap-1.5">
-          <input type="radio" checked={featureType === 'lookup'} onChange={() => setFeatureType('lookup')} />
-          <span className="text-sm">Standard FeatureLookup</span>
-        </label>
-        <label className="flex items-center gap-1.5">
-          <input type="radio" checked={featureType === 'declarative'} onChange={() => setFeatureType('declarative')} />
-          <span className="text-sm">Declarative Feature (beta)</span>
-        </label>
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-sm font-medium">
+          {mode === 'create' ? 'New' : ''} {featureType === 'lookup' ? 'Feature Lookup' : featureType === 'on_demand' ? 'On-Demand Feature' : 'Declarative Feature'}
+        </div>
+        <button onClick={onCancel} className="text-xs text-gray-400 hover:text-gray-600">Close</button>
       </div>
 
+      {/* Catalog / Schema — shared across all types */}
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div>
+          <label className="block text-xs font-medium mb-1">Catalog {loadingUc === 'catalogs' && <span className="text-blue-500 text-xs">loading...</span>}</label>
+          <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.catalog} onChange={e => setForm({ ...form, catalog: e.target.value })} disabled={dis}>
+            <option value="">Select...</option>
+            {catalogs.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs font-medium mb-1">Schema</label>
+          <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.schema} onChange={e => setForm({ ...form, schema: e.target.value })} disabled={dis || !form.catalog}>
+            <option value="">Select...</option>
+            {schemas.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Lookup detail */}
       {featureType === 'lookup' && (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium mb-1">Catalog {loadingUc === 'catalogs' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })}>
-              <option value="">Select catalog...</option>
-              {catalogs.map((c) => <option key={c} value={c}>{c}</option>)}
+            <label className="block text-xs font-medium mb-1">Table</label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.table} onChange={e => setForm({ ...form, table: e.target.value })} disabled={dis || !form.schema}>
+              <option value="">Select...</option>
+              {tables.map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Schema {loadingUc === 'schemas' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.schema} onChange={(e) => setForm({ ...form, schema: e.target.value })} disabled={!form.catalog}>
-              <option value="">Select schema...</option>
-              {schemas.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Table {loadingUc === 'tables' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.table} onChange={(e) => setForm({ ...form, table: e.target.value })} disabled={!form.schema}>
-              <option value="">Select table...</option>
-              {tables.map((t) => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Feature Columns {loadingUc === 'columns' && <span className="text-blue-500 text-xs">loading...</span>}</label>
+            <label className="block text-xs font-medium mb-1">Feature Columns</label>
             <div className="max-h-40 overflow-y-auto border rounded p-2 space-y-1">
-              {columns.map((col) => (
+              {columns.map(col => (
                 <label key={col.name} className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
-                  <input type="checkbox" checked={form.selectedFeatures.includes(col.name)} onChange={() => toggleFeatureCol(col.name)} />
+                  <input type="checkbox" checked={form.selectedFeatures.includes(col.name)} onChange={() => toggleFeatureCol(col.name)} disabled={dis} />
                   <span className="font-mono text-xs">{col.name}</span> <span className="text-gray-400 text-xs">({col.type})</span>
                 </label>
               ))}
-              {columns.length === 0 && <span className="text-xs text-gray-400">Select a table first</span>}
+              {columns.length === 0 && <span className="text-xs text-gray-400">{form.table ? 'Loading...' : 'Select a table'}</span>}
             </div>
             {form.selectedFeatures.length > 0 && <div className="text-xs text-gray-500 mt-1">{form.selectedFeatures.length} selected</div>}
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Lookup Key(s) <span className="text-xs text-gray-400">(from EOL entity columns)</span></label>
+            <label className="block text-xs font-medium mb-1">Lookup Key(s) <span className="text-gray-400">(EOL entity columns)</span></label>
             <div className="border rounded p-2 space-y-1">
-              {eolColumns.map((col) => (
+              {eolColumns.map(col => (
                 <label key={col} className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
-                  <input type="checkbox" checked={form.selectedLookupKeys.includes(col)} onChange={() => toggleLookupKey(col)} />
+                  <input type="checkbox" checked={form.selectedLookupKeys.includes(col)} onChange={() => toggleLookupKey(col)} disabled={dis} />
                   <span className="font-mono text-xs">{col}</span>
                 </label>
               ))}
-              {eolColumns.length === 0 && <span className="text-xs text-gray-400">No EOL selected on this feature definition</span>}
             </div>
           </div>
           {selectedEol?.timestamp_column && (
             <div>
-              <label className="block text-sm font-medium mb-1">Timestamp Lookup Key</label>
-              <div className="border rounded p-2">
-                <label className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
-                  <input type="checkbox" checked={form.timestamp_lookup_key === selectedEol.timestamp_column} onChange={(e) => setForm({ ...form, timestamp_lookup_key: e.target.checked ? selectedEol!.timestamp_column : '' })} />
-                  <span className="font-mono text-xs">{selectedEol.timestamp_column}</span>
-                  <span className="text-gray-400 text-xs">(point-in-time join)</span>
-                </label>
-              </div>
+              <label className="block text-xs font-medium mb-1">Timestamp Lookup Key</label>
+              <label className="flex items-center gap-1.5 text-sm cursor-pointer px-1">
+                <input type="checkbox" checked={form.timestamp_lookup_key === selectedEol.timestamp_column}
+                  onChange={e => setForm({ ...form, timestamp_lookup_key: e.target.checked ? selectedEol!.timestamp_column : '' })} disabled={dis} />
+                <span className="font-mono text-xs">{selectedEol.timestamp_column}</span>
+                <span className="text-gray-400 text-xs">(point-in-time join)</span>
+              </label>
             </div>
           )}
-          <div><label className="block text-sm font-medium mb-1">Default Values (JSON)</label><input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.default_values} onChange={(e) => setForm({ ...form, default_values: e.target.value })} placeholder='{"col": 0}' /></div>
+          <div>
+            <label className="block text-xs font-medium mb-1">Default Values (JSON)</label>
+            <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.default_values}
+              onChange={e => setForm({ ...form, default_values: e.target.value })} placeholder='{"col": 0}' disabled={dis} />
+          </div>
         </div>
       )}
 
+      {/* On-demand detail */}
+      {featureType === 'on_demand' && (
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium mb-1">Function</label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.selectedFunction}
+              onChange={e => setForm({ ...form, selectedFunction: e.target.value, bindings: {} })} disabled={dis || !form.schema}>
+              <option value="">Select...</option>
+              {ucFunctions.map(f => <option key={f} value={f}>{f}</option>)}
+            </select>
+            {ucFunctions.length === 0 && form.schema && <div className="text-xs text-gray-400 mt-1">No functions in {form.catalog}.{form.schema}</div>}
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1">Output Column Name</label>
+            <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.outputName}
+              onChange={e => setForm({ ...form, outputName: e.target.value })} placeholder="e.g. risk_score" disabled={dis} />
+          </div>
+          {funcParams.length > 0 && (
+            <div>
+              <label className="block text-xs font-medium mb-2">Input Bindings</label>
+              <div className="border rounded divide-y">
+                {funcParams.map(param => (
+                  <div key={param.name} className="flex items-center gap-2 px-3 py-2">
+                    <div className="w-1/3">
+                      <span className="font-mono text-xs font-medium">{param.name}</span>
+                      <span className="text-gray-400 text-xs ml-1">({param.type})</span>
+                    </div>
+                    <span className="text-gray-400 text-xs">&larr;</span>
+                    <select className="flex-1 px-2 py-1 border rounded text-sm" value={form.bindings[param.name] || ''}
+                      onChange={e => setForm(f => ({ ...f, bindings: { ...f.bindings, [param.name]: e.target.value } }))} disabled={dis}>
+                      <option value="">Select source...</option>
+                      {lookupColumns.map(lk => (
+                        <optgroup key={lk.table} label={lk.table}>
+                          {lk.columns.map(col => <option key={`${lk.table}-${col}`} value={col}>{col}</option>)}
+                        </optgroup>
+                      ))}
+                      <optgroup label="EOL Columns">
+                        {eolColumns.map(col => <option key={`eol-${col}`} value={col}>{col}</option>)}
+                        {selectedEol?.timestamp_column && !eolColumns.includes(selectedEol.timestamp_column) && (
+                          <option value={selectedEol.timestamp_column}>{selectedEol.timestamp_column} (timestamp)</option>
+                        )}
+                        {selectedEol?.label_column && !eolColumns.includes(selectedEol.label_column) && (
+                          <option value={selectedEol.label_column}>{selectedEol.label_column} (label)</option>
+                        )}
+                      </optgroup>
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Declarative detail */}
       {featureType === 'declarative' && (
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-sm font-medium mb-1">Source Catalog {loadingUc === 'catalogs' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })}>
-              <option value="">Select catalog...</option>
-              {catalogs.map((c) => <option key={c} value={c}>{c}</option>)}
+            <label className="block text-xs font-medium mb-1">Source Table</label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.table} onChange={e => setForm({ ...form, table: e.target.value })} disabled={dis || !form.schema}>
+              <option value="">Select...</option>
+              {tables.map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Source Schema {loadingUc === 'schemas' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.schema} onChange={(e) => setForm({ ...form, schema: e.target.value })} disabled={!form.catalog}>
-              <option value="">Select schema...</option>
-              {schemas.map((s) => <option key={s} value={s}>{s}</option>)}
+            <label className="block text-xs font-medium mb-1">Input Column</label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.declarative_input} onChange={e => setForm({ ...form, declarative_input: e.target.value })} disabled={dis || columns.length === 0}>
+              <option value="">Select...</option>
+              {columns.map(col => <option key={col.name} value={col.name}>{col.name} ({col.type})</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Source Table {loadingUc === 'tables' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.table} onChange={(e) => setForm({ ...form, table: e.target.value })} disabled={!form.schema}>
-              <option value="">Select table...</option>
-              {tables.map((t) => <option key={t} value={t}>{t}</option>)}
+            <label className="block text-xs font-medium mb-1">Function</label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.declarative_function} onChange={e => setForm({ ...form, declarative_function: e.target.value })} disabled={dis}>
+              <option value="">Select...</option>
+              {['sum','avg','count','min','max','stddev_pop','stddev_samp','var_pop','var_samp','approx_count_distinct','first','last'].map(f => <option key={f} value={f}>{f}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Input Column {loadingUc === 'columns' && <span className="text-blue-500 text-xs">loading...</span>}</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.declarative_input} onChange={(e) => setForm({ ...form, declarative_input: e.target.value })} disabled={columns.length === 0}>
-              <option value="">Select column...</option>
-              {columns.map((col) => <option key={col.name} value={col.name}>{col.name} ({col.type})</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Function</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.declarative_function} onChange={(e) => setForm({ ...form, declarative_function: e.target.value })}>
-              <option value="">Select function...</option>
-              <option value="sum">Sum</option>
-              <option value="avg">Avg / Mean</option>
-              <option value="count">Count</option>
-              <option value="min">Min</option>
-              <option value="max">Max</option>
-              <option value="stddev_pop">Stddev (population)</option>
-              <option value="stddev_samp">Stddev (sample)</option>
-              <option value="var_pop">Variance (population)</option>
-              <option value="var_samp">Variance (sample)</option>
-              <option value="approx_count_distinct">Approx Count Distinct</option>
-              <option value="first">First</option>
-              <option value="last">Last</option>
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Time Window Type</label>
-            <select className="w-full px-3 py-2 border rounded" value={form.declarative_window_type} onChange={(e) => setForm({ ...form, declarative_window_type: e.target.value })}>
-              <option value="">Select window type...</option>
+            <label className="block text-xs font-medium mb-1">Window Type</label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.declarative_window_type} onChange={e => setForm({ ...form, declarative_window_type: e.target.value })} disabled={dis}>
+              <option value="">Select...</option>
               <option value="continuous">Continuous</option>
               <option value="tumbling">Tumbling</option>
               <option value="sliding">Sliding</option>
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Window Duration <span className="text-xs text-gray-400">(e.g. 30d, 12h, 60m)</span></label>
-            <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.declarative_window_duration} onChange={(e) => setForm({ ...form, declarative_window_duration: e.target.value })} placeholder="30d" />
+            <label className="block text-xs font-medium mb-1">Window Duration</label>
+            <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.declarative_window_duration} onChange={e => setForm({ ...form, declarative_window_duration: e.target.value })} placeholder="30d" disabled={dis} />
           </div>
           {form.declarative_window_type === 'sliding' && (
             <div>
-              <label className="block text-sm font-medium mb-1">Slide Duration <span className="text-xs text-gray-400">(e.g. 1d, 6h)</span></label>
-              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.declarative_slide_duration} onChange={(e) => setForm({ ...form, declarative_slide_duration: e.target.value })} placeholder="1d" />
-            </div>
-          )}
-          <div>
-            <label className="block text-sm font-medium mb-1">Lookup Key(s) <span className="text-xs text-gray-400">(from EOL entity columns)</span></label>
-            <div className="border rounded p-2 space-y-1">
-              {eolColumns.map((col) => (
-                <label key={col} className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
-                  <input type="checkbox" checked={form.selectedLookupKeys.includes(col)} onChange={() => toggleLookupKey(col)} />
-                  <span className="font-mono text-xs">{col}</span>
-                </label>
-              ))}
-              {eolColumns.length === 0 && <span className="text-xs text-gray-400">No EOL selected on this feature definition</span>}
-            </div>
-          </div>
-          {selectedEol?.timestamp_column && (
-            <div>
-              <label className="block text-sm font-medium mb-1">Timestamp Lookup Key</label>
-              <div className="border rounded p-2">
-                <label className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
-                  <input type="checkbox" checked={form.timestamp_lookup_key === selectedEol.timestamp_column} onChange={(e) => setForm({ ...form, timestamp_lookup_key: e.target.checked ? selectedEol!.timestamp_column : '' })} />
-                  <span className="font-mono text-xs">{selectedEol.timestamp_column}</span>
-                  <span className="text-gray-400 text-xs">(point-in-time join)</span>
-                </label>
-              </div>
+              <label className="block text-xs font-medium mb-1">Slide Duration</label>
+              <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.declarative_slide_duration} onChange={e => setForm({ ...form, declarative_slide_duration: e.target.value })} placeholder="1d" disabled={dis} />
             </div>
           )}
           <div className="col-span-2">
-            <label className="block text-sm font-medium mb-1">Filter Condition <span className="text-xs text-gray-400">(optional SQL expression)</span></label>
-            <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.declarative_filter} onChange={(e) => setForm({ ...form, declarative_filter: e.target.value })} placeholder='e.g. amount > 100' />
+            <label className="block text-xs font-medium mb-1">Filter Condition</label>
+            <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.declarative_filter} onChange={e => setForm({ ...form, declarative_filter: e.target.value })} placeholder="e.g. amount > 100" disabled={dis} />
           </div>
         </div>
       )}
 
-      <div className="mt-3">
-        <button onClick={submit} className="px-4 py-2 bg-green-600 text-white rounded text-sm">Add Entry</button>
-      </div>
-    </div>
-  );
-}
-
-// ── Feature Entry Detail — read-only view matching the creation form layout ──
-function FeatureEntryDetail({ entry, eolId, eols }: { entry: FeatureEntry; eolId: number | null; eols: EOL[] }) {
-  const [columns, setColumns] = useState<{ name: string; type: string }[]>([]);
-
-  const selectedEol = eols.find((e) => e.id === eolId);
-  const rawCols = selectedEol?.entity_columns;
-  const eolColumns: string[] = Array.isArray(rawCols)
-    ? rawCols
-    : typeof rawCols === 'string'
-      ? rawCols.replace(/^\{|\}$/g, '').split(',').filter(Boolean)
-      : [];
-
-  // Parse table_name into catalog.schema.table
-  const parts = entry.table_name?.split('.') || [];
-  const catalog = parts[0] || '';
-  const schema = parts[1] || '';
-  const table = parts[2] || '';
-
-  // Load columns for the table
-  useEffect(() => {
-    if (catalog && schema && table) {
-      api.getColumns(catalog, schema, table).then(setColumns).catch(() => setColumns([]));
-    }
-  }, [catalog, schema, table]);
-
-  const featureNames = entry.feature_names || [];
-  const lookupKeys = entry.lookup_key || [];
-
-  if (entry.feature_type === 'declarative') {
-    const spec = entry.declarative_spec || {} as any;
-    return (
-      <div className="mt-2 p-3 border rounded bg-gray-50">
-        <div className="text-xs font-medium text-purple-700 mb-2">Declarative Feature</div>
-        <div className="grid grid-cols-2 gap-2 text-sm">
-          {spec.source_table && <div><span className="text-gray-500">Source:</span> <span className="font-mono">{spec.source_table}</span></div>}
-          {spec.input && <div><span className="text-gray-500">Input:</span> <span className="font-mono">{spec.input}</span></div>}
-          {spec.function && <div><span className="text-gray-500">Function:</span> <span className="font-mono">{spec.function}</span></div>}
-          {spec.time_window && <div><span className="text-gray-500">Window:</span> <span className="font-mono">{spec.time_window.type} / {spec.time_window.window_duration}{spec.time_window.slide_duration ? ` (slide: ${spec.time_window.slide_duration})` : ''}</span></div>}
-          {spec.lookup_key && <div><span className="text-gray-500">Lookup Key:</span> <span className="font-mono">{spec.lookup_key.join(', ')}</span></div>}
-          {spec.timestamp_lookup_key && <div><span className="text-gray-500">Timestamp Key:</span> <span className="font-mono">{spec.timestamp_lookup_key}</span></div>}
-          {spec.filter_condition && <div className="col-span-2"><span className="text-gray-500">Filter:</span> <span className="font-mono">{spec.filter_condition}</span></div>}
+      {!isReadOnly && (
+        <div className="mt-4 flex gap-2">
+          <button onClick={submit} className="px-4 py-2 bg-green-600 text-white rounded text-sm">{mode === 'create' ? 'Add' : 'Save'}</button>
+          <button onClick={onCancel} className="px-4 py-2 border rounded text-sm">Cancel</button>
         </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-2 p-3 border rounded bg-gray-50">
-      <div className="text-xs font-medium text-purple-700 mb-3">Standard FeatureLookup</div>
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="block text-sm font-medium mb-1">Catalog</label>
-          <div className="w-full px-3 py-2 border rounded bg-white text-sm font-mono">{catalog}</div>
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">Schema</label>
-          <div className="w-full px-3 py-2 border rounded bg-white text-sm font-mono">{schema}</div>
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">Table</label>
-          <div className="w-full px-3 py-2 border rounded bg-white text-sm font-mono">{table}</div>
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">Feature Columns</label>
-          <div className="max-h-40 overflow-y-auto border rounded p-2 space-y-1 bg-white">
-            {columns.map((col) => (
-              <label key={col.name} className="flex items-center gap-1.5 text-sm px-1 rounded">
-                <input type="checkbox" checked={featureNames.includes(col.name)} disabled />
-                <span className="font-mono text-xs">{col.name}</span> <span className="text-gray-400 text-xs">({col.type})</span>
-              </label>
-            ))}
-            {columns.length === 0 && <span className="text-xs text-gray-400">Loading columns...</span>}
-          </div>
-          <div className="text-xs text-gray-500 mt-1">{featureNames.length} selected</div>
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">Lookup Key(s) <span className="text-xs text-gray-400">(from EOL entity columns)</span></label>
-          <div className="border rounded p-2 space-y-1 bg-white">
-            {eolColumns.map((col) => (
-              <label key={col} className="flex items-center gap-1.5 text-sm px-1 rounded">
-                <input type="checkbox" checked={lookupKeys.includes(col)} disabled />
-                <span className="font-mono text-xs">{col}</span>
-              </label>
-            ))}
-          </div>
-        </div>
-        {entry.timestamp_lookup_key && (
-          <div>
-            <label className="block text-sm font-medium mb-1">Timestamp Lookup Key</label>
-            <div className="border rounded p-2 bg-white">
-              <label className="flex items-center gap-1.5 text-sm px-1 rounded">
-                <input type="checkbox" checked disabled />
-                <span className="font-mono text-xs">{entry.timestamp_lookup_key}</span>
-                <span className="text-gray-400 text-xs">(point-in-time join)</span>
-              </label>
-            </div>
-          </div>
-        )}
-        {entry.default_values && (
-          <div>
-            <label className="block text-sm font-medium mb-1">Default Values</label>
-            <div className="w-full px-3 py-2 border rounded bg-white font-mono text-xs">{JSON.stringify(entry.default_values)}</div>
-          </div>
-        )}
-      </div>
+      )}
     </div>
   );
 }
@@ -967,7 +1073,7 @@ function FeaturesTab({ projectId, eols, features, reload }: { projectId: number;
                             <button onClick={(e) => { e.stopPropagation(); api.deleteFeatureEntry(entry.id).then(reload); }} className="text-red-400 text-xs hover:text-red-600">remove</button>
                           </div>
                           {viewingEntryId === entry.id && (
-                            <FeatureEntryDetail entry={entry} eolId={f.eol_id} eols={eols} />
+                            <div className="mt-2 p-2 bg-gray-50 rounded text-xs font-mono">{JSON.stringify(entry, null, 2)}</div>
                           )}
                         </div>
                       ))}
@@ -985,12 +1091,7 @@ function FeaturesTab({ projectId, eols, features, reload }: { projectId: number;
 
               {/* Add entry form */}
               {addingEntryTo === f.id && (
-                <FeatureEntryForm
-                  featureId={f.id}
-                  eolId={f.eol_id}
-                  eols={eols}
-                  onSaved={() => { setAddingEntryTo(null); reload(); }}
-                />
+                <div className="p-3 text-sm text-gray-400">Legacy feature entry form removed — use Training Specs</div>
               )}
             </div>
           );
@@ -1314,9 +1415,22 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' });
   const [expandedId, setExpandedId] = useState<number | null>(null);
-  const [addingEntryTo, setAddingEntryTo] = useState<number | null>(null);
   const [registerError, setRegisterError] = useState('');
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const commitRename = async (specId: number, original: string) => {
+    const next = renameValue.trim();
+    setRenamingId(null);
+    if (!next || next === original) return;
+    try {
+      await api.updateTrainingSpec(specId, { name: next });
+      reload();
+    } catch (e: any) {
+      alert(`Rename failed: ${e.message}`);
+    }
+  };
 
   // Poll running runs
   useEffect(() => {
@@ -1463,7 +1577,33 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                 <div className="cursor-pointer flex-1" onClick={() => setExpandedId(isExpanded ? null : spec.id)}>
                   <h3 className="font-medium">
                     <span className="text-gray-400 mr-1">{isExpanded ? '▾' : '▸'}</span>
-                    {spec.name}
+                    {renamingId === spec.id ? (
+                      <input
+                        autoFocus
+                        className="border rounded px-1 py-0.5 text-sm font-medium"
+                        value={renameValue}
+                        onChange={e => setRenameValue(e.target.value)}
+                        onClick={e => e.stopPropagation()}
+                        onBlur={() => commitRename(spec.id, spec.name)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') { e.preventDefault(); commitRename(spec.id, spec.name); }
+                          if (e.key === 'Escape') { e.preventDefault(); setRenamingId(null); }
+                        }}
+                      />
+                    ) : (
+                      <span
+                        onClick={e => {
+                          if (isLocked) return;
+                          e.stopPropagation();
+                          setRenameValue(spec.name);
+                          setRenamingId(spec.id);
+                        }}
+                        className={isLocked ? '' : 'cursor-text hover:bg-gray-100 px-1 rounded'}
+                        title={isLocked ? undefined : 'Click to rename'}
+                      >
+                        {spec.name}
+                      </span>
+                    )}
                     {isLocked && <span className="ml-2 text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded">locked</span>}
                   </h3>
                   <div className="text-sm text-gray-500 ml-4">
@@ -1478,22 +1618,10 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                   {!isLocked && spec.entries.length > 0 && (
                     <button onClick={() => launchRun(spec.id)} className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">Run</button>
                   )}
-                  {!isLocked && (
-                    <button onClick={() => setAddingEntryTo(addingEntryTo === spec.id ? null : spec.id)} className="px-2 py-1 bg-blue-50 text-blue-600 text-xs rounded hover:bg-blue-100">
-                      {addingEntryTo === spec.id ? 'Cancel' : '+ Feature'}
-                    </button>
-                  )}
                   <button onClick={() => api.copyTrainingSpec(spec.id).then(reload)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Copy</button>
                   {!isLocked && <button onClick={() => api.deleteTrainingSpec(spec.id).then(reload)} className="text-red-500 text-sm">Delete</button>}
                 </div>
               </div>
-
-              {/* Feature entry form */}
-              {addingEntryTo === spec.id && (
-                <div className="px-4 pb-4">
-                  <FeatureEntryForm featureId={spec.id} eolId={spec.eol_id} eols={eols} onSaved={() => { setAddingEntryTo(null); reload(); }} isTrainingSpec />
-                </div>
-              )}
 
               {/* Expanded detail */}
               {isExpanded && (
@@ -1508,26 +1636,8 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                     )}
                   </div>
 
-                  {/* Feature entries */}
-                  {spec.entries.length > 0 ? (
-                    <div className="space-y-2 mb-4">
-                      <div className="text-xs font-medium text-gray-500">Feature Entries</div>
-                      {spec.entries.map(entry => (
-                        <div key={entry.id} className="flex justify-between items-center p-2 bg-gray-50 rounded text-sm">
-                          <div>
-                            <span className="text-xs px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded mr-2">{entry.feature_type}</span>
-                            <span className="font-mono text-gray-600">{entry.table_name}</span>
-                            {entry.feature_type === 'lookup' && <span className="text-gray-400"> → {entry.feature_names?.join(', ')}</span>}
-                          </div>
-                          {!isLocked && (
-                            <button onClick={() => api.deleteTrainingSpecEntry(entry.id).then(reload)} className="text-red-400 text-xs hover:text-red-600">remove</button>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-xs text-gray-400 mb-4">No feature entries — click "+ Feature" to add</div>
-                  )}
+                  {/* Feature Builder — master-detail */}
+                  <FeatureBuilder specId={spec.id} eolId={spec.eol_id} eols={eols} entries={spec.entries} onChanged={reload} locked={isLocked} />
 
                   {/* Runs */}
                   {specRuns.length > 0 && (

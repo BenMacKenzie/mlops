@@ -141,18 +141,21 @@ A complete, immutable training configuration: features + split + task type. Comb
 Each notebook handles both classification and regression via the `task_type` parameter.
 
 #### `app.feature_entry`
-An individual feature lookup or declarative feature within a training spec. A training spec can have many entries, each pulling from a different table.
+An individual feature entry within a training spec. Each entry is one of three types: a table lookup, an on-demand function, or a declarative feature. A training spec can have many entries of mixed types.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
 | training_spec_id | BIGINT FK → training_spec | Parent spec |
-| feature_type | VARCHAR(50) | `'lookup'` or `'declarative'` |
+| feature_type | VARCHAR(50) | `'lookup'`, `'on_demand'`, or `'declarative'` |
 | table_name | VARCHAR(255) | UC feature table (for lookup type) |
-| feature_names | TEXT[] | Columns to look up |
-| lookup_key | TEXT[] | Join keys mapping to EOL entity columns |
-| timestamp_lookup_key | VARCHAR(255) | For point-in-time lookups |
-| default_values | JSONB | Default values for missing features |
+| feature_names | TEXT[] | Columns to look up (for lookup type) |
+| lookup_key | TEXT[] | Join keys mapping to EOL entity columns (for lookup type) |
+| timestamp_lookup_key | VARCHAR(255) | For point-in-time lookups (for lookup type) |
+| default_values | JSONB | Default values for missing features (for lookup type) |
+| function_name | VARCHAR(255) | Fully-qualified UC function name (for on_demand type) |
+| input_bindings | JSONB | Map of function param → source column (for on_demand type). Sources can be columns from any lookup entry in the spec or EOL columns. |
+| output_name | VARCHAR(255) | Name of the computed output column (for on_demand type) |
 | declarative_spec | JSONB | Full declarative Feature spec (for declarative type) |
 
 #### `app.run`
@@ -252,31 +255,54 @@ Consolidates feature definitions, dataset configuration, and model training into
 6. Set split percentages and seed
 7. Optionally set hyperparameters (JSON)
 
-**Adding feature entries** (one or more per spec):
+**Feature Builder (master-detail UI)**
 
-*Standard FeatureLookup entry:*
-1. Select a **feature table** via cascading dropdowns: Catalog → Schema → Table
-   - Dropdowns populated from Unity Catalog metadata via SQL warehouse
-2. Select **feature columns** from the chosen table (multi-select)
-3. Select **lookup key(s)** from the EOL's entity columns
-4. Optionally set **timestamp lookup key** and **default values**
+The feature section of a training spec uses a two-panel master-detail layout for managing all feature entries (lookups, on-demand, declarative).
 
-*Declarative Feature entry (beta):*
-1. Configure via guided form: source table, input column, function, time window
+*Left panel — entry list:*
+- Shows all feature entries in the spec, each displaying: type badge, name/summary, source info
+- **"+ Add"** button with type selector: Lookup | On-Demand | Declarative
+- Click an entry to select it → loads in the right panel for editing
+- Delete button per entry (trash icon)
+- Entries are editable until the spec is locked (first run created). After locking, the list is read-only.
 
-**View & Copy:**
-- **View:** Click an existing spec to expand and see all details (read-only)
-- **Copy:** Duplicate an existing spec (with all entries) to create a new version. Use this to experiment with different features, splits, or parameters.
+*Right panel — detail form:*
+Adapts to the selected entry's type. Catalog and schema **default to the most recently used values** across entries (so you only pick catalog/schema once if all features come from the same schema).
 
-Training specs are **locked** once a run has been created against them — no edits to features, split, or parameters after that point. This preserves lineage: a model always traces back to the exact spec that produced it. To iterate, copy the spec.
+*Lookup detail:*
+1. Catalog → Schema → Table cascade (catalog/schema pre-filled from last entry)
+2. Feature columns — checkbox list from the selected table
+3. Lookup keys — checkbox list from EOL entity columns
+4. Optional: timestamp lookup key, default values (JSON)
+5. All fields editable until spec is locked
+
+*On-Demand detail:*
+1. Catalog → Schema → Function cascade (catalog/schema pre-filled from last entry)
+   - Functions listed from `information_schema.routines`
+2. Function parameters read from `information_schema.parameters`, displayed as binding form
+3. For each parameter, bind to a source via dropdown:
+   - **Columns from any lookup entry** in the spec (grouped by source table)
+   - **EOL columns** (entity keys, timestamp, label)
+4. Output column name
+5. At serving time, the endpoint resolves lookup features first, then passes bound values to the UC function. On-demand outputs do **not** require synced tables.
+
+*Declarative detail (beta):*
+1. Source table (catalog/schema/table cascade), input column, function, time window
+2. Same form as today, adapted to the right-panel layout
+
+**Editing & locking:**
+- All entries are fully editable (add columns, change bindings, modify parameters) until the spec's first run is created
+- After first run → spec is **locked**: entry list and detail forms become read-only
+- **Copy** duplicates the entire spec (with all entries) under a new name for further editing
+- Enforced server-side: PUT/POST/DELETE on entries rejected for specs that have runs
 
 **Running:**
 - Click **Run** on a training spec → launches a single Databricks Job that:
   1. Executes EOL SQL → spine DataFrame
-  2. Builds `FeatureLookup` objects → `fe.create_training_set()` → `load_df()`
+  2. Builds `FeatureLookup` objects (from lookup entries) + `FeatureFunction` objects (from on-demand entries) → `fe.create_training_set()` → `load_df()`
   3. Splits per strategy/method
   4. Trains model (CatBoost, configured by task_type + parameters)
-  5. Logs with `fe.log_model()` (embeds feature specs for serving)
+  5. Logs with `fe.log_model()` (embeds feature specs — both lookups and on-demand functions — for serving)
 - View runs with status, metrics, job/MLflow links
 - **Register model:** One-click registration via app-managed notebook (`register_model.py`)
 - Auto-polls running jobs every 10s
@@ -289,27 +315,30 @@ Training specs are **locked** once a run has been created against them — no ed
 
 Each notebook handles both classification and regression via the `task_type` parameter. The app selects the right notebook automatically based on split_strategy.
 
-Server endpoints for cascading dropdowns:
+Server endpoints for UC metadata:
 - `GET /api/uc/catalogs` — list catalogs via SQL warehouse
 - `GET /api/uc/schemas?catalog=X` — list schemas in catalog
 - `GET /api/uc/tables?catalog=X&schema=Y` — list tables in schema
 - `GET /api/uc/columns?catalog=X&schema=Y&table=Z` — list columns in table
+- `GET /api/uc/functions?catalog=X&schema=Y` — list UC functions in schema (from `information_schema.routines`)
+- `GET /api/uc/function-params?catalog=X&schema=Y&function=Z` — get function parameter names and types (from `information_schema.parameters`)
+- `PUT /api/training-spec-entries/:id` — update an existing entry (blocked if spec has runs)
 
 ### 5. Deployment (within project)
 
 Manages synced tables (online feature store) and serving endpoints.
 
-Since training notebooks use `fe.log_model()`, models have feature specs embedded. Databricks serving endpoints automatically resolve feature lookups from synced tables at inference time. If the requesting system supplies a feature in the request payload, it is used instead of the lookup — built-in Databricks behavior.
+Since training notebooks use `fe.log_model()`, models have feature specs embedded. Databricks serving endpoints automatically resolve feature lookups from synced tables at inference time. On-demand features (`FeatureFunction`) are computed at inference time by calling the UC function — they do **not** require synced tables. If the requesting system supplies a feature in the request payload, it is used instead of the lookup — built-in Databricks behavior.
 
 **Two sections in the tab:**
 
-1. **Synced Tables** (project-level) — all distinct source tables from feature entries across all training specs. Shows sync status, pipeline link, and which training specs reference each table. When a deployment is selected, highlights tables required by that model.
+1. **Synced Tables** (project-level) — all distinct source tables from **lookup** feature entries across all training specs. On-demand entries are excluded (they don't need online tables). Shows sync status, pipeline link, and which training specs reference each table. When a deployment is selected, highlights tables required by that model.
 2. **Deployments** — each links a registered model to a serving endpoint.
 
 **Creating a deployment:**
 1. Give it a name (e.g. `production`)
 2. Select a registered model version from dropdown
-3. All required feature tables must be synced (ONLINE) before endpoint creation
+3. All required **lookup** feature tables must be synced (ONLINE) before endpoint creation. On-demand features are ready automatically (the UC function just needs to exist and be accessible).
 4. Link to Databricks endpoint UI for management (stop/start)
 
 **Syncing tables:**
@@ -365,7 +394,7 @@ All training notebooks accept:
 - `eol_sql` — the spine SQL (entity keys + label)
 - `label_column` — target column name
 - `entity_columns_json` — JSON array of entity key column names
-- `feature_lookups_json` — JSON array of feature lookup definitions
+- `feature_entries_json` — JSON array of feature entry definitions (replaces `feature_lookups_json`). Each entry has a `"type"` field: `"lookup"` or `"on_demand"`. Lookup entries contain `table_name`, `feature_names`, `lookup_key`, etc. On-demand entries contain `function_name`, `input_bindings`, `output_name`.
 - `task_type` — `'classification'` or `'regression'`
 - `split_method` — `'random'` or `'temporal'` (ignored for CV)
 - `split_config_json` — `{"eval_pct": 20, "test_pct": 10, "seed": 42}`
@@ -377,12 +406,30 @@ All training notebooks accept:
 ### Notebook Pipeline (what each notebook does)
 
 1. Execute EOL SQL → spine DataFrame
-2. Build `FeatureLookup` objects from `feature_lookups_json`
-3. `fe.create_training_set(spine, feature_lookups, label)` → training_set
-4. `training_set.load_df()` → full DataFrame with features
+2. Build `FeatureLookup` and `FeatureFunction` objects from `feature_entries_json`:
+   ```python
+   entries = json.loads(feature_entries_json)
+   features = []
+   for e in entries:
+       features.append(FeatureLookup(
+           table_name=e["table_name"],
+           feature_names=e["feature_names"],
+           lookup_key=e["lookup_key"],
+           timestamp_lookup_key=e.get("timestamp_lookup_key"),
+       ))
+       # Attach on-demand functions from this lookup entry
+       for od in e.get("on_demand_features", []):
+           features.append(FeatureFunction(
+               udf_name=od["function_name"],
+               input_bindings=od["input_bindings"],
+               output_name=od["output_name"],
+           ))
+   ```
+3. `fe.create_training_set(spine, features, label)` → training_set
+4. `training_set.load_df()` → full DataFrame with features (lookups resolved from tables, on-demand functions executed)
 5. Split per `split_method` + `split_config` (or skip for CV)
 6. Train model (CatBoost, configured by `task_type` + `parameters_json`)
-7. `fe.log_model(model, training_set=training_set, ...)` → model with feature specs embedded
+7. `fe.log_model(model, training_set=training_set, ...)` → model with feature specs embedded (both lookups and on-demand functions)
 8. Return metrics + table names via `dbutils.notebook.exit()`
 
 ### Registration Notebook
@@ -455,6 +502,10 @@ See `deploy.sh` for the full deployment script.
 
 11. **MLflow via REST API for reads, notebooks for writes** — The Express backend calls MLflow REST endpoints for reading (experiments, runs, metrics). Model logging and registration require the Python SDK and run inside notebooks.
 
+12. **On-demand features as peer entries with cross-table bindings** — On-demand features are their own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, and `output_name` columns. Input bindings can reference columns from *any* lookup entry in the spec (not just one table) + EOL columns. This supports functions like `distance(customer_zip, merchant_zip)` that need inputs from multiple tables. The app references existing UC functions — it does not author them. On-demand outputs don't require synced tables; the serving endpoint calls the UC function at inference time.
+
+13. **Master-detail feature builder** — Feature entries (lookup, on-demand, declarative) are managed via a two-panel layout: left panel shows the entry list, right panel shows the editable detail form for the selected entry. Catalog/schema default to the most recently used values across entries. All entries are fully editable (add/remove columns, change bindings) until the spec's first run locks it. Copy-to-edit after locking.
+
 ---
 
 ## Action Items
@@ -494,7 +545,8 @@ See `deploy.sh` for the full deployment script.
 - [ ] Write `train_standard.py` notebook (train/eval split) — 2026-04-17
 - [ ] Remove git_url/notebook_path from project, remove GitHub notebook listing — 2026-04-17
 - [ ] End-to-end test: create project → EOL → training spec → run → register → deploy — 2026-04-17
-- [ ] **BLOCKER: Online store Postgres DB mismatch** — `fe.publish_table()` writes to `databricks_postgres` but serving endpoint looks in `serverless_stable_1dpktm_catalog`. Need to align the Lakebase database name with the UC catalog. Investigate with Feature Store / Lakebase team or file ES ticket. — 2026-04-20
+- [ ] **BLOCKER: Lakebase metadata bug (ES-1849341)** — `fe.publish_table()` succeeds but serving endpoint can't discover the online table. Known bug where publish fails to register Online Store metadata. File ES ticket against FeatureStore.MLFeatureStore with workspace ID, region, exact API calls, and error text. Also check: SP permissions (USAGE on catalog/schema, SELECT on online table). — 2026-04-20
+- [ ] Add on-demand feature support: `function_name`/`input_bindings`/`output_name` columns on `feature_entry`, UC function/params endpoints, master-detail feature builder UI, entry update endpoint, notebook `FeatureFunction` construction — 2026-04-21
 - [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime) — 2026-04-12
 - [ ] Build MLflow experiment viewer + run comparison UI — 2026-04-12
 - [ ] Fix local dev Lakebase auth (SASL issue with AppKit token refresh) — 2026-04-12
@@ -536,6 +588,8 @@ See `deploy.sh` for the full deployment script.
 - 2026-04-17: Consolidated training spec — merged feature_definition + dataset + training config into single `training_spec` entity. UI reduced from 4 tabs to 2 (EOL + Training). Split strategy determines notebook: none→CV, train_eval→standard, train_eval_test→hpsearch. Copy workflow for experimentation.
 - 2026-04-17: App-managed training notebooks — training notebooks live in `notebooks/` folder, not user git repos. App selects notebook based on split_strategy. Each notebook handles full pipeline: EOL → features → create_training_set → split → train → fe.log_model(). Ensures feature specs always embedded correctly. Project no longer needs git_url/notebook_path fields.
 - 2026-04-17: Single-job training — no separate materialize step. Each run does everything in one notebook/job. The `training_set` object from `fe.create_training_set()` flows through to `fe.log_model()`, embedding feature specs for serving. Eliminates the need to cache/manage materialized tables separately.
+- 2026-04-21: On-demand features — own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, `output_name` columns. Initially tried attaching to lookup entries as nested JSONB, but a `distance(customer_zip, merchant_zip)` use case showed bindings need to cross tables. Reverted to peer entries. Input bindings can reference columns from any lookup entry in the spec + EOL columns. Notebook param renamed `feature_lookups_json` → `feature_entries_json`; notebook builds `FeatureLookup` + `FeatureFunction` objects from the flat entry list. On-demand outputs don't require synced tables. Function metadata read from `information_schema.routines` and `information_schema.parameters`.
+- 2026-04-21: Master-detail feature builder UI — replaced per-entry add/view forms with a two-panel layout. Left panel: entry list (lookup, on-demand, declarative). Right panel: editable detail form for selected entry. Catalog/schema default to most recently used values. Entries fully editable until spec's first run locks them. Supports add, edit, delete, and copy-to-edit-after-lock.
 
 ## Meeting Notes
 See `meetings/` folder for dated meeting notes.

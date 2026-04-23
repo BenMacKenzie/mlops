@@ -28,6 +28,10 @@ export const getSchemas = (catalog: string) => request<string[]>(`/api/uc/schema
 export const getTables = (catalog: string, schema: string) => request<string[]>(`/api/uc/tables?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`);
 export const getColumns = (catalog: string, schema: string, table: string) =>
   request<{ name: string; type: string }[]>(`/api/uc/columns?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`);
+export const getFunctions = (catalog: string, schema: string) =>
+  request<string[]>(`/api/uc/functions?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`);
+export const getFunctionParams = (catalog: string, schema: string, functionName: string) =>
+  request<{ name: string; type: string }[]>(`/api/uc/function-params?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&function=${encodeURIComponent(functionName)}`);
 export const previewSql = (sql: string) =>
   request<{ rows: any[]; count: number }>('/api/sql/preview', { method: 'POST', body: JSON.stringify({ sql }) });
 
@@ -50,6 +54,8 @@ export const copyTrainingSpec = (id: number, name?: string) =>
   request<TrainingSpec>(`/api/training-specs/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
 export const createTrainingSpecEntry = (specId: number, data: any) =>
   request<FeatureEntry>(`/api/training-specs/${specId}/entries`, { method: 'POST', body: JSON.stringify(data) });
+export const updateTrainingSpecEntry = (id: number, data: any) =>
+  request<FeatureEntry>(`/api/training-spec-entries/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteTrainingSpecEntry = (id: number) =>
   request<{ ok: boolean }>(`/api/training-spec-entries/${id}`, { method: 'DELETE' });
 

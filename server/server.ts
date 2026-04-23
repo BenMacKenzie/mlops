@@ -284,6 +284,33 @@ appkit.server.extend((app) => {
     }
   });
 
+  app.get('/api/uc/functions', async (req, res) => {
+    try {
+      const catalog = req.query.catalog as string;
+      const schema = req.query.schema as string;
+      if (!catalog || !schema) { res.status(400).json({ error: 'catalog and schema required' }); return; }
+      const rows = await executeSql(req, `SELECT routine_name FROM ${catalog}.information_schema.routines WHERE routine_schema = '${schema}' AND routine_type = 'FUNCTION' ORDER BY routine_name`);
+      res.json(rows.map((r: any) => r.routine_name || r.ROUTINE_NAME || Object.values(r)[0]));
+    } catch (e: any) {
+      console.error('[uc/functions] error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get('/api/uc/function-params', async (req, res) => {
+    try {
+      const catalog = req.query.catalog as string;
+      const schema = req.query.schema as string;
+      const func = req.query.function as string;
+      if (!catalog || !schema || !func) { res.status(400).json({ error: 'catalog, schema, and function required' }); return; }
+      const rows = await executeSql(req, `SELECT parameter_name, data_type FROM ${catalog}.information_schema.parameters WHERE specific_schema = '${schema}' AND specific_name = '${func}' AND parameter_name IS NOT NULL ORDER BY ordinal_position`);
+      res.json(rows.map((r: any) => ({ name: r.parameter_name || r.PARAMETER_NAME, type: r.data_type || r.DATA_TYPE })));
+    } catch (e: any) {
+      console.error('[uc/function-params] error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // SQL preview — execute arbitrary SQL and return results (for EOL validation)
   app.post('/api/sql/preview', async (req, res) => {
     try {
@@ -419,13 +446,25 @@ appkit.server.extend((app) => {
       if (parseInt(runCount.rows[0].count) > 0) {
         res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
       }
-      const { eol_id, name, task_type, split_strategy, split_method, split_config, parameters } = req.body;
+      const jsonCols = new Set(['split_config', 'parameters']);
+      const allowed = ['eol_id', 'name', 'task_type', 'split_strategy', 'split_method', 'split_config', 'parameters'];
+      const sets: string[] = [];
+      const values: any[] = [];
+      for (const key of allowed) {
+        if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+          const v = req.body[key];
+          sets.push(`${key}=$${values.length + 1}`);
+          values.push(jsonCols.has(key) ? (v ? JSON.stringify(v) : null) : v);
+        }
+      }
+      if (sets.length === 0) {
+        const current = await db.query('SELECT * FROM app.training_spec WHERE id = $1', [req.params.id]);
+        res.json(current.rows[0]); return;
+      }
+      values.push(req.params.id);
       const result = await db.query(
-        `UPDATE app.training_spec SET eol_id=$1, name=$2, task_type=$3, split_strategy=$4, split_method=$5, split_config=$6, parameters=$7
-         WHERE id=$8 RETURNING *`,
-        [eol_id, name, task_type, split_strategy, split_method,
-         split_config ? JSON.stringify(split_config) : null,
-         parameters ? JSON.stringify(parameters) : null, req.params.id]
+        `UPDATE app.training_spec SET ${sets.join(', ')} WHERE id=$${values.length} RETURNING *`,
+        values
       );
       res.json(result.rows[0]);
     } catch (e: any) {
@@ -461,10 +500,12 @@ appkit.server.extend((app) => {
         const entryResult = await db.query(
           `INSERT INTO app.feature_entry
            (training_spec_id, feature_type, table_name, feature_names, lookup_key,
-            timestamp_lookup_key, output_name, default_values, declarative_spec)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+            timestamp_lookup_key, output_name, default_values,
+            function_name, input_bindings, declarative_spec)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
           [newSpec.id, e.feature_type, e.table_name, e.feature_names, e.lookup_key,
-           e.timestamp_lookup_key, e.output_name, e.default_values, e.declarative_spec]
+           e.timestamp_lookup_key, e.output_name, e.default_values,
+           e.function_name, e.input_bindings, e.declarative_spec]
         );
         copiedEntries.push(entryResult.rows[0]);
       }
@@ -484,18 +525,54 @@ appkit.server.extend((app) => {
       }
       const {
         feature_type, table_name, feature_names, lookup_key,
-        timestamp_lookup_key, output_name, default_values, declarative_spec
+        timestamp_lookup_key, output_name, default_values,
+        function_name, input_bindings, declarative_spec
       } = req.body;
       const result = await db.query(
         `INSERT INTO app.feature_entry
          (training_spec_id, feature_type, table_name, feature_names, lookup_key,
-          timestamp_lookup_key, output_name, default_values, declarative_spec)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+          timestamp_lookup_key, output_name, default_values,
+          function_name, input_bindings, declarative_spec)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
         [req.params.specId, feature_type, table_name, feature_names, lookup_key,
          timestamp_lookup_key, output_name, default_values ? JSON.stringify(default_values) : null,
+         function_name || null, input_bindings ? JSON.stringify(input_bindings) : null,
          declarative_spec ? JSON.stringify(declarative_spec) : null]
       );
       res.status(201).json(result.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.put('/api/training-spec-entries/:id', async (req, res) => {
+    try {
+      const entry = await db.query('SELECT training_spec_id FROM app.feature_entry WHERE id = $1', [req.params.id]);
+      if (entry.rows.length === 0) { res.status(404).json({ error: 'Entry not found' }); return; }
+      if (entry.rows[0].training_spec_id) {
+        const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [entry.rows[0].training_spec_id]);
+        if (parseInt(runCount.rows[0].count) > 0) {
+          res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
+        }
+      }
+      const {
+        feature_type, table_name, feature_names, lookup_key,
+        timestamp_lookup_key, output_name, default_values,
+        function_name, input_bindings, declarative_spec
+      } = req.body;
+      const result = await db.query(
+        `UPDATE app.feature_entry SET
+          feature_type=$1, table_name=$2, feature_names=$3, lookup_key=$4,
+          timestamp_lookup_key=$5, output_name=$6, default_values=$7,
+          function_name=$8, input_bindings=$9, declarative_spec=$10
+         WHERE id=$11 RETURNING *`,
+        [feature_type, table_name, feature_names, lookup_key,
+         timestamp_lookup_key, output_name, default_values ? JSON.stringify(default_values) : null,
+         function_name || null, input_bindings ? JSON.stringify(input_bindings) : null,
+         declarative_spec ? JSON.stringify(declarative_spec) : null,
+         req.params.id]
+      );
+      res.json(result.rows[0]);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -558,14 +635,23 @@ appkit.server.extend((app) => {
       const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
       const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [spec.id])).rows;
 
-      const featureLookups = entries
-        .filter((e: any) => e.feature_type === 'lookup')
-        .map((e: any) => ({
+      const featureEntries = entries.map((e: any) => {
+        if (e.feature_type === 'on_demand') {
+          return {
+            type: 'on_demand',
+            function_name: e.function_name,
+            input_bindings: e.input_bindings,
+            output_name: e.output_name,
+          };
+        }
+        return {
+          type: 'lookup',
           table_name: e.table_name,
           feature_names: e.feature_names,
           lookup_key: e.lookup_key,
           timestamp_lookup_key: e.timestamp_lookup_key || null,
-        }));
+        };
+      }).filter((e: any) => e.type === 'lookup' || e.type === 'on_demand');
 
       const entityColumns = Array.isArray(eol.entity_columns)
         ? eol.entity_columns
@@ -598,7 +684,7 @@ appkit.server.extend((app) => {
         eol_sql: eol.sql_definition,
         label_column: eol.label_column || '',
         entity_columns_json: JSON.stringify(entityColumns),
-        feature_lookups_json: JSON.stringify(featureLookups),
+        feature_entries_json: JSON.stringify(featureEntries),
         task_type: spec.task_type || 'classification',
         parameters_json: JSON.stringify(spec.parameters || {}),
         catalog: project.catalog,
@@ -1968,10 +2054,13 @@ db.query(`
     training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE,
     feature_type VARCHAR(50) NOT NULL DEFAULT 'lookup',
     table_name VARCHAR(255), feature_names TEXT[], lookup_key TEXT[],
-    timestamp_lookup_key VARCHAR(255), output_name VARCHAR(255), default_values JSONB, declarative_spec JSONB
+    timestamp_lookup_key VARCHAR(255), output_name VARCHAR(255), default_values JSONB, declarative_spec JSONB,
+    function_name VARCHAR(255), input_bindings JSONB
   );
   ALTER TABLE app.feature_entry ADD COLUMN IF NOT EXISTS training_spec_id BIGINT REFERENCES app.training_spec(id) ON DELETE CASCADE;
   ALTER TABLE app.feature_entry ALTER COLUMN feature_definition_id DROP NOT NULL;
+  ALTER TABLE app.feature_entry ADD COLUMN IF NOT EXISTS function_name VARCHAR(255);
+  ALTER TABLE app.feature_entry ADD COLUMN IF NOT EXISTS input_bindings JSONB;
   CREATE TABLE IF NOT EXISTS app.dataset (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL, feature_definition_id BIGINT REFERENCES app.feature_definition(id) ON DELETE SET NULL,

@@ -25,13 +25,18 @@ export interface EOL {
 export interface FeatureEntry {
   id: number;
   training_spec_id: number;
-  feature_type: 'lookup' | 'declarative';
+  feature_type: 'lookup' | 'on_demand' | 'declarative';
+  // Lookup fields
   table_name: string | null;
   feature_names: string[] | null;
   lookup_key: string[] | null;
   timestamp_lookup_key: string | null;
-  output_name: string | null;
   default_values: Record<string, any> | null;
+  // On-demand fields
+  function_name: string | null;
+  input_bindings: Record<string, string> | null;
+  output_name: string | null;
+  // Declarative fields
   declarative_spec: Record<string, any> | null;
 }
 

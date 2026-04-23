@@ -15,7 +15,7 @@
 dbutils.widgets.text("eol_sql", "")
 dbutils.widgets.text("label_column", "")
 dbutils.widgets.text("entity_columns_json", "[]")
-dbutils.widgets.text("feature_lookups_json", "[]")
+dbutils.widgets.text("feature_entries_json", "[]")
 dbutils.widgets.text("task_type", "classification")
 dbutils.widgets.text("parameters_json", "{}")
 dbutils.widgets.text("catalog", "")
@@ -31,7 +31,7 @@ import tempfile
 eol_sql = dbutils.widgets.get("eol_sql")
 label_column = dbutils.widgets.get("label_column")
 entity_columns = json.loads(dbutils.widgets.get("entity_columns_json"))
-feature_lookups_raw = json.loads(dbutils.widgets.get("feature_lookups_json"))
+feature_entries_raw = json.loads(dbutils.widgets.get("feature_entries_json"))
 task_type = dbutils.widgets.get("task_type")
 user_params = json.loads(dbutils.widgets.get("parameters_json"))
 catalog = dbutils.widgets.get("catalog")
@@ -41,7 +41,7 @@ experiment_name = dbutils.widgets.get("experiment_name")
 print(f"Task type: {task_type}")
 print(f"EOL SQL: {eol_sql[:200]}...")
 print(f"Label: {label_column}, Entity columns: {entity_columns}")
-print(f"Feature lookups: {len(feature_lookups_raw)}")
+print(f"Feature entries: {len(feature_entries_raw)}")
 print(f"User params: {user_params}")
 
 # COMMAND ----------
@@ -76,34 +76,41 @@ print(f"EOL rows: {eol_df.count()}, columns: {eol_df.columns}")
 
 # COMMAND ----------
 
-from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
+from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup, FeatureFunction
 
 fe = FeatureEngineeringClient()
 
-feature_lookups = []
-for fd in feature_lookups_raw:
-    fl_kwargs = {
-        "table_name": fd["table_name"],
-        "lookup_key": fd["lookup_key"],
-    }
-    if fd.get("feature_names"):
-        fl_kwargs["feature_names"] = fd["feature_names"]
-    if fd.get("timestamp_lookup_key"):
-        fl_kwargs["timestamp_lookup_key"] = fd["timestamp_lookup_key"]
-    feature_lookups.append(FeatureLookup(**fl_kwargs))
+features = []
+for entry in feature_entries_raw:
+    if entry["type"] == "on_demand":
+        features.append(FeatureFunction(
+            udf_name=entry["function_name"],
+            input_bindings=entry["input_bindings"],
+            output_name=entry["output_name"],
+        ))
+    else:
+        fl_kwargs = {
+            "table_name": entry["table_name"],
+            "lookup_key": entry["lookup_key"],
+        }
+        if entry.get("feature_names"):
+            fl_kwargs["feature_names"] = entry["feature_names"]
+        if entry.get("timestamp_lookup_key"):
+            fl_kwargs["timestamp_lookup_key"] = entry["timestamp_lookup_key"]
+        features.append(FeatureLookup(**fl_kwargs))
 
-print(f"Built {len(feature_lookups)} FeatureLookups")
+print(f"Built {len(features)} features (FeatureLookups + FeatureFunctions)")
 
 # Exclude entity columns + timestamp lookup keys from the training data
 exclude = list(entity_columns) if entity_columns else []
-for fd in feature_lookups_raw:
-    ts_key = fd.get("timestamp_lookup_key")
+for entry in feature_entries_raw:
+    ts_key = entry.get("timestamp_lookup_key")
     if ts_key and ts_key not in exclude:
         exclude.append(ts_key)
 
 training_set = fe.create_training_set(
     df=eol_df,
-    feature_lookups=feature_lookups,
+    feature_lookups=features,
     label=label_column,
     exclude_columns=exclude,
 )
