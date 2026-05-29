@@ -1,0 +1,33 @@
+# Exclude from Databricks bundle uploads.
+# Runtime only needs: app.yaml, package.json, build/server.mjs, client/dist/, notebooks/
+
+node_modules/
+client/src/
+client/public/
+client/vite.config.ts
+client/vite-env.d.ts
+server/
+dist/
+tests/
+playwright-report/
+test-results/
+.smoke-test/
+.git/
+.vscode/
+.idea/
+.databricks/
+.appkit/
+appkit/
+meetings/
+README.md
+*.log
+.env
+.env.*
+playwright.config.ts
+vitest.config.ts
+eslint.config.js
+appkit.plugins.json
+tsconfig*.json
+reset-db.sh
+dev.sh
+deploy.sh

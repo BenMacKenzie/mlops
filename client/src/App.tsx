@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec } from './types';
 import * as api from './api';
 
@@ -445,28 +445,68 @@ function FeatureSummary({ spec, onChanged, locked }: {
     }
   }
 
-  const excluded = new Set(spec.excluded_features || []);
-  const included = outputs.filter(o => !excluded.has(o.name));
+  const persisted = useMemo(() => new Set(spec.excluded_features || []), [spec.excluded_features]);
+  const [pending, setPending] = useState<Set<string>>(persisted);
+  const [saving, setSaving] = useState(false);
+  const [open, setOpen] = useState(false);
 
-  const toggle = async (name: string) => {
-    const next = new Set(excluded);
-    if (next.has(name)) next.delete(name); else next.add(name);
+  // Reset pending state when the spec's persisted value changes (e.g. after save/reload)
+  useEffect(() => { setPending(new Set(persisted)); }, [persisted]);
+
+  const dirty = pending.size !== persisted.size ||
+    [...pending].some(x => !persisted.has(x));
+
+  const included = outputs.filter(o => !pending.has(o.name));
+
+  const toggle = (name: string) => {
+    setPending(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
+
+  const save = async () => {
+    setSaving(true);
     try {
-      await api.updateTrainingSpec(spec.id, { excluded_features: [...next] });
+      await api.updateTrainingSpec(spec.id, { excluded_features: [...pending] });
       onChanged();
     } catch (err: any) {
       alert(`Update failed: ${err.message}`);
     }
+    setSaving(false);
   };
+
+  const reset = () => setPending(new Set(persisted));
 
   if (outputs.length === 0) return null;
 
   return (
     <div className="mt-4 border-t pt-3">
-      <div className="text-xs font-medium text-gray-500 mb-2">
-        Training Features ({included.length} of {outputs.length} included)
-        {locked && <span className="ml-2 text-gray-400">— locked</span>}
+      <div className="flex items-center justify-between mb-2">
+        <button
+          onClick={() => setOpen(o => !o)}
+          className="text-xs font-medium text-gray-500 hover:text-gray-700 flex items-center gap-1"
+        >
+          <span className="text-gray-400">{open ? '▾' : '▸'}</span>
+          Training Features ({included.length} of {outputs.length} included)
+          {locked && <span className="ml-2 text-gray-400">— locked</span>}
+          {dirty && !locked && <span className="ml-2 text-amber-600">— unsaved</span>}
+        </button>
+        {open && !locked && (
+          <div className="flex gap-2">
+            {dirty && (
+              <button onClick={reset} className="px-2 py-1 text-xs text-gray-500 hover:text-gray-700">Reset</button>
+            )}
+            <button
+              onClick={save}
+              disabled={!dirty || saving}
+              className="px-3 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:bg-gray-300"
+            >{saving ? 'Saving...' : 'Save'}</button>
+          </div>
+        )}
       </div>
+      {open && (
       <table className="w-full text-left text-sm border rounded overflow-hidden">
         <thead className="bg-gray-50">
           <tr>
@@ -478,7 +518,7 @@ function FeatureSummary({ spec, onChanged, locked }: {
         </thead>
         <tbody className="divide-y">
           {outputs.map((o, i) => {
-            const isExcluded = excluded.has(o.name);
+            const isExcluded = pending.has(o.name);
             return (
               <tr key={`${o.name}-${o.source}-${i}`} className={isExcluded ? 'bg-gray-50 text-gray-400' : ''}>
                 <td className="px-3 py-1.5">
@@ -501,6 +541,7 @@ function FeatureSummary({ spec, onChanged, locked }: {
           })}
         </tbody>
       </table>
+      )}
     </div>
   );
 }
@@ -713,10 +754,11 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
   const [ucFunctions, setUcFunctions] = useState<string[]>([]);
   const [funcParams, setFuncParams] = useState<{ name: string; type: string }[]>([]);
   const [loadingUc, setLoadingUc] = useState('');
+  void setLoadingUc;
 
   // EOL columns for lookup key selection
   const selectedEol = eols.find((e) => e.id === eolId);
-  const rawCols = selectedEol?.entity_columns;
+  const rawCols: any = selectedEol?.entity_columns;
   const eolColumns: string[] = Array.isArray(rawCols)
     ? rawCols
     : typeof rawCols === 'string'
@@ -840,6 +882,7 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
   };
 
   const sel = (v: string) => isReadOnly ? v : undefined;
+  void sel;
   const dis = isReadOnly;
 
   return (
@@ -1036,7 +1079,8 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
   );
 }
 
-// ── Features Tab ──
+// ── Features Tab (legacy, replaced by TrainingSpecTab) ──
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function FeaturesTab({ projectId, eols, features, reload }: { projectId: number; eols: EOL[]; features: FeatureDefinition[]; reload: () => void }) {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [createForm, setCreateForm] = useState({ name: '', eol_id: '' });
@@ -1182,7 +1226,8 @@ function FeaturesTab({ projectId, eols, features, reload }: { projectId: number;
   );
 }
 
-// ── Datasets Tab ──
+// ── Datasets Tab (legacy, replaced by TrainingSpecTab) ──
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function DatasetsTab({ projectId, features, datasets, reload }: {
   projectId: number; features: FeatureDefinition[]; datasets: Dataset[]; reload: () => void;
 }) {
@@ -1330,7 +1375,8 @@ function DatasetsTab({ projectId, features, datasets, reload }: {
   );
 }
 
-// ── Runs Tab (train + evaluate) ──
+// ── Runs Tab (train + evaluate) (legacy, replaced by TrainingSpecTab) ──
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function RunsTab({ projectId, datasets, runs, reload }: {
   projectId: number; datasets: Dataset[]; runs: Run[]; reload: () => void;
 }) {
@@ -2296,5 +2342,10 @@ function App() {
     </div>
   );
 }
+
+// Keep legacy tab components compiled (replaced by TrainingSpecTab but not yet deleted).
+void FeaturesTab;
+void DatasetsTab;
+void RunsTab;
 
 export default App;

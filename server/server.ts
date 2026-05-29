@@ -17,9 +17,10 @@ const appkit = await createApp({
 
 const db = appkit.lakebase;
 
-// Lakebase project config for synced tables (feature store online serving)
+// Lakebase project config for synced tables (feature store online serving).
+// The online store name must match the Lakebase project name for fe.publish_table().
 const LAKEBASE_BRANCH = process.env.LAKEBASE_BRANCH || 'projects/mlops/branches/production';
-const LAKEBASE_PG_DATABASE = process.env.PGDATABASE || 'databricks_postgres';
+const ONLINE_STORE_NAME = (LAKEBASE_BRANCH.match(/^projects\/([^/]+)/)?.[1]) || 'mlops';
 
 // Helper: call Databricks REST API using the user's OBO token (or app token for local dev)
 function getToken(req: any): string {
@@ -42,7 +43,7 @@ async function getUsername(req: any): Promise<string> {
   } catch {
     _cachedUser = '';
   }
-  return _cachedUser;
+  return _cachedUser ?? '';
 }
 
 async function databricksApi(req: any, method: string, apiPath: string, body?: any, apiPrefix = 'api/2.1'): Promise<any> {
@@ -1063,7 +1064,7 @@ appkit.server.extend((app) => {
           environment_key: 'Default',
           spec: {
             client: '1',
-            dependencies: ['databricks-feature-engineering'],
+            dependencies: ['databricks-feature-engineering>=0.15.0'],
           },
         }],
       };
@@ -1238,9 +1239,6 @@ appkit.server.extend((app) => {
       const trainNotebookPath = project.notebook_path
         ? `${project.notebook_path}/${project.training_notebook}`
         : project.training_notebook;
-      const evalNotebookPath = project.notebook_path
-        ? `${project.notebook_path}/${project.evaluation_notebook}`
-        : project.evaluation_notebook;
 
       // Build feature lookups JSON for the training notebook (for fe.log_model)
       const entriesResult = await db.query(
@@ -1286,7 +1284,7 @@ appkit.server.extend((app) => {
           ],
           environments: [{
             environment_key: 'Default',
-            spec: { client: '1', dependencies: ['databricks-feature-engineering'] },
+            spec: { client: '1', dependencies: ['databricks-feature-engineering>=0.15.0'] },
           }],
         };
         console.log(`[job] Creating job: mlops-${project.name}`);
@@ -1370,7 +1368,7 @@ appkit.server.extend((app) => {
             const expResp = await fetch(`${host}/api/2.0/mlflow/experiments/get-by-name?experiment_name=${encodeURIComponent(experimentFullPath)}`, {
               headers: { Authorization: `Bearer ${token}` },
             });
-            const expData = await expResp.json();
+            const expData = await expResp.json() as any;
             if (expData.experiment?.experiment_id) {
               mlflowExperimentId = expData.experiment.experiment_id;
             }
@@ -1387,7 +1385,7 @@ appkit.server.extend((app) => {
                 max_results: 1,
               }),
             });
-            const searchData = await searchResp.json();
+            const searchData = await searchResp.json() as any;
             const mlRun = searchData.runs?.[0];
             if (mlRun) {
               mlflowRunId = mlRun.info?.run_id || null;
@@ -1458,7 +1456,7 @@ appkit.server.extend((app) => {
       };
 
       console.log(`[register] Launching register job: ${fullModelName} from run ${run.mlflow_run_id}`);
-      const { job_id, run_id: jobRunId, run_url } = await createOrRunJob(
+      const { run_id: jobRunId } = await createOrRunJob(
         req, `mlops-register-${modelName}`, notebookPath, params
       );
 
@@ -1546,7 +1544,7 @@ appkit.server.extend((app) => {
       const publishMode = (sync_mode || 'triggered').toUpperCase();
       const shortName = source_table.split('.').pop();
       const onlineTableName = `${project.catalog}.${project.schema}.${shortName}_online`;
-      const onlineStoreName = project.catalog; // must match UC catalog for serving endpoint lookup
+      const onlineStoreName = ONLINE_STORE_NAME; // Lakebase project name
 
       // Enable CDF on source table (required for TRIGGERED/CONTINUOUS)
       try {
@@ -1583,7 +1581,7 @@ appkit.server.extend((app) => {
       };
 
       console.log(`[publish] Publishing ${source_table} → ${onlineTableName} (store: ${onlineStoreName})`);
-      const { job_id, run_id: jobRunId, run_url } = await createOrRunJob(
+      const { run_id: jobRunId, run_url } = await createOrRunJob(
         req, `mlops-publish-${shortName}`, notebookPath, params
       );
 
@@ -1708,7 +1706,7 @@ appkit.server.extend((app) => {
       const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'publish_table.py');
       await uploadNotebook(req, localNotebook, notebookPath);
 
-      const onlineStoreName = project.catalog; // must match UC catalog for serving endpoint lookup
+      const onlineStoreName = ONLINE_STORE_NAME; // Lakebase project name
       let published = 0;
       const seen = new Set<string>();
       for (const entry of entriesResult.rows) {
