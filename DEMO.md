@@ -50,3 +50,22 @@ Direct features from the spine (`amount`, `pos_entry_mode`, `security_code`) are
 ## Deployment note
 Both lookup tables must be published online before serving. `pos_entry_mode`/`security_code`
 being STRING is the deliberate fix for the int32→int64 downcast MLflow rejects at serving.
+
+## End-to-end result (2026-09-29, verified)
+Full path exercised via the app API against 77rg2n: project → EOL → spec → train → register
+→ publish online tables → serving endpoint → test inference.
+- Training (CV): test-AUC-mean **0.9616**.
+- Serving returned `predictions: [1,1,0]` for three sampled transactions, matching true labels;
+  serving auto-resolved both lookups + computed `zip_distance` on-demand.
+- Model `cc_fraud` v2 deployed to endpoint `cc-fraud`.
+
+### Two gotchas fixed during the run (important for the demo)
+1. **On-demand `FeatureFunction` requires a Python UDF, not SQL.** A SQL `distance()` failed at
+   `create_training_set` with "is not a Python UDF. Only Python UDFs are supported." Recreated as
+   `LANGUAGE PYTHON`. → on-demand feature functions must be `LANGUAGE PYTHON` in UC.
+2. **int32/int64 serving mismatch** (same as the historical fix). Feature-table integer columns
+   created as Spark `INT` → int32 model signature; online-store lookup returns int64 → MLflow
+   refuses the narrowing at serving. Fix: make numeric feature columns **BIGINT** (or DOUBLE) so
+   the signature is int64. Applied to `customer_features` (customer_age, account_age_days,
+   num_transactions_30d). Re-publish over an existing online view via `fe.publish_table` (TRIGGERED)
+   works without dropping the view.
