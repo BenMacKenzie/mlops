@@ -5,10 +5,10 @@
 
 cd "$(dirname "$0")"
 
-PROFILE=fe-vm-serverless-stable-1dpktm
+PROFILE=fe-vm-serverless-stable-77rg2n
 
-export DATABRICKS_HOST=https://fevm-serverless-stable-1dpktm.cloud.databricks.com
-export DATABRICKS_WAREHOUSE_ID=c3adcf234afed63a
+export DATABRICKS_HOST=https://fevm-serverless-stable-77rg2n.cloud.databricks.com
+export DATABRICKS_WAREHOUSE_ID=fec84293300374a5
 export DATABRICKS_CONFIG_PROFILE=$PROFILE
 export NODE_ENV=development
 
@@ -21,7 +21,7 @@ if [ -z "$DATABRICKS_TOKEN" ]; then
 fi
 
 # Lakebase connection — use native auth (static token)
-export PGHOST=ep-little-wind-d2xv9pgg.database.us-east-1.cloud.databricks.com
+export PGHOST=ep-ancient-unit-d20ko36y.database.us-east-1.cloud.databricks.com
 export PGDATABASE=databricks_postgres
 export PGPORT=5432
 export PGSSLMODE=require

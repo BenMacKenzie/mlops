@@ -25,7 +25,7 @@ targets:
   default:
     default: true
     workspace:
-      host: https://fevm-serverless-stable-1dpktm.cloud.databricks.com
+      host: https://fevm-serverless-stable-77rg2n.cloud.databricks.com
 
     variables:
-      sql_warehouse_id: c3adcf234afed63a
+      sql_warehouse_id: fec84293300374a5
