@@ -1543,10 +1543,17 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
   const emptyForm = { name: '', eol_id: '', task_type: 'classification', split_strategy: 'none', split_method: 'random', eval_pct: '20', seed: '42', parameters: '' };
   const [form, setForm] = useState(emptyForm);
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [eolExpandedFor, setEolExpandedFor] = useState<number | null>(null);
   const [registerError, setRegisterError] = useState('');
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const parseEntityCols = (cols: any): string => {
+    if (Array.isArray(cols)) return cols.join(', ');
+    if (typeof cols === 'string') return cols.replace(/^\{|\}$/g, '');
+    return '';
+  };
 
   const commitRename = async (specId: number, original: string) => {
     const next = renameValue.trim();
@@ -1802,6 +1809,30 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                       <div><span className="text-gray-500">Params:</span> <span className="font-mono text-xs">{JSON.stringify(spec.parameters)}</span></div>
                     )}
                   </div>
+
+                  {/* EOL detail — expandable */}
+                  {eol && (
+                    <div className="mb-3 border rounded">
+                      <div
+                        className="px-3 py-2 cursor-pointer flex items-center bg-gray-50 hover:bg-gray-100 text-sm"
+                        onClick={() => setEolExpandedFor(eolExpandedFor === spec.id ? null : spec.id)}
+                      >
+                        <span className="text-gray-400 mr-1">{eolExpandedFor === spec.id ? '▾' : '▸'}</span>
+                        <span className="font-medium">EOL:</span>&nbsp;<span className="font-mono">{eol.name}</span>
+                        <span className="text-gray-500 ml-3">
+                          Label: <span className="font-mono">{eol.label_column}</span>
+                          <span className="mx-2">|</span>Entity: <span className="font-mono">{parseEntityCols(eol.entity_columns)}</span>
+                          {eol.timestamp_column && <><span className="mx-2">|</span>Timestamp: <span className="font-mono">{eol.timestamp_column}</span></>}
+                        </span>
+                      </div>
+                      {eolExpandedFor === spec.id && (
+                        <div className="px-3 py-3 border-t">
+                          <div className="text-xs font-medium text-gray-500 mb-1">SQL Definition</div>
+                          <pre className="p-2 bg-gray-50 rounded text-xs font-mono overflow-x-auto whitespace-pre-wrap">{eol.sql_definition}</pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Feature Builder — master-detail */}
                   <FeatureBuilder specId={spec.id} eolId={spec.eol_id} eols={eols} entries={spec.entries} onChanged={reload} locked={isLocked} />

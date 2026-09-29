@@ -1,6 +1,7 @@
 import { createApp, analytics, server, lakebase } from '@databricks/appkit';
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 
 // Use PGPASSWORD for native auth (local dev), or LAKEBASE_ENDPOINT for OAuth (deployed)
 const lakebaseConfig = process.env.PGPASSWORD
@@ -22,10 +23,39 @@ const db = appkit.lakebase;
 const LAKEBASE_BRANCH = process.env.LAKEBASE_BRANCH || 'projects/mlops/branches/production';
 const ONLINE_STORE_NAME = (LAKEBASE_BRANCH.match(/^projects\/([^/]+)/)?.[1]) || 'mlops';
 
-// Helper: call Databricks REST API using the user's OBO token (or app token for local dev)
+// Helper: call Databricks REST API using the user's OBO token (or app token for local dev).
+// In dev mode, refreshes the CLI-issued token before it expires (~1 hr) so the server
+// doesn't need a manual restart every hour.
+let _devToken: { token: string; expiresAt: number } | null = null;
+function refreshDevToken(): string {
+  const profile = process.env.DATABRICKS_CONFIG_PROFILE;
+  if (!profile) return process.env.DATABRICKS_TOKEN || '';
+  try {
+    const out = execSync(`databricks auth token -p ${profile}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const parsed = JSON.parse(out);
+    _devToken = {
+      token: parsed.access_token,
+      expiresAt: new Date(parsed.expiry).getTime(),
+    };
+    return _devToken.token;
+  } catch {
+    return process.env.DATABRICKS_TOKEN || '';
+  }
+}
 function getToken(req: any): string {
-  return (req.headers['x-forwarded-access-token'] as string)
-    || process.env.DATABRICKS_TOKEN || '';
+  const obo = req.headers['x-forwarded-access-token'] as string;
+  if (obo) return obo;
+  if (process.env.NODE_ENV === 'development') {
+    // Refresh 60s before expiry
+    if (!_devToken || Date.now() >= _devToken.expiresAt - 60_000) {
+      return refreshDevToken();
+    }
+    return _devToken.token;
+  }
+  return process.env.DATABRICKS_TOKEN || '';
 }
 
 // Helper: get the current user's email (cached)
