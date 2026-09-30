@@ -84,6 +84,9 @@ Deployed and verified 2026-09-30 at https://mlops-7474643951125249.aws.databrick
    redeploy → "permission denied for schema app"). `deploy.sh` does this automatically.
 8. The postgres app resource is re-added via REST after `bundle deploy` (DABs can't declare it),
    and a first-time app must be started before `apps deploy` — both handled in `deploy.sh`.
+9. **Force-include `client/dist`.** `.gitignore`'s `dist/` pattern also matches `client/dist`, so the
+   prebuilt SPA is excluded from the upload → root serves "Cannot GET /". `databricks.yml` uses
+   `sync.include: client/dist/**` to ship it.
 
 ### Two gotchas fixed during the run (important for the demo)
 1. **On-demand `FeatureFunction` requires a Python UDF, not SQL.** A SQL `distance()` failed at
