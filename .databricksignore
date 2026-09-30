@@ -1,13 +1,22 @@
 # Exclude from Databricks bundle uploads.
-# Runtime only needs: app.yaml, package.json, build/server.mjs, client/dist/, notebooks/
+# Runtime needs: app.yaml, package.json (minimal, swapped in by deploy.sh), server/
+# (run via tsx), client/dist/, notebooks/, config/.
+# The Apps platform runs `npm install` on the uploaded package.json — deploy.sh swaps in a
+# minimal runtime package.json (just @databricks/appkit + tsx) so that install stays fast.
+# package-lock.json is excluded so it can't override the minimal package.json with the full tree.
 
 node_modules/
+package-lock.json
+# .npmrc points at the internal dev proxy (npm-proxy.dev.databricks.com) for LOCAL installs.
+# The Apps build environment can't reach that proxy (install hangs ~8min then is killed), so
+# don't ship it — let the platform's npm use its own default registry for @databricks/appkit.
+.npmrc
 client/src/
 client/public/
 client/vite.config.ts
 client/vite-env.d.ts
-server/
 dist/
+build/
 tests/
 playwright-report/
 test-results/

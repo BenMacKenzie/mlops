@@ -2,3 +2,10 @@ command: ['npx', 'tsx', 'server/server.ts']
 env:
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: sql-warehouse
+  # Run in production mode (serves prebuilt client/dist, not Vite).
+  - name: NODE_ENV
+    value: production
+  # Lakebase plugin needs the endpoint path explicitly; PGHOST/PGPORT/PGDATABASE/PGUSER/
+  # PGSSLMODE are auto-injected by the platform from the postgres app resource.
+  - name: LAKEBASE_ENDPOINT
+    value: projects/mlops/branches/production/endpoints/primary

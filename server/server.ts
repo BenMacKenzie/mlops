@@ -3,6 +3,12 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 
+// The Apps platform injects DATABRICKS_HOST without a scheme (e.g. "workspace.cloud.databricks.com"),
+// which breaks `fetch(\`${host}/api/...\`)`. Normalize once so all REST calls have https://.
+if (process.env.DATABRICKS_HOST && !/^https?:\/\//.test(process.env.DATABRICKS_HOST)) {
+  process.env.DATABRICKS_HOST = `https://${process.env.DATABRICKS_HOST}`;
+}
+
 // Use PGPASSWORD for native auth (local dev), or LAKEBASE_ENDPOINT for OAuth (deployed)
 const lakebaseConfig = process.env.PGPASSWORD
   ? { password: process.env.PGPASSWORD }

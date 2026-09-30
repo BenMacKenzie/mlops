@@ -1,6 +1,18 @@
 bundle:
   name: mlops
 
+# `databricks bundle deploy` honors this (NOT .databricksignore). Keep the dev-proxy .npmrc,
+# the full package-lock.json, and the swap backup out of the app upload so the platform's
+# `npm install` uses the minimal package.json + its own default registry.
+sync:
+  exclude:
+    - .npmrc
+    - package-lock.json
+    - package.json.bak
+    - tests
+    - "*.config.ts"
+    - "tsconfig*.json"
+
 variables:
   sql_warehouse_id:
     description: SQL Warehouse ID

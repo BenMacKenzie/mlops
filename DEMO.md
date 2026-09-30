@@ -59,6 +59,32 @@ Full path exercised via the app API against 77rg2n: project → EOL → spec →
   serving auto-resolved both lookups + computed `zip_distance` on-demand.
 - Model `cc_fraud` v2 deployed to endpoint `cc-fraud`.
 
+## Deploying the app to Databricks Apps (canonical pattern)
+Deployed and verified 2026-09-30 at https://mlops-7474643951125249.aws.databricksapps.com
+(reads Lakebase + Unity Catalog). Run `./deploy.sh`. Hard-won lessons baked into the config:
+
+1. **No esbuild bundling / no deps-stripping.** Ship the source; the Apps platform runs
+   `npm install`. (The old esbuild approach failed on AppKit's per-plugin `manifest.json`, which
+   each plugin reads from its own `node_modules` dir — a single bundle can't satisfy all three.)
+2. **`.databricksignore` is NOT honored by `databricks bundle deploy`** — only `.gitignore` and
+   `sync.exclude` in `databricks.yml` are. Exclusions must go in `databricks.yml sync.exclude`.
+3. **Never ship the dev-proxy `.npmrc`.** `registry=https://npm-proxy.dev.databricks.com/` is
+   unreachable from the Apps build env → every `npm install` hangs ~8 min then is killed
+   ("Exit handler never called"). Excluded via `sync.exclude`; the platform's default registry
+   serves `@databricks/appkit` fine (~16s install). Also exclude `package-lock.json` so it can't
+   override the minimal uploaded `package.json`.
+4. **Minimal runtime `package.json`.** `deploy.sh` swaps in a package.json with only
+   `@databricks/appkit` + `tsx`; the client is prebuilt locally into `client/dist`.
+5. **`app.yaml`:** `npx tsx server/server.ts`, `NODE_ENV=production`, and an explicit
+   `LAKEBASE_ENDPOINT=projects/mlops/branches/production/endpoints/primary` (PGHOST/PGUSER/… auto-inject
+   from the postgres resource; only LAKEBASE_ENDPOINT must be set).
+6. **`DATABRICKS_HOST` is injected without a scheme** on the platform → `server.ts` prepends
+   `https://` at startup so REST calls parse.
+7. **Grant the app SP the `app` schema** every deploy (Lakebase re-provisions the SP role on
+   redeploy → "permission denied for schema app"). `deploy.sh` does this automatically.
+8. The postgres app resource is re-added via REST after `bundle deploy` (DABs can't declare it),
+   and a first-time app must be started before `apps deploy` — both handled in `deploy.sh`.
+
 ### Two gotchas fixed during the run (important for the demo)
 1. **On-demand `FeatureFunction` requires a Python UDF, not SQL.** A SQL `distance()` failed at
    `create_training_set` with "is not a Python UDF. Only Python UDFs are supported." Recreated as
