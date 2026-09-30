@@ -1,10 +1,10 @@
 # MLOps Model Manager
 
 **Created:** 2026-04-11
-**Status:** In Progress
-**Workspace:** https://fevm-serverless-stable-1dpktm.cloud.databricks.com
-**Default Catalog:** serverless_stable_1dpktm_catalog (user-configurable per project)
-**Lakebase Instance:** mlops
+**Status:** End-to-end verified (2026-09-29) on fe-vm-serverless-stable-77rg2n
+**Workspace:** https://fevm-serverless-stable-77rg2n.cloud.databricks.com
+**Default Catalog:** serverless_stable_77rg2n_catalog (user-configurable per project)
+**Lakebase Project:** mlops (app state + online store)
 **Owner:** Ben MacKenzie
 **Prior Art:** https://github.com/BenMacKenzie/mlops/tree/main (Dash-based prototype — reference for data model, job patterns, feature lookup UI)
 
@@ -342,11 +342,16 @@ Since training notebooks use `fe.log_model()`, models have feature specs embedde
 4. Link to Databricks endpoint UI for management (stop/start)
 
 **Syncing tables:**
-- One-click sync via Lakebase Projects API (`POST /api/2.0/postgres/synced_tables`)
-- PK columns read from UC `information_schema.constraint_column_usage`
-- CDF auto-enabled on source tables before sync
+- One-click publish via the `publish_table.py` notebook, which calls
+  `FeatureEngineeringClient.publish_table()` against the `mlops` online store
+  (auto-creates the store on first use). Tracked in `app.online_table`.
+- Source feature table must have a **PRIMARY KEY** (feature lookup + online publish require it)
+- CDF auto-enabled on source tables before publish
 - Naming: `{project_catalog}.{project_schema}.{short_name}_online`
 - "Sync All Required" button per deployment
+- **Feature-table integer columns must be `BIGINT` (or `DOUBLE`), not `INT`.** Spark `INT` yields an
+  int32 model signature, but the online-store lookup returns int64 at serving time and MLflow rejects
+  the int64→int32 narrowing. Use `BIGINT`/`DOUBLE` so the signature is int64.
 
 **Test interface:**
 - Entity key inputs populated from sample data (queried from EOL SQL)
@@ -368,9 +373,13 @@ The app interacts with MLflow via the Databricks REST API (from the Express back
 | Create serving endpoint | `POST /api/2.0/serving-endpoints` | From registered model version |
 | Get endpoint status | `GET /api/2.0/serving-endpoints/{name}` | Poll for readiness |
 | Query endpoint | `POST /serving-endpoints/{name}/invocations` | Test inference with entity keys |
-| Create online table | `POST /api/2.0/online-tables` | Publish feature table to online store |
-| Get online table status | `GET /api/2.0/online-tables/{name}` | Poll provisioning status |
-| Delete online table | `DELETE /api/2.0/online-tables/{name}` | Remove online table |
+| Publish feature table online | `FeatureEngineeringClient.publish_table()` (in `publish_table.py` notebook) | Publishes a UC feature table to the `mlops` online store (Lakebase). `create_online_store()` is called on first use. |
+| Poll online table status | `GET /api/2.0/serving-endpoints/{name}` + UC table checks | The published table is a UC `TABLE_ONLINE_VIEW`; it cannot be dropped via SQL `DROP TABLE`. Re-publishing over it via `publish_table(publish_mode='TRIGGERED')` re-syncs in place. |
+
+> **Online store note:** the deployment path uses the `FeatureEngineeringClient` online-store API
+> (`create_online_store` / `get_online_store` / `publish_table`), **not** the older
+> `POST /api/2.0/online-tables` or `POST /api/2.0/postgres/synced_tables` REST endpoints. The online
+> store and the app-state DB share the single Lakebase project `mlops`.
 
 ## App-Managed Notebooks
 
@@ -496,13 +505,13 @@ See `deploy.sh` for the full deployment script.
 
 8. **Training specs lock on first run** — A training spec can be edited freely until its first run is created. After that, it's locked — features, split config, and parameters are frozen to preserve lineage. The UI disables editing and shows a "Copy" action instead. This is enforced server-side: PUT/POST endpoints reject changes to specs that have runs.
 
-9. **Synced tables (not online tables)** — Feature tables are synced to Lakebase via `POST /api/2.0/postgres/synced_tables`. PK columns are read from UC `information_schema.constraint_column_usage`. CDF is auto-enabled on source tables. Synced tables are project-level, shared across deployments.
+9. **Online store via FeatureEngineeringClient** — Feature tables are published to the `mlops` Lakebase online store via `fe.publish_table()` (in the `publish_table.py` notebook), **not** the older `POST /api/2.0/postgres/synced_tables` REST API. The online store is created on first use with `fe.create_online_store()`; it coexists with the app-state DB in the same Lakebase project `mlops`. Source tables need a PRIMARY KEY and CDF (auto-enabled). Published tables are project-level, shared across deployments.
 
 10. **Notebook-based model registration** — Model registration uses an app-managed notebook (`register_model.py`) that calls `mlflow.register_model()`. The REST API cannot resolve artifact paths when DBFS root is disabled — the Python SDK has internal access.
 
 11. **MLflow via REST API for reads, notebooks for writes** — The Express backend calls MLflow REST endpoints for reading (experiments, runs, metrics). Model logging and registration require the Python SDK and run inside notebooks.
 
-12. **On-demand features as peer entries with cross-table bindings** — On-demand features are their own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, and `output_name` columns. Input bindings can reference columns from *any* lookup entry in the spec (not just one table) + EOL columns. This supports functions like `distance(customer_zip, merchant_zip)` that need inputs from multiple tables. The app references existing UC functions — it does not author them. On-demand outputs don't require synced tables; the serving endpoint calls the UC function at inference time.
+12. **On-demand features as peer entries with cross-table bindings** — On-demand features are their own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, and `output_name` columns. Input bindings can reference columns from *any* lookup entry in the spec (not just one table) + EOL columns. This supports functions like `distance(customer_zip, merchant_zip)` that need inputs from multiple tables. The app references existing UC functions — it does not author them. On-demand outputs don't require synced tables; the serving endpoint calls the UC function at inference time. **The referenced UC function must be a Python UDF (`LANGUAGE PYTHON`)** — `FeatureFunction` rejects SQL UDFs at `create_training_set` ("Only Python UDFs are supported").
 
 13. **Master-detail feature builder** — Feature entries (lookup, on-demand, declarative) are managed via a two-panel layout: left panel shows the entry list, right panel shows the editable detail form for the selected entry. Catalog/schema default to the most recently used values across entries. All entries are fully editable (add/remove columns, change bindings) until the spec's first run locks it. Copy-to-edit after locking.
 
