@@ -150,6 +150,10 @@ export const checkDeploymentStatus = (deploymentId: number) =>
   request<Deployment>(`/api/deployments/${deploymentId}/check-status`, { method: 'POST' });
 export const getDeploymentSamples = (deploymentId: number) =>
   request<Record<string, any>[]>(`/api/deployments/${deploymentId}/samples`);
+export const getDeploymentSchema = (deploymentId: number) =>
+  request<{ required: string[]; optional: string[]; types: Record<string, string> }>(
+    `/api/deployments/${deploymentId}/schema`,
+  );
 export const testDeploymentEndpoint = (deploymentId: number, data: Record<string, any>) =>
   request<any>(`/api/deployments/${deploymentId}/test`, { method: 'POST', body: JSON.stringify(data) });
 export const updateDeploymentEndpoint = (id: number, runId: number) =>

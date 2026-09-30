@@ -1688,7 +1688,48 @@ appkit.server.extend((app) => {
       if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       const ot = result.rows[0];
 
-      // Status is set by the publish job — just return current state
+      // Reconcile the stored status against reality. fe.publish_table creates a synced
+      // database table backed by a DLT pipeline; the app row is written as
+      // 'PROVISIONING' at publish time and never updated afterwards, so without this
+      // the UI shows PROVISIONING forever even once the table is online and serving.
+      if (ot.online_table_name && ot.status !== 'NOT_PUBLISHED') {
+        let resolved: string | null = null;
+
+        // Preferred signal: the synced-table's real sync state. This requires View on
+        // the backing DLT pipeline, which the app SP usually lacks (the pipeline is
+        // owned by the publishing user and recreated with a new id on every publish),
+        // so it commonly 403s — hence the row-count fallback below.
+        try {
+          const st = await databricksApi(
+            req, 'GET',
+            `database/synced_tables/${encodeURIComponent(ot.online_table_name)}`,
+            undefined, 'api/2.0'
+          );
+          const detailed: string = st?.data_synchronization_status?.detailed_state || '';
+          // Any SYNCED_TABLE_ONLINE_* state means the table is online and serving
+          // (including ONLINE_PIPELINE_FAILED, where only the latest incremental
+          // update failed but the initial snapshot is still served).
+          if (detailed.startsWith('SYNCED_TABLE_ONLINE')) resolved = 'ONLINE';
+          else if (detailed.includes('PROVISIONING') || detailed.includes('PIPELINING')) resolved = 'PROVISIONING';
+          else if (detailed.includes('OFFLINE') || detailed.includes('FAILED')) resolved = 'OFFLINE';
+        } catch { /* fall through to the row-count check */ }
+
+        // Fallback the SP can always run: if the synced table has rows it is online and
+        // serving. Uses the SP's existing SELECT grant via the SQL warehouse, so it
+        // needs no pipeline permission and survives re-publishes.
+        if (!resolved) {
+          try {
+            const fq = ot.online_table_name.split('.').map((p: string) => `\`${p}\``).join('.');
+            const rows = await executeSql(req, `SELECT count(*) AS n FROM ${fq}`);
+            if (Number(rows?.[0]?.n ?? 0) > 0) resolved = 'ONLINE';
+          } catch { /* leave status unchanged if we genuinely can't tell */ }
+        }
+
+        if (resolved && resolved !== ot.status) {
+          await db.query('UPDATE app.online_table SET status=$1 WHERE id=$2', [resolved, ot.id]);
+          ot.status = resolved;
+        }
+      }
       res.json(ot);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -1925,13 +1966,60 @@ appkit.server.extend((app) => {
         res.json([]); return;
       }
 
-      // Query the EOL SQL definition (the spine) which has the entity columns
-      const colList = entityCols.join(', ');
+      // Return full spine rows (every model input = entity keys + direct/pass-through
+      // feature columns), minus the label. The model signature marks the direct
+      // features (e.g. amount, pos_entry_mode, security_code) as required, not just
+      // the entity keys — so the test form must prefill ALL input columns or the
+      // endpoint rejects the request with "Model is missing inputs [...]".
+      const label = (eol.label_column || '').trim();
       const eolSql = eol.sql_definition.trim().replace(/;$/, '');
-      const rows = await executeSql(req, `SELECT DISTINCT ${colList} FROM (${eolSql}) AS _eol LIMIT 3`);
-      res.json(rows);
+      const rows = await executeSql(req, `SELECT * FROM (${eolSql}) AS _eol LIMIT 3`);
+      const cleaned = rows.map((r: any) => {
+        if (label && label in r) { const { [label]: _drop, ...rest } = r; return rest; }
+        return r;
+      });
+      res.json(cleaned);
     } catch (e: any) {
       console.error(`[samples] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Return the model's serving input schema, split into what the CALLER must provide
+  // vs what is looked up automatically. The endpoint OpenAPI marks the spine columns
+  // (entity keys + request-time/pass-through features like amount, pos_entry_mode) as
+  // `required`; the FeatureLookup-resolved features are optional (served from the
+  // online store), so the test form only needs to collect the required ones.
+  app.get('/api/deployments/:id/schema', async (req, res) => {
+    try {
+      const dep = (await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id])).rows[0];
+      if (!dep) { res.status(404).json({ error: 'Deployment not found' }); return; }
+
+      const oa = await databricksApi(
+        req, 'GET',
+        `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}/openapi`,
+        undefined, 'api/2.0'
+      );
+
+      // Find the invocations request body's dataframe_records variant (name/type map + required list).
+      let items: any = null;
+      for (const p of Object.values(oa?.paths || {}) as any[]) {
+        const oneOf = p?.post?.requestBody?.content?.['application/json']?.schema?.oneOf || [];
+        for (const opt of oneOf) {
+          if (opt?.properties?.dataframe_records?.items) { items = opt.properties.dataframe_records.items; break; }
+        }
+        if (items) break;
+      }
+
+      const props: Record<string, any> = items?.properties || {};
+      const required: string[] = Array.isArray(items?.required) ? items.required : [];
+      const types: Record<string, string> = {};
+      for (const [k, v] of Object.entries(props)) types[k] = (v as any)?.type || 'string';
+      const optional = Object.keys(props).filter((c) => !required.includes(c));
+
+      res.json({ required, optional, types });
+    } catch (e: any) {
+      console.error(`[schema] Error: ${e.message}`);
       res.status(500).json({ error: e.message });
     }
   });

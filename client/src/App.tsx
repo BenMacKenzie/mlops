@@ -1902,6 +1902,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
 // ════════════════════════════════════════════
 function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: string[] }) {
   const [samples, setSamples] = useState<Record<string, any>[]>([]);
+  const [schema, setSchema] = useState<{ required: string[]; optional: string[]; types: Record<string, string> } | null>(null);
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState('');
@@ -1909,13 +1910,22 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
 
   useEffect(() => {
     api.getDeploymentSamples(dep.id).then(setSamples).catch(() => setSamples([]));
+    api.getDeploymentSchema(dep.id).then(setSchema).catch(() => setSchema(null));
   }, [dep.id]);
+
+  // The caller only provides the model's REQUIRED inputs — the spine columns: entity
+  // keys + request-time/pass-through features (amount, pos_entry_mode, security_code).
+  // The optional inputs are FeatureLookup features resolved automatically from the
+  // online store, so the form never asks for them. Fall back to entity keys / sample
+  // shape only if the schema endpoint is unavailable.
+  const inputCols = schema?.required?.length
+    ? schema.required
+    : (samples.length > 0 ? Object.keys(samples[0]) : entityColumns);
+  const lookedUp = schema?.optional ?? [];
 
   const selectSample = (sample: Record<string, any>) => {
     const newInputs: Record<string, string> = {};
-    for (const col of entityColumns) {
-      newInputs[col] = String(sample[col] ?? '');
-    }
+    for (const col of inputCols) newInputs[col] = String(sample[col] ?? '');
     setInputs(newInputs);
   };
 
@@ -1923,9 +1933,11 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
     setResult(null); setError(''); setLoading(true);
     try {
       const record: Record<string, any> = {};
-      for (const [k, v] of Object.entries(inputs)) {
-        const num = Number(v);
-        record[k] = v !== '' && !isNaN(num) ? num : v;
+      for (const col of inputCols) {
+        const v = inputs[col] ?? '';
+        // Coerce by the declared schema type; leave as string when type unknown.
+        const t = schema?.types?.[col];
+        record[col] = (t === 'number' || t === 'integer') && v !== '' && !isNaN(Number(v)) ? Number(v) : v;
       }
       const res = await api.testDeploymentEndpoint(dep.id, { dataframe_records: [record] });
       setResult(res);
@@ -1937,10 +1949,14 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
 
   return (
     <div className="mt-4 border-t pt-3">
-      <div className="text-sm font-medium mb-2">Test Endpoint</div>
+      <div className="text-sm font-medium mb-1">Test Endpoint</div>
+      <p className="text-xs text-gray-500 mb-2">
+        Enter the request-time inputs the calling system provides. Looked-up features are
+        resolved automatically from the online store.
+      </p>
       {samples.length > 0 && (
         <div className="mb-2">
-          <label className="block text-xs text-gray-500 mb-1">Sample records (click to use)</label>
+          <label className="block text-xs text-gray-500 mb-1">Sample records (click to fill)</label>
           <div className="flex gap-2 flex-wrap">
             {samples.map((s, i) => (
               <button
@@ -1953,9 +1969,11 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
         </div>
       )}
       <div className="flex gap-3 items-end flex-wrap mb-2">
-        {entityColumns.map(col => (
+        {inputCols.map(col => (
           <div key={col}>
-            <label className="block text-xs text-gray-500 mb-1">{col}</label>
+            <label className="block text-xs text-gray-500 mb-1">
+              {col}{schema?.types?.[col] ? <span className="text-gray-400"> ({schema.types[col]})</span> : null}
+            </label>
             <input
               className="px-3 py-1.5 border rounded font-mono text-sm w-40"
               value={inputs[col] || ''}
@@ -1966,10 +1984,15 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
         ))}
         <button
           onClick={send}
-          disabled={loading || entityColumns.length === 0 || entityColumns.some(c => !inputs[c])}
+          disabled={loading || inputCols.length === 0 || inputCols.some(c => !inputs[c])}
           className="px-4 py-1.5 bg-purple-600 text-white text-sm rounded hover:bg-purple-700 disabled:bg-gray-300"
         >{loading ? 'Sending...' : 'Send'}</button>
       </div>
+      {lookedUp.length > 0 && (
+        <p className="text-xs text-gray-400 mb-2">
+          Auto-resolved from online store: {lookedUp.join(', ')}
+        </p>
+      )}
       {(result || error) && (
         <pre className="px-3 py-2 border rounded font-mono text-xs overflow-auto bg-gray-50 whitespace-pre-wrap max-h-32">
           {error ? <span className="text-red-500">{error}</span> : JSON.stringify(result, null, 2)}
@@ -1997,9 +2020,12 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
       api.getOnlineTables(projectId),
       api.getDeployments(projectId),
     ]);
-    // Refresh status for any synced table missing a pipeline URL
+    // Refresh status for any still-provisioning synced table. The stored status is
+    // written as PROVISIONING at publish time and only the server-side check-status
+    // call reconciles it against the real synced-table state, so always re-check
+    // PROVISIONING rows (they otherwise display PROVISIONING forever).
     const refreshed = await Promise.all(ot.map(async (t) => {
-      if (t.status !== 'NOT_PUBLISHED' && (!t.pipeline_id || !t.pipeline_id.startsWith('http'))) {
+      if (t.status === 'PROVISIONING') {
         try { return await api.checkOnlineTableStatus(t.id); } catch { return t; }
       }
       return t;
