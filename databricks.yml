@@ -5,6 +5,10 @@ bundle:
 # the full package-lock.json, and the swap backup out of the app upload so the platform's
 # `npm install` uses the minimal package.json + its own default registry.
 sync:
+  # client/dist is the prebuilt frontend served in production, but .gitignore's `dist/` pattern
+  # matches it — force-include it or the app serves "Cannot GET /".
+  include:
+    - client/dist/**
   exclude:
     - .npmrc
     - package-lock.json
