@@ -184,8 +184,13 @@ params = {
 }
 
 cv_dataset = Pool(X, y, cat_features=cat_features)
-df_sample = X.head(2)
 signature = infer_signature(X, y)
+
+# Serving input example: the spine columns a caller actually sends at inference
+# (entity/lookup keys + any direct features), minus the label. Feature lookups and
+# on-demand functions are resolved by the endpoint, so they must NOT be in the example.
+# This is what pre-fills the "Query endpoint" dialog and the app's test UI.
+serving_example = eol_df.drop(label_column).limit(5).toPandas()
 
 scores = cv(
     cv_dataset,
@@ -223,7 +228,7 @@ with mlflow.start_run() as run:
         artifact_path="model",
         flavor=mlflow.catboost,
         training_set=training_set,
-        input_example=df_sample,
+        input_example=serving_example,
     )
     print(f"Model logged with feature specs. Run ID: {run.info.run_id}")
 

@@ -250,7 +250,9 @@ with mlflow.start_run() as run:
         artifact_path="model",
         flavor=mlflow.catboost,
         training_set=training_set,
-        input_example=X_train.head(2),
+        # Serving input example: spine columns a caller sends (entity/lookup keys + direct
+        # features), minus the label. Lookups + on-demand functions are resolved by the endpoint.
+        input_example=eol_df.drop(label_column).limit(5).toPandas(),
     )
     print(f"Model logged. Run ID: {run.info.run_id}")
 

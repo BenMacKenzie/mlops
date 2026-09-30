@@ -51,17 +51,41 @@ function refreshDevToken(): string {
     return process.env.DATABRICKS_TOKEN || '';
   }
 }
-function getToken(req: any): string {
-  const obo = req.headers['x-forwarded-access-token'] as string;
-  if (obo) return obo;
+// Deployed apps authenticate to the Databricks REST APIs as the app's SERVICE PRINCIPAL
+// (client-credentials OAuth using the auto-injected DATABRICKS_CLIENT_ID/SECRET). The user OBO
+// token only carries the app's `user_api_scopes` (sql) — it can't drive jobs, serving, MLflow, or
+// workspace APIs. The SP is granted the needed permissions instead. Token is cached until expiry.
+let _spToken: { token: string; expiresAt: number } | null = null;
+async function getServicePrincipalToken(): Promise<string> {
+  const clientId = process.env.DATABRICKS_CLIENT_ID;
+  const clientSecret = process.env.DATABRICKS_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return process.env.DATABRICKS_TOKEN || '';
+  if (_spToken && Date.now() < _spToken.expiresAt - 60_000) return _spToken.token;
+  const host = process.env.DATABRICKS_HOST || '';
+  const resp = await fetch(`${host}/oidc/v1/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
+    },
+    body: 'grant_type=client_credentials&scope=all-apis',
+  });
+  const data: any = await resp.json();
+  if (!data.access_token) throw new Error(`SP token request failed: ${JSON.stringify(data)}`);
+  _spToken = { token: data.access_token, expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000 };
+  return _spToken.token;
+}
+
+async function getToken(req: any): Promise<string> {
   if (process.env.NODE_ENV === 'development') {
-    // Refresh 60s before expiry
-    if (!_devToken || Date.now() >= _devToken.expiresAt - 60_000) {
-      return refreshDevToken();
-    }
+    // Local dev: CLI token (full access), refreshed 60s before expiry.
+    if (!_devToken || Date.now() >= _devToken.expiresAt - 60_000) return refreshDevToken();
     return _devToken.token;
   }
-  return process.env.DATABRICKS_TOKEN || '';
+  // Deployed: use the app service principal for management APIs.
+  if (process.env.DATABRICKS_CLIENT_ID) return getServicePrincipalToken();
+  // Fallback: OBO user token (only useful for scopes in user_api_scopes).
+  return (req.headers['x-forwarded-access-token'] as string) || process.env.DATABRICKS_TOKEN || '';
 }
 
 // Helper: get the current user's email (cached)
@@ -84,7 +108,7 @@ async function getUsername(req: any): Promise<string> {
 
 async function databricksApi(req: any, method: string, apiPath: string, body?: any, apiPrefix = 'api/2.1'): Promise<any> {
   const host = process.env.DATABRICKS_HOST || '';
-  const token = getToken(req);
+  const token = await getToken(req);
   const resp = await fetch(`${host}/${apiPrefix}/${apiPath}`, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -104,7 +128,7 @@ async function databricksApi(req: any, method: string, apiPath: string, body?: a
 async function uploadNotebook(req: any, localPath: string, workspacePath: string): Promise<void> {
   const content = fs.readFileSync(localPath, 'utf-8');
   const host = process.env.DATABRICKS_HOST || '';
-  const token = getToken(req);
+  const token = await getToken(req);
   // Workspace API paths don't use /Workspace prefix
   const apiPath = workspacePath.replace(/^\/Workspace/, '');
   // Ensure parent directory exists
@@ -135,7 +159,7 @@ async function uploadNotebook(req: any, localPath: string, workspacePath: string
 // Helper: execute SQL statement on the warehouse and return rows
 async function executeSql(req: any, sql: string): Promise<any[]> {
   const host = process.env.DATABRICKS_HOST || '';
-  const token = getToken(req);
+  const token = await getToken(req);
   const warehouseId = process.env.DATABRICKS_WAREHOUSE_ID || '';
   const resp = await fetch(`${host}/api/2.0/sql/statements`, {
     method: 'POST',
@@ -756,7 +780,7 @@ appkit.server.extend((app) => {
 
       // Look up MLflow experiment ID
       const host = process.env.DATABRICKS_HOST || '';
-      const token = getToken(req);
+      const token = await getToken(req);
       let mlflowExperimentId: string | null = null;
       try {
         const experimentFullPath = `/Users/${userName}/${experimentName}`;
@@ -1345,7 +1369,7 @@ appkit.server.extend((app) => {
       // Look up the numeric MLflow experiment ID by name (MLflow API is at 2.0, not 2.1)
       let mlflowExperimentId: string | null = null;
       try {
-        const token = getToken(req);
+        const token = await getToken(req);
         const expUrl = `${host}/api/2.0/mlflow/experiments/get-by-name?experiment_name=${encodeURIComponent(experimentFullPath)}`;
         console.log(`[mlflow] Looking up experiment: ${expUrl}`);
         const expResp = await fetch(expUrl, {
@@ -1389,7 +1413,7 @@ appkit.server.extend((app) => {
       if (lifeCycleState === 'TERMINATED' && resultState === 'SUCCESS') {
         // Fetch MLflow experiment ID and metrics
         const host = process.env.DATABRICKS_HOST || '';
-        const token = getToken(req);
+        const token = await getToken(req);
         let mlflowExperimentId = run.mlflow_experiment_id;
         let trainingMetrics: Record<string, any> | null = null;
         let evalMetrics: Record<string, any> | null = null;
@@ -1797,7 +1821,7 @@ appkit.server.extend((app) => {
 
       // Check model version status — must be READY before creating endpoint
       const host = process.env.DATABRICKS_HOST || '';
-      const token = getToken(req);
+      const token = await getToken(req);
       const mvResp = await fetch(
         `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
         { headers: { Authorization: `Bearer ${token}` } }
@@ -1920,7 +1944,7 @@ appkit.server.extend((app) => {
       if (dep.endpoint_status !== 'READY') { res.status(400).json({ error: 'Endpoint not ready' }); return; }
 
       const host = process.env.DATABRICKS_HOST || '';
-      const token = getToken(req);
+      const token = await getToken(req);
       const payload = req.body;
 
       const resp = await fetch(`${host}/serving-endpoints/${encodeURIComponent(dep.endpoint_name)}/invocations`, {
@@ -1956,7 +1980,7 @@ appkit.server.extend((app) => {
 
       // Check model version is READY
       const host = process.env.DATABRICKS_HOST || '';
-      const token = getToken(req);
+      const token = await getToken(req);
       const mvResp = await fetch(
         `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
         { headers: { Authorization: `Bearer ${token}` } }
