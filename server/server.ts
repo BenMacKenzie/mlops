@@ -209,10 +209,14 @@ appkit.server.extend((app) => {
   app.post('/api/projects', async (req, res) => {
     try {
       const { name, description, catalog, schema, model_name, git_url, notebook_path, training_notebook, evaluation_notebook } = req.body;
+      // git_url/notebook_path/training_notebook/evaluation_notebook are legacy columns
+      // (NOT NULL DEFAULT '') from the old user-notebooks design; the app now uses
+      // app-managed notebooks and no longer collects them — coalesce to '' so the
+      // insert still satisfies the NOT NULL constraints.
       const result = await db.query(
         `INSERT INTO app.project (name, description, catalog, schema, model_name, git_url, notebook_path, training_notebook, evaluation_notebook)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [name, description, catalog, schema, model_name || name, git_url, notebook_path, training_notebook, evaluation_notebook]
+        [name, description, catalog, schema, model_name || name, git_url || '', notebook_path || '', training_notebook || '', evaluation_notebook || '']
       );
       res.status(201).json(result.rows[0]);
     } catch (e: any) {
@@ -226,7 +230,7 @@ appkit.server.extend((app) => {
       const result = await db.query(
         `UPDATE app.project SET name=$1, description=$2, catalog=$3, schema=$4, model_name=$5, git_url=$6, notebook_path=$7, training_notebook=$8, evaluation_notebook=$9
          WHERE id=$10 RETURNING *`,
-        [name, description, catalog, schema, model_name || name, git_url, notebook_path, training_notebook, evaluation_notebook, req.params.id]
+        [name, description, catalog, schema, model_name || name, git_url || '', notebook_path || '', training_notebook || '', evaluation_notebook || '', req.params.id]
       );
       if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       res.json(result.rows[0]);

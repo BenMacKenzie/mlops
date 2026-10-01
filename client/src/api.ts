@@ -35,12 +35,6 @@ export const getFunctionParams = (catalog: string, schema: string, functionName:
 export const previewSql = (sql: string) =>
   request<{ rows: any[]; count: number }>('/api/sql/preview', { method: 'POST', body: JSON.stringify({ sql }) });
 
-// ── GitHub ──
-export const listNotebooks = (repoUrl: string, notebookPath: string) =>
-  request<{ name: string; path: string }[]>(
-    `/api/github/notebooks?repo_url=${encodeURIComponent(repoUrl)}&notebook_path=${encodeURIComponent(notebookPath)}`
-  );
-
 // ── Training Specs ──
 export const getTrainingSpecs = (projectId: number) =>
   request<(TrainingSpec & { run_count: number })[]>(`/api/projects/${projectId}/training-specs`);

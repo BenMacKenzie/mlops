@@ -53,63 +53,14 @@ function StatusBadge({ status }: { status: string }) {
 function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: '', description: '', catalog: 'serverless_stable_1dpktm_catalog', schema: '', model_name: '', git_url: 'https://github.com/BenMacKenzie/db-model-trainer/tree/main/notebooks', notebook_path: '', training_notebook: '', evaluation_notebook: '' });
-  const [notebooks, setNotebooks] = useState<{ name: string; path: string }[]>([]);
-  const [loadingNotebooks, setLoadingNotebooks] = useState(false);
+  const [form, setForm] = useState({ name: '', description: '', catalog: '', schema: '', model_name: '' });
 
   const load = useCallback(() => { api.getProjects().then(setProjects); }, []);
   useEffect(() => { load(); }, [load]);
 
-  // Parse git_url to extract repo URL and notebook path
-  // e.g. "https://github.com/BenMacKenzie/db-model-trainer/notebooks" ->
-  //   repo: "https://github.com/BenMacKenzie/db-model-trainer", path: "notebooks"
-  const parseGitUrl = (url: string) => {
-    const match = url.match(/^(https:\/\/github\.com\/[^/]+\/[^/]+)(?:\/(.+))?$/);
-    if (match) {
-      let path = match[2] || '';
-      // Strip tree/main/ or tree/branch/ (GitHub web UI artifact)
-      path = path.replace(/^tree\/[^/]+\//, '');
-      return { repoUrl: match[1], path };
-    }
-    return null;
-  };
-
-  const fetchNotebooks = async (gitUrl: string) => {
-    const parsed = parseGitUrl(gitUrl);
-    if (!parsed) { setNotebooks([]); return; }
-    setLoadingNotebooks(true);
-    try {
-      const nbs = await api.listNotebooks(parsed.repoUrl, parsed.path);
-      setNotebooks(nbs);
-      setForm((f) => ({ ...f, notebook_path: parsed.path }));
-    } catch {
-      setNotebooks([]);
-    }
-    setLoadingNotebooks(false);
-  };
-
-  // Auto-fetch notebooks when git_url changes and looks valid (debounced)
-  useEffect(() => {
-    const parsed = parseGitUrl(form.git_url);
-    if (parsed && parsed.repoUrl) {
-      const timer = setTimeout(() => fetchNotebooks(form.git_url), 500);
-      return () => clearTimeout(timer);
-    } else {
-      setNotebooks([]);
-    }
-    return undefined;
-  }, [form.git_url]);
-
   const submit = async () => {
-    const parsed = parseGitUrl(form.git_url);
-    const submitData = {
-      ...form,
-      git_url: parsed?.repoUrl || form.git_url,
-      notebook_path: parsed?.path || form.notebook_path,
-    };
-    await api.createProject(submitData as Omit<Project, 'id'>);
-    setForm({ name: '', description: '', catalog: '', schema: '', model_name: '', git_url: '', notebook_path: '', training_notebook: '', evaluation_notebook: '' });
-    setNotebooks([]);
+    await api.createProject(form as Omit<Project, 'id'>);
+    setForm({ name: '', description: '', catalog: '', schema: '', model_name: '' });
     setShowForm(false);
     load();
   };
@@ -128,40 +79,9 @@ function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
           <div className="grid grid-cols-2 gap-3">
             <div><label className="block text-sm font-medium text-gray-700 mb-1">name</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
             <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">description</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
-            <div><label className="block text-sm font-medium text-gray-700 mb-1">catalog</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })} placeholder="serverless_stable_1dpktm_catalog" /></div>
+            <div><label className="block text-sm font-medium text-gray-700 mb-1">catalog</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })} placeholder="catalog name" /></div>
             <div><label className="block text-sm font-medium text-gray-700 mb-1">schema</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.schema} onChange={(e) => setForm({ ...form, schema: e.target.value })} /></div>
             <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">model name <span className="text-xs text-gray-400">(for UC model registry — defaults to project name)</span></label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.model_name} onChange={(e) => setForm({ ...form, model_name: e.target.value })} placeholder={form.name || 'project name'} /></div>
-            <div className="col-span-2">
-              <label className="block text-sm font-medium text-gray-700 mb-1">git url (include path to notebooks folder)</label>
-              <input
-                className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none font-mono text-sm"
-                value={form.git_url}
-                onChange={(e) => setForm({ ...form, git_url: e.target.value })}
-                placeholder="https://github.com/user/repo/notebooks"
-              />
-              {loadingNotebooks && <div className="text-xs text-blue-500 mt-1">Fetching notebooks...</div>}
-            </div>
-            {notebooks.length > 0 && (
-              <>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">training notebook</label>
-                  <select className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.training_notebook} onChange={(e) => setForm({ ...form, training_notebook: e.target.value })}>
-                    <option value="">Select training notebook...</option>
-                    {notebooks.map((nb) => <option key={nb.name} value={nb.name}>{nb.name}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">evaluation notebook</label>
-                  <select className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.evaluation_notebook} onChange={(e) => setForm({ ...form, evaluation_notebook: e.target.value })}>
-                    <option value="">Select evaluation notebook...</option>
-                    {notebooks.map((nb) => <option key={nb.name} value={nb.name}>{nb.name}</option>)}
-                  </select>
-                </div>
-              </>
-            )}
-            {notebooks.length === 0 && form.git_url && !loadingNotebooks && parseGitUrl(form.git_url) && (
-              <div className="col-span-2 text-sm text-gray-400">No notebooks found at this path</div>
-            )}
           </div>
           <div className="mt-3 flex gap-2">
             <button onClick={submit} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">Create</button>
