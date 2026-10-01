@@ -552,7 +552,7 @@ online-store API + SP grants).
 
 **Open / future:**
 - [ ] `train_hpsearch.py` — hyperparameter-search notebook for the `train_eval_test` split (not yet written)
-- [ ] Remove legacy `git_url`/`notebook_path` from the project form + GitHub notebook auto-fetch (leftover from the old user-notebooks design; still in `client/src/App.tsx`). Also fix the stale `serverless_stable_1dpktm_catalog` default in the create-project form.
+- [x] Remove legacy git-notebook fields from the create-project form (git_url/notebook_path/training/eval notebook selectors + GitHub auto-fetch) and the stale `serverless_stable_1dpktm_catalog` default — done 2026-10-01 (commit a2acd87). **Remaining:** the DB columns (`git_url`, `notebook_path`, `training_notebook`, `evaluation_notebook` on `app.project`, NOT NULL DEFAULT '') and the unused legacy `git_source` training path in `server.ts` can be dropped in a later migration.
 - [ ] MLflow experiment viewer + run-comparison UI
 - [ ] (Optional) Re-publish `customer_features_online` to clear its permanently-failed sync pipeline — the initial snapshot still serves, but incremental sync died after the INT→BIGINT retype changed the source table id
 - [ ] (Optional) Populate the native "Query endpoint" example (needs a retrain; the app's schema-driven test UI already covers testing)
