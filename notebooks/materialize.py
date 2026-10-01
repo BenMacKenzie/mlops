@@ -71,63 +71,76 @@ if feature_defs or declarative_defs:
 
     print(f"Built {len(feature_lookups)} FeatureLookups")
 
-    # Declarative Features
+    # Declarative Features (databricks-feature-engineering 0.18 API):
+    #   function=AggregationFunction(operator, time_window); filter_condition lives on the
+    #   DeltaTableSource; entity/timeseries/name go on create_feature. ContinuousWindow was
+    #   removed → use RollingWindow. Mirrors notebooks/materialize_online.py.
+    import re
+    from databricks.feature_engineering.entities import (
+        DeltaTableSource, AggregationFunction,
+        TumblingWindow, SlidingWindow, RollingWindow,
+    )
+    from databricks.ml_features.entities.function import AGGREGATION_FUNCTION_BY_SHORTHAND
+
+    def parse_duration(s):
+        s = (s or "").strip()
+        if not s:
+            raise ValueError("Window duration is empty — check the declarative feature definition")
+        if s.endswith('d'):
+            return timedelta(days=int(s[:-1]))
+        if s.endswith('h'):
+            return timedelta(hours=int(s[:-1]))
+        if s.endswith('m'):
+            return timedelta(minutes=int(s[:-1]))
+        return timedelta(days=int(s))
+
+    def feature_name_for(dd):
+        # Keep in sync with makeFeatureName() in server.ts so offline + online share a feature.
+        tw = dd.get("time_window", {})
+        base = f"{dd.get('function', 'agg')}_{dd.get('input', 'x')}_{tw.get('window_duration', '')}".lower()
+        return re.sub(r'[^a-z0-9]+', '_', base).strip('_')[:120] or "feature"
+
     features = []
     for dd in declarative_defs:
-        from databricks.feature_engineering.entities import (
-            Feature, DeltaTableSource,
-            ContinuousWindow, TumblingWindow, SlidingWindow,
-        )
-
-        # Parse duration string (e.g. "30d", "12h", "60m") to timedelta
-        def parse_duration(s):
-            if not s or not s.strip():
-                raise ValueError(f"Window duration is empty — check the declarative feature definition")
-            s = s.strip()
-            if s.endswith('d'):
-                return timedelta(days=int(s[:-1]))
-            elif s.endswith('h'):
-                return timedelta(hours=int(s[:-1]))
-            elif s.endswith('m'):
-                return timedelta(minutes=int(s[:-1]))
-            else:
-                return timedelta(days=int(s))
-
         tw = dd["time_window"]
         window_duration = parse_duration(tw["window_duration"])
         if tw["type"] == "continuous":
-            time_window = ContinuousWindow(window_duration=window_duration)
+            time_window = RollingWindow(window_duration=window_duration)
         elif tw["type"] == "tumbling":
             time_window = TumblingWindow(window_duration=window_duration)
         elif tw["type"] == "sliding":
-            slide_duration = parse_duration(tw["slide_duration"])
-            time_window = SlidingWindow(window_duration=window_duration, slide_duration=slide_duration)
+            time_window = SlidingWindow(window_duration=window_duration, slide_duration=parse_duration(tw["slide_duration"]))
+        else:
+            raise ValueError(f"Unknown window type: {tw['type']}")
 
-        # Parse the three-level source table name
+        operator_cls = AGGREGATION_FUNCTION_BY_SHORTHAND.get(dd["function"])
+        if operator_cls is None:
+            raise ValueError(f"Unsupported aggregation function '{dd['function']}'")
+        agg = AggregationFunction(operator=operator_cls(input=dd["input"]), time_window=time_window)
+
         src_parts = dd["source_table"].split(".")
         src_catalog = src_parts[0] if len(src_parts) == 3 else catalog
         src_schema = src_parts[1] if len(src_parts) == 3 else schema
         src_table = src_parts[-1]
+        source_kwargs = dict(catalog_name=src_catalog, schema_name=src_schema, table_name=src_table)
+        if dd.get("filter_condition"):
+            source_kwargs["filter_condition"] = dd["filter_condition"]
+        source = DeltaTableSource(**source_kwargs)
 
-        # Determine entity and timeseries columns from EOL
-        ts_col = dd.get("timestamp_lookup_key") or (entity_columns[0] if not entity_columns else None)
-        source = DeltaTableSource(
-            table_name=src_table,
-            catalog_name=src_catalog,
-            schema_name=src_schema,
-            entity_columns=dd.get("lookup_key") or dd.get("entity_columns") or entity_columns,
-            timeseries_column=dd.get("timestamp_lookup_key") or dd.get("timeseries_column") or "",
-        )
+        name = feature_name_for(dd)
+        entity = dd.get("lookup_key") or dd.get("entity_columns") or entity_columns
+        timeseries_column = dd.get("timestamp_lookup_key") or dd.get("timeseries_column") or None
 
-        feat = fe.create_feature(
-            source=source,
-            inputs=[dd["input"]],
-            function=dd["function"],
-            time_window=time_window,
-            catalog_name=catalog,
-            schema_name=schema,
-            **({"filter_condition": dd["filter_condition"]} if dd.get("filter_condition") else {}),
-        )
+        try:
+            feat = fe.create_feature(
+                source=source, function=agg, catalog_name=catalog, schema_name=schema,
+                entity=entity, timeseries_column=timeseries_column, name=name,
+            )
+        except Exception as e:  # noqa: BLE001 — idempotent re-run
+            if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
+                feat = fe.get_feature(full_name=f"{catalog}.{schema}.{name}")
+            else:
+                raise
         features.append(feat)
 
     print(f"Built {len(features)} declarative Features")
@@ -143,13 +156,24 @@ if feature_defs or declarative_defs:
         if ts_key and ts_key not in exclude:
             exclude.append(ts_key)
 
-    training_set = fe.create_training_set(
+    # 0.18 constraint: create_training_set accepts feature_lookups OR features, not both.
+    if features and feature_lookups:
+        raise ValueError(
+            "This training spec mixes declarative (aggregation) features with FeatureLookups. "
+            "databricks-feature-engineering 0.18 does not allow both in one create_training_set — "
+            "use one kind per spec, or materialize the aggregation features online (Online Features "
+            "tab) and reference their tables as FeatureLookups instead."
+        )
+    ts_kwargs = dict(
         df=eol_df,
-        feature_lookups=feature_lookups,
-        features=features if features else None,
         label=label_column if label_column else None,
         exclude_columns=exclude,
     )
+    if features:
+        ts_kwargs["features"] = features
+    else:
+        ts_kwargs["feature_lookups"] = feature_lookups
+    training_set = fe.create_training_set(**ts_kwargs)
     full_df = training_set.load_df()
 
 print(f"Full dataset: {full_df.count()} rows, {len(full_df.columns)} columns")
