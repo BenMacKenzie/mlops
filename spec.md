@@ -1,7 +1,7 @@
 # MLOps Model Manager
 
 **Created:** 2026-04-11
-**Status:** End-to-end verified (2026-09-29) on fe-vm-serverless-stable-77rg2n
+**Status:** Deployed to Databricks Apps + end-to-end verified (2026-09-30) on fe-vm-serverless-stable-77rg2n
 **Workspace:** https://fevm-serverless-stable-77rg2n.cloud.databricks.com
 **Default Catalog:** serverless_stable_77rg2n_catalog (user-configurable per project)
 **Lakebase Project:** mlops (app state + online store)
@@ -184,16 +184,16 @@ A single end-to-end execution: materialize dataset → train model → log with 
 | started_at | TIMESTAMP | |
 | ended_at | TIMESTAMP | |
 
-#### `app.synced_table`
-Tracks feature tables synced to Lakebase for online serving. Project-level — shared across all deployments.
+#### `app.online_table`
+Tracks feature tables published to the Lakebase online store for serving. Project-level — shared across all deployments. (UI labels these "Synced Tables".)
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
 | project_id | BIGINT FK → project | |
 | source_table | VARCHAR(255) | Fully-qualified UC table name |
-| synced_table_name | VARCHAR(255) | Destination UC name (`{catalog}.{schema}.{name}_online`) |
-| status | VARCHAR(50) | `'PROVISIONING'`, `'ONLINE'`, `'FAILED'` |
+| online_table_name | VARCHAR(255) | Destination UC name (`{catalog}.{schema}.{name}_online`) |
+| status | VARCHAR(50) | `'PROVISIONING'`, `'ONLINE'`, `'OFFLINE'` — reconciled by `check-status` |
 | pipeline_id | VARCHAR(255) | Lakebase sync pipeline URL |
 
 #### `app.deployment`
@@ -216,7 +216,7 @@ Links a registered model version to a serving endpoint. All feature tables from 
 project 1──* entity_observation_label
 project 1──* training_spec
 project 1──* run
-project 1──* synced_table
+project 1──* online_table
 project 1──* deployment
 
 entity_observation_label 1──* training_spec
@@ -353,10 +353,16 @@ Since training notebooks use `fe.log_model()`, models have feature specs embedde
   int32 model signature, but the online-store lookup returns int64 at serving time and MLflow rejects
   the int64→int32 narrowing. Use `BIGINT`/`DOUBLE` so the signature is int64.
 
-**Test interface:**
-- Entity key inputs populated from sample data (queried from EOL SQL)
-- Constructs `{"dataframe_records": [{...}]}` payload automatically
-- Displays prediction response
+**Test interface (schema-driven, dynamic to the model signature):**
+- Reads the endpoint's OpenAPI (`GET /api/deployments/:id/schema`) and renders one input
+  per **required** model input — the request-time values the calling system supplies
+  (entity keys + any pass-through/direct features like `amount`, `pos_entry_mode`,
+  `security_code`). FeatureLookup features are shown as "auto-resolved from online store"
+  and never requested. Adapts automatically to whatever model/version the endpoint serves.
+- Sample records (from the EOL spine, minus label — `GET /api/deployments/:id/samples`)
+  prefill the required fields on click.
+- Values are coerced to their declared types, then sent as `{"dataframe_records": [{...}]}`.
+- Displays the prediction response.
 
 ## MLflow Integration Details
 
@@ -372,9 +378,10 @@ The app interacts with MLflow via the Databricks REST API (from the Express back
 | Transition stage | UC Model Registry API | Promote versions |
 | Create serving endpoint | `POST /api/2.0/serving-endpoints` | From registered model version |
 | Get endpoint status | `GET /api/2.0/serving-endpoints/{name}` | Poll for readiness |
-| Query endpoint | `POST /serving-endpoints/{name}/invocations` | Test inference with entity keys |
+| Query endpoint | `POST /serving-endpoints/{name}/invocations` | Test inference; caller supplies the required request-time inputs (entity keys + pass-through features), lookups auto-resolved |
+| Get serving input schema | `GET /api/2.0/serving-endpoints/{name}/openapi` | Drives the dynamic test form: `required` = caller-provided inputs, the rest = looked-up features |
 | Publish feature table online | `FeatureEngineeringClient.publish_table()` (in `publish_table.py` notebook) | Publishes a UC feature table to the `mlops` online store (Lakebase). `create_online_store()` is called on first use. |
-| Poll online table status | `GET /api/2.0/serving-endpoints/{name}` + UC table checks | The published table is a UC `TABLE_ONLINE_VIEW`; it cannot be dropped via SQL `DROP TABLE`. Re-publishing over it via `publish_table(publish_mode='TRIGGERED')` re-syncs in place. |
+| Poll online table status | `GET /api/2.0/database/synced_tables/{name}` (requires pipeline View — the app SP lacks it) → falls back to `SELECT count(*)` via the warehouse | The app row is written `PROVISIONING` at publish time and never auto-updated; `check-status` reconciles it to `ONLINE` when the synced table has rows. Re-publishing via `publish_table(publish_mode='TRIGGERED')` re-syncs in place. |
 
 > **Online store note:** the deployment path uses the `FeatureEngineeringClient` online-store API
 > (`create_online_store` / `get_online_store` / `publish_table`), **not** the older
@@ -480,10 +487,25 @@ The dev script sets `PGPASSWORD` via `databricks postgres generate-database-cred
 
 ## Deployment
 
-Deployment to Databricks Apps requires:
-1. Bundling the server with esbuild (minified, <10MB file size limit)
-2. Using a minimal `package.json` with no dependencies (to avoid npm install on the remote, which can't reach the registry)
-3. Re-adding the Lakebase postgres resource after each `databricks bundle deploy` (bundle overwrites app resources)
+Deployment to Databricks Apps uses the **canonical AppKit pattern** (no esbuild bundling):
+1. Build the client locally to `client/dist`; ship source. The Apps platform runs a plain
+   `npm install` on a **minimal runtime `package.json`** (`{@databricks/appkit, tsx}`).
+   esbuild single-file bundling was abandoned — it breaks on AppKit's per-plugin
+   `manifest.json` (each plugin reads it from its own `node_modules`).
+2. **Never ship the dev-proxy `.npmrc`** or `package-lock.json` — unreachable from the Apps
+   build env, so `npm install` hangs. Exclude them via `sync.exclude` in `databricks.yml`;
+   force-include `client/dist` via `sync.include` (`.gitignore`'s `dist/` otherwise drops
+   the SPA → "Cannot GET /"). Note `.databricksignore` is ignored by `bundle deploy`.
+3. Re-add the Lakebase postgres resource after each `databricks bundle deploy` (bundle
+   overwrites app resources; DABs can't declare the `postgres` type). Start the app before
+   `apps deploy`.
+4. Grant the app service principal the Lakebase `app` schema on every deploy (Lakebase
+   re-provisions the SP Postgres role per deploy).
+5. **The deployed app authenticates as its service principal** for management APIs
+   (client-credentials OAuth from the injected `DATABRICKS_CLIENT_ID/SECRET`); the user OBO
+   token only carries the app's limited `user_api_scopes` (no serving/jobs/mlflow). Grant the
+   SP CAN_MANAGE on serving endpoints and USE/SELECT/EXECUTE on the model's catalog/schema.
+   Local dev keeps the CLI token.
 
 See `deploy.sh` for the full deployment script.
 
@@ -518,87 +540,60 @@ See `deploy.sh` for the full deployment script.
 ---
 
 ## Action Items
-- [x] Scaffold AppKit project with `databricks apps init` — 2026-04-11
-- [x] Design and create Lakebase schema — 2026-04-11
-- [x] Build Express API routes for CRUD on all entities — 2026-04-11
-- [x] Build React UI: Projects list + detail page (incl. GitHub notebook auto-fetch) — 2026-04-11
-- [x] Build React UI: Dataset builder, Runs tab — 2026-04-11
-- [x] Build job launcher logic (submit runs to Databricks Jobs API) — 2026-04-11
-- [x] Create Lakebase tables via psql — 2026-04-12
-- [x] Fix materialize notebook upload (Workspace Import API) — 2026-04-12
-- [x] Add `databricks-feature-engineering` to serverless job environment — 2026-04-12
-- [x] Refactor feature_definition → container + feature_entry model (multi-table support) — 2026-04-12
-- [x] Add view/expand for existing EOLs and feature definitions (read-only detail view) — 2026-04-12
-- [x] Add copy-to-new-version for EOLs and feature definitions — 2026-04-12
-- [x] Remove DROP TABLE statements from schema init — 2026-04-13
-- [x] Merge training_run + evaluation_run into single `run` table — 2026-04-13
-- [x] Single-task training job (training notebook includes evaluation) — 2026-04-14
-- [x] MLflow experiment link resolved by numeric ID via API — 2026-04-14
-- [x] Dynamic username resolution (PGUSER local, SCIM API deployed) — 2026-04-14
-- [x] Read-only detail view for feature lookup entries — 2026-04-14
-- [x] Pushed to GitHub: `appkit-rewrite` branch on BenMacKenzie/mlops — 2026-04-14
-- [x] Fix DeltaTableSource namespace — use short table_name with separate catalog_name/schema_name — 2026-04-17
-- [x] Rename Runs tab → Training — 2026-04-17
-- [x] Add model registration to Unity Catalog (one-click from training runs) — 2026-04-17
-- [x] Add model_name as project-level field (backfill existing projects with project name) — 2026-04-17
-- [x] Pass catalog/schema as training notebook params (for volume TMPDIR) — 2026-04-17
-- [x] Consolidate metrics display to single column (test/eval only, hide training metrics) — 2026-04-17
-- [x] Build Deployment tab: synced tables, endpoint creation, test inference — 2026-04-17
-- [x] Synced table provisioning via Lakebase Projects API — 2026-04-17
-- [x] Model registration via app-managed notebook (register_model.py) — 2026-04-17
-- [x] Serving endpoint creation + status polling — 2026-04-17
-- [x] Test inference interface with entity key inputs and sample data — 2026-04-17
-- [ ] Consolidate UI: merge Features/Datasets/Training tabs into single Training tab — 2026-04-17
-- [ ] Create `app.training_spec` table, migrate from feature_definition + dataset — 2026-04-17
-- [ ] Write `train_cv.py` notebook (full pipeline: EOL → features → CV → fe.log_model) — 2026-04-17
-- [ ] Write `train_standard.py` notebook (train/eval split) — 2026-04-17
-- [ ] Remove git_url/notebook_path from project, remove GitHub notebook listing — 2026-04-17
-- [ ] End-to-end test: create project → EOL → training spec → run → register → deploy — 2026-04-17
-- [ ] **BLOCKER: Lakebase metadata bug (ES-1849341)** — `fe.publish_table()` succeeds but serving endpoint can't discover the online table. Known bug where publish fails to register Online Store metadata. File ES ticket against FeatureStore.MLFeatureStore with workspace ID, region, exact API calls, and error text. Also check: SP permissions (USAGE on catalog/schema, SELECT on online table). — 2026-04-20
-- [ ] Add on-demand feature support: `function_name`/`input_bindings`/`output_name` columns on `feature_entry`, UC function/params endpoints, master-detail feature builder UI, entry update endpoint, notebook `FeatureFunction` construction — 2026-04-21
-- [ ] Deploy to workspace (blocked: npm registry unreachable from app runtime) — 2026-04-12
-- [ ] Build MLflow experiment viewer + run comparison UI — 2026-04-12
-- [ ] Fix local dev Lakebase auth (SASL issue with AppKit token refresh) — 2026-04-12
+
+**Delivered** (initial build Apr 2026 + re-home 2026-09-30): scaffold, Lakebase schema, full
+CRUD API + React UI, consolidated `training_spec` model, app-managed training notebooks
+(`train_cv.py`, `train_standard.py`), on-demand + declarative features, master-detail feature
+builder, single-job training pipeline, model registration (`register_model.py`), Deployment tab
+(online tables + serving endpoint + schema-driven test UI), deploy to Databricks Apps, and
+end-to-end verification (train → register → publish → serve → predict). The ES-1849341
+online-store discovery blocker is **resolved** (feature-engineering library bump + `fe.*`
+online-store API + SP grants).
+
+**Open / future:**
+- [ ] `train_hpsearch.py` — hyperparameter-search notebook for the `train_eval_test` split (not yet written)
+- [ ] Remove legacy `git_url`/`notebook_path` from the project form + GitHub notebook auto-fetch (leftover from the old user-notebooks design; still in `client/src/App.tsx`). Also fix the stale `serverless_stable_1dpktm_catalog` default in the create-project form.
+- [ ] MLflow experiment viewer + run-comparison UI
+- [ ] (Optional) Re-publish `customer_features_online` to clear its permanently-failed sync pipeline — the initial snapshot still serves, but incremental sync died after the INT→BIGINT retype changed the source table id
+- [ ] (Optional) Populate the native "Query endpoint" example (needs a retrain; the app's schema-driven test UI already covers testing)
+- [ ] (Future) One shared Databricks Job per project, reused across runs (`job_id` on project; `notebook_params` already vary per run)
 
 ## Decisions
-- 2026-04-11: Use AppKit (not APX) for React app framework — official SDK, built-in Lakebase plugin
-- 2026-04-11: Store declarative feature specs as JSONB — beta API may change, flexibility > normalization
-- 2026-04-11: Rewrite from scratch in React/TS rather than porting Dash app — cleaner architecture, better Databricks Apps integration
-- 2026-04-11: Notebooks are user-provided via git, not baked into the app — keeps app generic, data scientists write training code in their preferred way
-- 2026-04-12: Use `appkit.server.extend()` for custom routes (not `configure` callback which doesn't exist)
-- 2026-04-12: For local dev, pass `PGPASSWORD` directly to lakebase plugin as native auth — AppKit's `LAKEBASE_ENDPOINT` OAuth token refresh doesn't work with CLI profile auth
-- 2026-04-12: esbuild bundling for deploy has plugin manifest issues — using `npx tsx server/server.ts` as app command instead; deployment still blocked on npm registry access from app runtime
-- 2026-04-12: Refactored feature_definition into container + feature_entry — a definition is a named spec (name + EOL), entries are individual lookups/declarative features that can reference different tables. Materialize gathers all entries. Definitions are immutable; copy to create new versions.
-- 2026-04-12: Materialize notebook auto-uploaded to workspace via Import API (`/api/2.0/workspace/import`) before each job run — strips `/Workspace` prefix for API, uses `format: SOURCE`
-- 2026-04-12: Serverless jobs need `databricks-feature-engineering` in environment dependencies spec
-- 2026-04-13: Merged training_run + evaluation_run into single `run` table — eliminated separate evaluation tab
-- 2026-04-13: Git source jobs use job-level `git_source` (not task-level) and relative notebook paths (no leading `/`); workspace jobs use absolute paths
-- 2026-04-14: Dropped separate evaluation task — training notebook includes `mlflow.evaluate()`, so a single-task job is sufficient
-- 2026-04-14: MLflow experiment names are short (`project_dataset`); notebook prepends `/Users/<username>/`. Server resolves numeric experiment ID via `GET /api/2.0/mlflow/experiments/get-by-name` (note: MLflow API is at 2.0, not 2.1)
-- 2026-04-14: Username resolved dynamically — `PGUSER` env var for local dev, Databricks SCIM API (`/api/2.1/preview/scim/v2/Me`) for deployed app, cached after first call
-- 2026-04-14: Code pushed to `appkit-rewrite` branch on https://github.com/BenMacKenzie/mlops
-- 2026-04-14: MLflow experiment scoped to project (not dataset) so all runs appear in one experiment; experiment ID lookup falls back to null instead of name to avoid broken links
-- 2026-04-14: Materialize notebook now excludes `timestamp_lookup_key` columns (observation dates) alongside entity columns
-- 2026-04-14: Dataset tab now links to UC table explorer and job run URL (visible in all statuses, not just MATERIALIZING)
-- 2026-04-14: **Future enhancement** — consolidate to a single Databricks Job per project (store `job_id` on project record, reuse across all runs/datasets). Currently each run creates its own job on first launch; `notebook_params` already vary per run so a shared job would work.
-- 2026-04-17: DeltaTableSource requires `catalog_name` and `schema_name` as separate params; `table_name` must be the short name only — passing a fully qualified name caused garbled namespace resolution
-- 2026-04-17: `fe.create_feature()` also requires `catalog_name`/`schema_name` — these specify the output feature catalog/schema
-- 2026-04-17: Model registration uses an app-managed notebook (`notebooks/register_model.py`) launched as a Databricks Job. The notebook calls `mlflow.register_model(f"runs:/{run_id}/model", model_name)`. This is required because the REST API (`unity-catalog/model-versions/create`) cannot resolve artifact paths when DBFS root is disabled — the Python SDK has internal access to the artifact store.
-- 2026-04-17: MLflow `runs/get` is a GET endpoint (not POST) — must pass `run_id` as query param
-- 2026-04-17: Metrics bucketing handles both `mlflow.evaluate()` prefixes (`eval_`, `evaluation_`) and CatBoost CV prefixes (`test-`, `train-`). UI shows only test/eval metrics.
-- 2026-04-17: `model_name` added to project table as UC model registry name; defaults to project name. Backfilled via `UPDATE app.project SET model_name = name WHERE model_name = ''`
-- 2026-04-17: Training notebook receives `catalog` and `schema` as widget params — needed for constructing volume paths (e.g. TMPDIR for CatBoost on serverless)
-- 2026-04-17: Serverless jobs cannot write to `/tmp` — use UC volumes for temp storage. CatBoost `cv()` needs `train_dir` or `logging_dir` set to a volume path.
-- 2026-04-17: Online tables are project-level, shared across deployments. A source table published once serves all deployments referencing it. Multiple models/datasets can share the same online table.
-- 2026-04-17: All feature tables from a dataset must be published as online tables before the model can be deployed to a serving endpoint. No per-feature request-time selection needed — if the requesting system supplies a feature in the request payload, Databricks serving uses it instead of looking it up. This is built-in behavior.
-- 2026-04-17: Training notebooks already use `FeatureEngineeringClient.log_model()` — models have feature specs embedded. Serving endpoints auto-resolve feature lookups from online tables at inference time. No notebook contract changes needed for deployment.
-- 2026-04-17: Online table naming convention: `{project_catalog}.{project_schema}.{short_table_name}_online`. Synced table creation uses `POST /api/2.0/postgres/synced_tables` with PK columns read from UC `information_schema.constraint_column_usage`. CDF enabled automatically on source tables before sync.
-- 2026-04-17: Dataset split redesign — three strategies (none, train/eval, train/eval/test) × two methods (random stratified, temporal). Random splits always stratified on label column to maintain class proportions. Temporal splits sorted by EOL timestamp column, latest records to eval/test. "None" strategy for CV workflows where the notebook handles splitting internally. Replaces the original `eval_split_type`/`eval_split_config` design.
-- 2026-04-17: Consolidated training spec — merged feature_definition + dataset + training config into single `training_spec` entity. UI reduced from 4 tabs to 2 (EOL + Training). Split strategy determines notebook: none→CV, train_eval→standard, train_eval_test→hpsearch. Copy workflow for experimentation.
-- 2026-04-17: App-managed training notebooks — training notebooks live in `notebooks/` folder, not user git repos. App selects notebook based on split_strategy. Each notebook handles full pipeline: EOL → features → create_training_set → split → train → fe.log_model(). Ensures feature specs always embedded correctly. Project no longer needs git_url/notebook_path fields.
-- 2026-04-17: Single-job training — no separate materialize step. Each run does everything in one notebook/job. The `training_set` object from `fe.create_training_set()` flows through to `fe.log_model()`, embedding feature specs for serving. Eliminates the need to cache/manage materialized tables separately.
-- 2026-04-21: On-demand features — own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, `output_name` columns. Initially tried attaching to lookup entries as nested JSONB, but a `distance(customer_zip, merchant_zip)` use case showed bindings need to cross tables. Reverted to peer entries. Input bindings can reference columns from any lookup entry in the spec + EOL columns. Notebook param renamed `feature_lookups_json` → `feature_entries_json`; notebook builds `FeatureLookup` + `FeatureFunction` objects from the flat entry list. On-demand outputs don't require synced tables. Function metadata read from `information_schema.routines` and `information_schema.parameters`.
-- 2026-04-21: Master-detail feature builder UI — replaced per-entry add/view forms with a two-panel layout. Left panel: entry list (lookup, on-demand, declarative). Right panel: editable detail form for selected entry. Catalog/schema default to most recently used values. Entries fully editable until spec's first run locks them. Supports add, edit, delete, and copy-to-edit-after-lock.
+
+Curated: durable choices, still-relevant implementation gotchas, and the 2026-09-30 operational
+learnings. Superseded build-churn (the earlier `feature_definition`/`dataset`/materialize model,
+the git-source-notebook and esbuild-bundling attempts) has been pruned — current architecture lives
+in **Key Design Decisions** above. Git history has the full trail.
+
+**Framework / architecture:**
+- Use AppKit (not APX) — official SDK, built-in Lakebase plugin; full React/TS rewrite of the Dash prototype.
+- Declarative feature specs stored as JSONB (beta API; flexibility > normalization).
+- Custom routes via `appkit.server.extend()` (there is no `configure` callback).
+
+**Jobs / notebooks:**
+- Serverless jobs need `databricks-feature-engineering` in the environment dependencies spec.
+- App-managed notebooks are uploaded via the Workspace Import API (`/api/2.0/workspace/import`) before each run — strip the `/Workspace` prefix for the API call, use `format: SOURCE`.
+- Serverless jobs cannot write to `/tmp` — point CatBoost `cv()` `train_dir`/`logging_dir` at a UC **volume**; the notebook receives `catalog`/`schema` widgets to build the volume path.
+- `DeltaTableSource` / `fe.create_feature()` need `catalog_name` + `schema_name` as separate params; `table_name` must be the short name only (a fully-qualified name garbles namespace resolution).
+- Model registration must run in a notebook (`register_model.py` → `mlflow.register_model`) — the REST `model-versions/create` can't resolve artifact paths when DBFS root is disabled.
+
+**MLflow / metrics:**
+- Experiment names are short (`project`); the notebook prepends `/Users/<username>/`. Resolve the numeric id via `GET /api/2.0/mlflow/experiments/get-by-name` (MLflow API is **2.0**, not 2.1); fall back to null (not name) to avoid broken links.
+- `GET /api/2.0/mlflow/runs/get` is a GET — pass `run_id` as a query param.
+- Metric bucketing handles both `mlflow.evaluate()` prefixes (`eval_`, `evaluation_`) and CatBoost CV prefixes (`test-`, `train-`); UI shows test/eval only.
+
+**Auth / identity:**
+- Local dev: pass `PGPASSWORD` (from a CLI token) directly to the lakebase plugin as native auth — AppKit's `LAKEBASE_ENDPOINT` OAuth refresh doesn't work with CLI-profile auth.
+- Username resolved dynamically: `PGUSER` locally, SCIM `/api/2.1/preview/scim/v2/Me` when deployed; cached after first call.
+
+**2026-09-30 (re-home to fe-vm-serverless-stable-77rg2n):**
+- Canonical AppKit deploy (no esbuild): ship source + minimal runtime `package.json`; platform runs `npm install`. Exclude dev-proxy `.npmrc`/`package-lock.json` via `sync.exclude`, force-include `client/dist` via `sync.include`. `DATABRICKS_HOST` arrives schemeless → prepend `https://` in server. Full recipe: `reference_appkit_deploy_recipe` memory.
+- Deployed app auths as its **service principal** for management APIs (client-credentials OAuth via injected `DATABRICKS_CLIENT_ID/SECRET`); the user OBO token lacks serving/jobs/mlflow scopes. `getToken()` is async: dev → CLI token, deployed → SP token. Grant the SP CAN_MANAGE on endpoints + USE/SELECT/EXECUTE on the model catalog/schema, else deployment shows FAILED + inference 403.
+- Serving inputs = the full spine, not just entity keys. The model signature marks the spine's pass-through columns (e.g. `amount`, `pos_entry_mode`, `security_code`) REQUIRED alongside the lookup keys; sending only entity keys → `BAD_REQUEST … Model is missing inputs [...]`. `/samples` returns the full spine row (minus label).
+- Test form is **schema-driven** — `GET /api/deployments/:id/schema` reads the endpoint OpenAPI and returns `{required, optional, types}`. UI renders a typed field per required input (dynamic to the served model signature); optional = FeatureLookup features shown as auto-resolved. Robust when `/samples` returns nothing.
+- Online-table status reconciliation — the synced-table state API (`/api/2.0/database/synced_tables/{name}`) needs pipeline View perms the app SP lacks (`PERMISSION_DENIED … pipeline`), so `check-status` falls back to `SELECT count(*)` via the warehouse (SP-safe, survives re-publishes): rows > 0 → ONLINE. Client re-checks PROVISIONING rows on load.
+- Recreating a feature source table (e.g. INT→BIGINT retype) gives it a new Delta table id, permanently breaking the existing synced-table sync pipeline (`DIFFERENT_DELTA_TABLE_READ_BY_STREAMING_SOURCE`). The initial snapshot keeps serving, but incremental sync dies — drop the online table and re-publish fresh.
+- `fe.log_model(input_example=...)` does not reliably populate the native "Query endpoint" example — the served model's OpenAPI carries the signature but no example value (the spine example has fewer columns than the resolved feature signature, so MLflow drops it). The app's schema-driven test UI is the reliable path.
 
 ## Meeting Notes
 See `meetings/` folder for dated meeting notes.
