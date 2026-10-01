@@ -1,4 +1,4 @@
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec } from './types';
+import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec, DeclarativeFeature, MaterializedFeature } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -130,6 +130,23 @@ export const checkOnlineTableStatus = (id: number) =>
   request<OnlineTable>(`/api/online-tables/${id}/check-status`, { method: 'POST' });
 export const deleteOnlineTable = (id: number) =>
   request<{ ok: boolean }>(`/api/online-tables/${id}`, { method: 'DELETE' });
+
+// ── Materialized Features (declarative → online store, on a schedule) ──
+export const getMaterializedFeatures = (projectId: number) =>
+  request<DeclarativeFeature[]>(`/api/projects/${projectId}/materialized-features`);
+export const materializeFeature = (
+  projectId: number,
+  data: { feature_entry_id: number; trigger_type: string; cron_expression?: string | null; timezone_id?: string | null },
+) =>
+  request<MaterializedFeature>(`/api/projects/${projectId}/materialized-features`, { method: 'POST', body: JSON.stringify(data) });
+export const pauseMaterializedFeature = (id: number) =>
+  request<MaterializedFeature>(`/api/materialized-features/${id}/pause`, { method: 'POST' });
+export const resumeMaterializedFeature = (id: number) =>
+  request<MaterializedFeature>(`/api/materialized-features/${id}/resume`, { method: 'POST' });
+export const refreshMaterializedFeature = (id: number) =>
+  request<MaterializedFeature>(`/api/materialized-features/${id}/refresh`, { method: 'POST' });
+export const deleteMaterializedFeature = (id: number) =>
+  request<{ ok: boolean }>(`/api/materialized-features/${id}`, { method: 'DELETE' });
 
 // ── Deployments ──
 export const getDeployments = (projectId: number) =>

@@ -1128,7 +1128,7 @@ appkit.server.extend((app) => {
           environment_key: 'Default',
           spec: {
             client: '1',
-            dependencies: ['databricks-feature-engineering>=0.15.0'],
+            dependencies: ['databricks-feature-engineering>=0.18.0'],
           },
         }],
       };
@@ -1348,7 +1348,7 @@ appkit.server.extend((app) => {
           ],
           environments: [{
             environment_key: 'Default',
-            spec: { client: '1', dependencies: ['databricks-feature-engineering>=0.15.0'] },
+            spec: { client: '1', dependencies: ['databricks-feature-engineering>=0.18.0'] },
           }],
         };
         console.log(`[job] Creating job: mlops-${project.name}`);
@@ -1743,6 +1743,310 @@ appkit.server.extend((app) => {
   app.delete('/api/online-tables/:id', async (req, res) => {
     try {
       await db.query('DELETE FROM app.online_table WHERE id = $1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ════════════════════════════════════════════
+  //  MATERIALIZED FEATURES (declarative → online store, on a schedule)
+  // ════════════════════════════════════════════
+
+  // Build a materialize_online declarative spec from a feature_entry + its EOL, and a
+  // stable UC feature name. Returns null if the entry isn't a usable declarative feature.
+  function buildDeclarativeSpec(entry: any, eol: any, featureName: string) {
+    const spec = entry.declarative_spec;
+    if (!spec) return null;
+    return {
+      name: featureName,
+      source_table: spec.source_table,
+      input: spec.input,
+      function: spec.function,
+      time_window: spec.time_window,
+      filter_condition: spec.filter_condition || null,
+      // Entity + point-in-time columns come from the EOL (same as the materialize route).
+      lookup_key: spec.lookup_key || eol?.entity_columns || [],
+      entity_columns: eol?.entity_columns || [],
+      timestamp_lookup_key: spec.timestamp_lookup_key || eol?.timestamp_column || null,
+      timeseries_column: eol?.timestamp_column || null,
+    };
+  }
+
+  function makeFeatureName(spec: any): string {
+    const win = spec?.time_window?.window_duration || '';
+    const base = `${spec?.function || 'agg'}_${spec?.input || 'x'}_${win}`.toLowerCase();
+    return base.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
+  }
+
+  // Run the app-managed materialize_online notebook as a job, wait for it, and return the
+  // parsed dbutils.notebook.exit payload ({ status, operation, results }). Throws on failure.
+  async function runMaterializeOnline(
+    req: any, jobName: string, params: Record<string, string>,
+  ): Promise<{ status: string; operation: string; results: any[] }> {
+    const userName = await getUsername(req);
+    const notebookPath = `/Workspace/Users/${userName}/.mlops/materialize_online`;
+    const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'materialize_online.py');
+    await uploadNotebook(req, localNotebook, notebookPath);
+
+    const { job_id, run_id, run_url } = await createOrRunJob(req, jobName, notebookPath, params);
+
+    let attempts = 0;
+    while (attempts < 120) {
+      await new Promise(r => setTimeout(r, 5000));
+      attempts++;
+      const jobRun = await databricksApi(req, 'GET', `jobs/runs/get?run_id=${run_id}`);
+      const life = jobRun.state?.life_cycle_state;
+      const result = jobRun.state?.result_state;
+      if (life === 'TERMINATED' && result === 'SUCCESS') {
+        // runs/get-output requires the TASK run id, not the job-level run id (the latter
+        // errors for a job with tasks). A single-task job exposes it at tasks[0].run_id.
+        const taskRunId = jobRun.tasks?.[0]?.run_id ?? run_id;
+        const out = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${taskRunId}`);
+        const raw = out?.notebook_output?.result;
+        let parsed: any = {};
+        try { parsed = raw ? JSON.parse(raw) : {}; } catch { parsed = {}; }
+        return { status: 'SUCCESS', operation: parsed.operation, results: parsed.results || [], ...parsed, job_id, run_id, run_url } as any;
+      }
+      if (life === 'TERMINATED' || life === 'INTERNAL_ERROR') {
+        throw new Error(jobRun.state?.state_message || result || 'materialize_online job failed');
+      }
+    }
+    throw new Error('materialize_online job timed out after 10 minutes');
+  }
+
+  // List declarative features for a project (across specs), each annotated with its
+  // materialization row (or null if it hasn't been materialized online yet).
+  app.get('/api/projects/:projectId/materialized-features', async (req, res) => {
+    try {
+      const entries = await db.query(
+        `SELECT fe.id AS feature_entry_id, fe.declarative_spec, ts.id AS spec_id, ts.name AS spec_name, ts.eol_id
+         FROM app.feature_entry fe
+         JOIN app.training_spec ts ON fe.training_spec_id = ts.id
+         WHERE ts.project_id = $1 AND fe.feature_type = 'declarative' AND fe.declarative_spec IS NOT NULL
+         ORDER BY fe.id`,
+        [req.params.projectId]
+      );
+      const mats = await db.query(
+        'SELECT * FROM app.materialized_feature WHERE project_id = $1',
+        [req.params.projectId]
+      );
+      const byEntry = new Map(mats.rows.map((m: any) => [m.feature_entry_id, m]));
+      res.json(entries.rows.map((e: any) => ({
+        feature_entry_id: e.feature_entry_id,
+        spec_id: e.spec_id,
+        spec_name: e.spec_name,
+        declarative_spec: e.declarative_spec,
+        materialized: byEntry.get(e.feature_entry_id) || null,
+      })));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Materialize a declarative feature to the online store on a schedule.
+  app.post('/api/projects/:projectId/materialized-features', async (req, res) => {
+    try {
+      const { feature_entry_id, trigger_type, cron_expression, timezone_id } = req.body;
+      if (!feature_entry_id) { res.status(400).json({ error: 'feature_entry_id required' }); return; }
+
+      const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [req.params.projectId]);
+      if (projResult.rows.length === 0) { res.status(404).json({ error: 'Project not found' }); return; }
+      const project = projResult.rows[0];
+
+      const entryResult = await db.query(
+        `SELECT fe.*, ts.eol_id FROM app.feature_entry fe
+         JOIN app.training_spec ts ON fe.training_spec_id = ts.id
+         WHERE fe.id = $1`,
+        [feature_entry_id]
+      );
+      if (entryResult.rows.length === 0) { res.status(404).json({ error: 'Feature entry not found' }); return; }
+      const entry = entryResult.rows[0];
+      if (entry.feature_type !== 'declarative' || !entry.declarative_spec) {
+        res.status(400).json({ error: 'Not a declarative feature' }); return;
+      }
+      const eolResult = await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [entry.eol_id]);
+      const eol = eolResult.rows[0];
+
+      const featureName = makeFeatureName(entry.declarative_spec);
+      const featureFullName = `${project.catalog}.${project.schema}.${featureName}`;
+      const spec = buildDeclarativeSpec(entry, eol, featureName);
+      const triggerType = trigger_type || 'derived';
+
+      // CDF on the source is required for incremental aggregation materialization.
+      try {
+        await executeSql(req, `ALTER TABLE ${spec!.source_table} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
+      } catch (e: any) {
+        console.warn(`[matfeat] CDF enable warning: ${e.message}`);
+      }
+
+      // Upsert the tracking row as MATERIALIZING before launching the job.
+      const upsert = await db.query(
+        `INSERT INTO app.materialized_feature
+           (project_id, feature_entry_id, feature_name, feature_full_name, trigger_type, cron_expression, timezone_id, desired_state, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE','MATERIALIZING')
+         ON CONFLICT (feature_entry_id) DO UPDATE SET
+           feature_name=EXCLUDED.feature_name, feature_full_name=EXCLUDED.feature_full_name,
+           trigger_type=EXCLUDED.trigger_type, cron_expression=EXCLUDED.cron_expression,
+           timezone_id=EXCLUDED.timezone_id, status='MATERIALIZING', error_message=NULL
+         RETURNING *`,
+        [req.params.projectId, feature_entry_id, featureName, featureFullName, triggerType,
+          cron_expression || null, timezone_id || null]
+      );
+      const rowId = upsert.rows[0].id;
+
+      const params = {
+        operation: 'create',
+        declarative_features_json: JSON.stringify([spec]),
+        catalog: project.catalog,
+        schema: project.schema,
+        online_store_name: ONLINE_STORE_NAME,
+        table_name_prefix: 'mlops_feat_',
+        trigger_type: triggerType,
+        cron_expression: cron_expression || '',
+        timezone_id: timezone_id || '',
+        feature_full_names_json: '[]',
+      };
+
+      try {
+        const out = await runMaterializeOnline(req, `mlops-matfeat-${featureName}`, params);
+        const r = (out.results && out.results[0]) || {};
+        const scheduleState = r.schedule_state || 'ACTIVE';
+        await db.query(
+          `UPDATE app.materialized_feature SET
+             status=$1, schedule_state=$2, resolved_cron=$3, materialized_feature_id=$4,
+             online_table_name=$5, pipeline_id=$6, job_id=$7, run_id=$8, materialize_run_url=$9,
+             last_materialization_time=$10, error_message=NULL
+           WHERE id=$11`,
+          [scheduleState === 'PAUSED' ? 'PAUSED' : 'ACTIVE', scheduleState, r.resolved_cron || null,
+            r.materialized_feature_id || null, r.online_table_name || null, r.pipeline_id || null,
+            r.job_id || (out as any).job_id || null, (out as any).run_id || null, (out as any).run_url || null,
+            r.last_materialization_time || null, rowId]
+        );
+      } catch (e: any) {
+        await db.query('UPDATE app.materialized_feature SET status=$1, error_message=$2 WHERE id=$3',
+          ['FAILED', e.message, rowId]);
+        throw e;
+      }
+
+      const updated = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [rowId]);
+      res.status(201).json(updated.rows[0]);
+    } catch (e: any) {
+      console.error(`[matfeat] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Pause / resume: toggle the pipeline schedule state (fast — only pipeline state is
+  // live-updatable; changing the cron requires remove + re-materialize).
+  async function setMaterializedFeatureState(req: any, res: any, op: 'pause' | 'resume') {
+    try {
+      const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
+      const row = result.rows[0];
+      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
+
+      const out = await runMaterializeOnline(req, `mlops-matfeat-${op}-${row.feature_name}`, {
+        operation: op,
+        declarative_features_json: '[]',
+        catalog: project.catalog,
+        schema: project.schema,
+        online_store_name: ONLINE_STORE_NAME,
+        table_name_prefix: 'mlops_feat_',
+        trigger_type: row.trigger_type,
+        cron_expression: '',
+        timezone_id: '',
+        feature_full_names_json: JSON.stringify([row.feature_full_name]),
+      });
+      const r = (out.results && out.results[0]) || {};
+      const scheduleState = r.schedule_state || (op === 'pause' ? 'PAUSED' : 'ACTIVE');
+      await db.query(
+        `UPDATE app.materialized_feature SET desired_state=$1, schedule_state=$2, status=$3,
+           last_materialization_time=COALESCE($4, last_materialization_time) WHERE id=$5`,
+        [op === 'pause' ? 'PAUSED' : 'ACTIVE', scheduleState, scheduleState === 'PAUSED' ? 'PAUSED' : 'ACTIVE',
+          r.last_materialization_time || null, row.id]
+      );
+      const updated = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  }
+  app.post('/api/materialized-features/:id/pause', (req, res) => setMaterializedFeatureState(req, res, 'pause'));
+  app.post('/api/materialized-features/:id/resume', (req, res) => setMaterializedFeatureState(req, res, 'resume'));
+
+  // Refresh live state (schedule state, resolved cron, last materialization time).
+  app.post('/api/materialized-features/:id/refresh', async (req, res) => {
+    try {
+      const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
+      const row = result.rows[0];
+      if (!row.feature_full_name || row.status === 'NOT_MATERIALIZED' || row.status === 'MATERIALIZING') {
+        res.json(row); return;
+      }
+      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
+      const out = await runMaterializeOnline(req, `mlops-matfeat-status-${row.feature_name}`, {
+        operation: 'status',
+        declarative_features_json: '[]',
+        catalog: project.catalog,
+        schema: project.schema,
+        online_store_name: ONLINE_STORE_NAME,
+        table_name_prefix: 'mlops_feat_',
+        trigger_type: row.trigger_type,
+        cron_expression: '',
+        timezone_id: '',
+        feature_full_names_json: JSON.stringify([row.feature_full_name]),
+      });
+      const r = (out.results && out.results[0]) || {};
+      // Reconcile every field the API reports; COALESCE so a not-yet-provisioned null
+      // (e.g. pipeline_id early on) doesn't wipe a value we already captured.
+      await db.query(
+        `UPDATE app.materialized_feature SET
+           schedule_state=COALESCE($1, schedule_state),
+           status=$2,
+           resolved_cron=COALESCE($3, resolved_cron),
+           materialized_feature_id=COALESCE($4, materialized_feature_id),
+           online_table_name=COALESCE($5, online_table_name),
+           pipeline_id=COALESCE($6, pipeline_id),
+           last_materialization_time=COALESCE($7, last_materialization_time)
+         WHERE id=$8`,
+        [r.schedule_state || null, r.schedule_state === 'PAUSED' ? 'PAUSED' : 'ACTIVE',
+          r.resolved_cron || null, r.materialized_feature_id || null, r.online_table_name || null,
+          r.pipeline_id || null, r.last_materialization_time || null, row.id]
+      );
+      const updated = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id]);
+      res.json(updated.rows[0]);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Remove the materialization (stops the pipeline + deletes the UC feature) and the row.
+  app.delete('/api/materialized-features/:id', async (req, res) => {
+    try {
+      const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
+      if (result.rows.length === 0) { res.json({ ok: true }); return; }
+      const row = result.rows[0];
+      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
+      if (row.feature_full_name && row.status !== 'NOT_MATERIALIZED') {
+        try {
+          await runMaterializeOnline(req, `mlops-matfeat-delete-${row.feature_name}`, {
+            operation: 'delete',
+            declarative_features_json: '[]',
+            catalog: project.catalog,
+            schema: project.schema,
+            online_store_name: ONLINE_STORE_NAME,
+            table_name_prefix: 'mlops_feat_',
+            trigger_type: row.trigger_type,
+            cron_expression: '',
+            timezone_id: '',
+            feature_full_names_json: JSON.stringify([row.feature_full_name]),
+          });
+        } catch (e: any) {
+          console.warn(`[matfeat] delete job warning: ${e.message}`);
+        }
+      }
+      await db.query('DELETE FROM app.materialized_feature WHERE id = $1', [req.params.id]);
       res.json({ ok: true });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -2259,6 +2563,32 @@ db.query(`
     name VARCHAR(255) NOT NULL, run_id BIGINT NOT NULL REFERENCES app.run(id) ON DELETE CASCADE,
     endpoint_name VARCHAR(255) NOT NULL, endpoint_status VARCHAR(50) DEFAULT 'NOT_CREATED',
     endpoint_config JSONB, created_at TIMESTAMP DEFAULT NOW()
+  );
+  -- One Databricks-managed online materialization per declarative feature entry.
+  -- Tracks the chosen schedule (trigger) and the live pipeline state read back from the
+  -- feature-engineering API. Distinct from app.online_table (which mirrors precomputed
+  -- FeatureLookup tables via fe.publish_table).
+  CREATE TABLE IF NOT EXISTS app.materialized_feature (
+    id BIGSERIAL PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,
+    feature_entry_id BIGINT REFERENCES app.feature_entry(id) ON DELETE SET NULL,
+    feature_name VARCHAR(255) NOT NULL,
+    feature_full_name VARCHAR(767),
+    online_table_name VARCHAR(767),
+    trigger_type VARCHAR(50) NOT NULL DEFAULT 'derived',
+    cron_expression VARCHAR(255),
+    timezone_id VARCHAR(100),
+    resolved_cron VARCHAR(255),
+    desired_state VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    schedule_state VARCHAR(50),
+    materialized_feature_id VARCHAR(255),
+    job_id BIGINT, run_id BIGINT, pipeline_id VARCHAR(255),
+    status VARCHAR(50) NOT NULL DEFAULT 'NOT_MATERIALIZED',
+    last_materialization_time VARCHAR(64),
+    materialize_run_url TEXT,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (feature_entry_id)
   );
 `).then(() => console.log('Database schema initialized'))
   .catch((e: Error) => console.error('Schema init error:', e.message));

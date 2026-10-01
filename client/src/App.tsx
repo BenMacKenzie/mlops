@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec } from './types';
+import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec, DeclarativeFeature } from './types';
 import * as api from './api';
 
 // ── Simple hash-based routing ──
@@ -10,7 +10,7 @@ type Page =
 function useHashRoute(): [Page, (p: Page) => void] {
   const parse = (): Page => {
     const hash = window.location.hash.slice(1);
-    const m = hash.match(/^\/projects\/(\d+)(?:\/(\w+))?/);
+    const m = hash.match(/^\/projects\/(\d+)(?:\/([\w-]+))?/);
     if (m) return { view: 'project', id: parseInt(m[1]), tab: m[2] || 'overview' };
     return { view: 'projects' };
   };
@@ -38,6 +38,9 @@ function StatusBadge({ status }: { status: string }) {
     RUNNING: 'bg-blue-100 text-blue-800',
     READY: 'bg-green-100 text-green-800',
     SUCCESS: 'bg-green-100 text-green-800',
+    ACTIVE: 'bg-green-100 text-green-800',
+    PAUSED: 'bg-amber-100 text-amber-800',
+    NOT_MATERIALIZED: 'bg-gray-200 text-gray-700',
     FAILED: 'bg-red-100 text-red-800',
   };
   return (
@@ -149,7 +152,8 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
 
   if (!project) return <div className="text-center py-8">Loading...</div>;
 
-  const tabs = ['overview', 'eols', 'training', 'deployment'];
+  const tabs = ['overview', 'eols', 'training', 'online-features', 'deployment'];
+  const tabLabels: Record<string, string> = { 'online-features': 'Online Features' };
 
   return (
     <div>
@@ -164,13 +168,14 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
             key={t}
             className={`px-4 py-2 text-sm font-medium capitalize ${tab === t ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
             onClick={() => navigate({ view: 'project', id: projectId, tab: t })}
-          >{t}</button>
+          >{tabLabels[t] || t}</button>
         ))}
       </div>
 
       {tab === 'overview' && <OverviewTab project={project} eols={eols} trainingSpecs={trainingSpecs} specRuns={specRuns} />}
       {tab === 'eols' && <EOLsTab projectId={projectId} eols={eols} reload={load} />}
       {tab === 'training' && <TrainingSpecTab projectId={projectId} eols={eols} specs={trainingSpecs} runs={specRuns} reload={load} />}
+      {tab === 'online-features' && <OnlineFeaturesTab projectId={projectId} project={project} />}
       {tab === 'deployment' && <DeploymentTab projectId={projectId} eols={eols} trainingSpecs={trainingSpecs} runs={specRuns} />}
     </div>
   );
@@ -1925,6 +1930,196 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
 // ════════════════════════════════════════════
 //  DEPLOYMENT TAB
 // ════════════════════════════════════════════
+// ── Online Features Tab ──
+// Databricks-managed materialization of declarative (aggregation) features to the online
+// store on a schedule — the "feature views" path. Distinct from the Deployment tab's
+// publishing of precomputed FeatureLookup tables (which only mirrors, never recomputes).
+function windowLabel(tw: any): string {
+  if (!tw) return '';
+  const dur = tw.window_duration || '';
+  if (tw.type === 'sliding') return `sliding ${dur}/${tw.slide_duration || '?'}`;
+  if (tw.type === 'continuous') return `rolling ${dur}`;
+  return `${tw.type || 'window'} ${dur}`;
+}
+
+function OnlineFeaturesTab({ projectId, project }: { projectId: number; project: Project }) {
+  const [features, setFeatures] = useState<DeclarativeFeature[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyEntry, setBusyEntry] = useState<number | null>(null);
+  const [editEntry, setEditEntry] = useState<number | null>(null);
+  const [form, setForm] = useState({ trigger_type: 'derived', cron_expression: '', timezone_id: 'UTC' });
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setFeatures(await api.getMaterializedFeatures(projectId)); }
+    finally { setLoading(false); }
+  }, [projectId]);
+  useEffect(() => { load(); }, [load]);
+
+  const openEditor = (entryId: number, mf: any) => {
+    setEditEntry(entryId);
+    setForm({
+      trigger_type: mf?.trigger_type || 'derived',
+      cron_expression: mf?.cron_expression || '',
+      timezone_id: mf?.timezone_id || 'UTC',
+    });
+  };
+
+  const submit = async (entryId: number) => {
+    setBusyEntry(entryId);
+    setEditEntry(null);
+    try {
+      await api.materializeFeature(projectId, {
+        feature_entry_id: entryId,
+        trigger_type: form.trigger_type,
+        cron_expression: form.trigger_type === 'manual_cron' ? form.cron_expression : null,
+        timezone_id: form.trigger_type === 'manual_cron' ? form.timezone_id : null,
+      });
+      await load();
+    } catch (e: any) { alert(`Materialize failed: ${e.message}`); }
+    finally { setBusyEntry(null); }
+  };
+
+  const toggleState = async (mf: any) => {
+    setBusyEntry(mf.feature_entry_id);
+    try {
+      if (mf.status === 'PAUSED') await api.resumeMaterializedFeature(mf.id);
+      else await api.pauseMaterializedFeature(mf.id);
+      await load();
+    } catch (e: any) { alert(`Failed: ${e.message}`); }
+    finally { setBusyEntry(null); }
+  };
+
+  const refresh = async (mf: any) => {
+    setBusyEntry(mf.feature_entry_id);
+    try { await api.refreshMaterializedFeature(mf.id); await load(); }
+    catch (e: any) { alert(`Refresh failed: ${e.message}`); }
+    finally { setBusyEntry(null); }
+  };
+
+  const remove = async (mf: any) => {
+    if (!confirm(`Remove the online materialization for ${mf.feature_name}? This stops the pipeline and deletes the UC feature.`)) return;
+    setBusyEntry(mf.feature_entry_id);
+    try { await api.deleteMaterializedFeature(mf.id); await load(); }
+    catch (e: any) { alert(`Remove failed: ${e.message}`); }
+    finally { setBusyEntry(null); }
+  };
+
+  if (loading) return <div className="text-center py-8">Loading...</div>;
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-blue-50 border border-blue-200 rounded p-3 text-sm text-gray-700">
+        Declarative aggregation features are recomputed and pushed to the online store
+        (<span className="font-mono">{project.catalog}.{project.schema}</span>) by a Databricks-managed
+        pipeline on the schedule you choose here. Changing a schedule requires removing and re-adding;
+        <span className="font-medium"> pause/resume</span> is applied live.
+      </div>
+
+      {features.length === 0 && (
+        <div className="text-gray-500 text-sm py-6 text-center">
+          No declarative features defined. Add aggregation features to a training spec (Training tab) first.
+        </div>
+      )}
+
+      <div className="space-y-3">
+        {features.map((f) => {
+          const spec = f.declarative_spec;
+          const mf = f.materialized;
+          const busy = busyEntry === f.feature_entry_id;
+          const status = mf?.status || 'NOT_MATERIALIZED';
+          return (
+            <div key={f.feature_entry_id} className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="font-medium">
+                    {spec.function}({spec.input}) <span className="text-gray-400">·</span> <span className="font-mono text-sm">{windowLabel(spec.time_window)}</span>
+                  </div>
+                  <div className="text-xs text-gray-500 mt-0.5 truncate">
+                    source <span className="font-mono">{spec.source_table}</span>
+                    {spec.filter_condition && <> · filter <span className="font-mono">{spec.filter_condition}</span></>}
+                    <> · spec <span className="font-mono">{f.spec_name}</span></>
+                  </div>
+                  {mf && (
+                    <div className="text-xs text-gray-500 mt-1 space-x-3">
+                      <span>schedule: <span className="font-mono">{mf.trigger_type === 'manual_cron' ? (mf.cron_expression || '—') : mf.trigger_type === 'table_trigger' ? 'on table change' : (mf.resolved_cron || 'auto (derived)')}</span></span>
+                      {mf.last_materialization_time && <span>last run: <span className="font-mono">{mf.last_materialization_time}</span></span>}
+                      {mf.online_table_name && <span>online: <span className="font-mono">{mf.online_table_name}</span></span>}
+                    </div>
+                  )}
+                  {mf?.error_message && <div className="text-xs text-red-600 mt-1">{mf.error_message}</div>}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <StatusBadge status={busy ? 'MATERIALIZING' : status} />
+                </div>
+              </div>
+
+              {/* Schedule editor */}
+              {editEntry === f.feature_entry_id ? (
+                <div className="mt-3 border-t pt-3 grid grid-cols-3 gap-3 items-end">
+                  <div>
+                    <label className="block text-xs font-medium mb-1">Trigger</label>
+                    <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.trigger_type}
+                      onChange={e => setForm({ ...form, trigger_type: e.target.value })}>
+                      <option value="derived">Auto (derived from window)</option>
+                      <option value="manual_cron">Custom cron</option>
+                      <option value="table_trigger">On source table change</option>
+                    </select>
+                  </div>
+                  {form.trigger_type === 'manual_cron' && (
+                    <>
+                      <div>
+                        <label className="block text-xs font-medium mb-1">Quartz cron</label>
+                        <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" placeholder="0 0 * * * ?"
+                          value={form.cron_expression} onChange={e => setForm({ ...form, cron_expression: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium mb-1">Timezone</label>
+                        <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" placeholder="UTC"
+                          value={form.timezone_id} onChange={e => setForm({ ...form, timezone_id: e.target.value })} />
+                      </div>
+                    </>
+                  )}
+                  <div className="col-span-3 flex gap-2">
+                    <button onClick={() => submit(f.feature_entry_id)} disabled={busy}
+                      className="px-3 py-1.5 bg-green-600 text-white rounded text-sm disabled:opacity-50">
+                      {mf ? 'Re-materialize' : 'Materialize online'}
+                    </button>
+                    <button onClick={() => setEditEntry(null)} className="px-3 py-1.5 border rounded text-sm">Cancel</button>
+                    {form.trigger_type === 'derived' && (
+                      <span className="text-xs text-gray-500 self-center">Databricks computes the cadence from the window + delay.</span>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-3 flex gap-2">
+                  {!mf || status === 'NOT_MATERIALIZED' || status === 'FAILED' ? (
+                    <button onClick={() => openEditor(f.feature_entry_id, mf)} disabled={busy}
+                      className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm disabled:opacity-50">
+                      Schedule online
+                    </button>
+                  ) : (
+                    <>
+                      <button onClick={() => toggleState(mf)} disabled={busy}
+                        className="px-3 py-1.5 border rounded text-sm disabled:opacity-50">
+                        {status === 'PAUSED' ? 'Resume' : 'Pause'}
+                      </button>
+                      <button onClick={() => refresh(mf)} disabled={busy}
+                        className="px-3 py-1.5 border rounded text-sm disabled:opacity-50">Refresh</button>
+                      <button onClick={() => remove(mf)} disabled={busy}
+                        className="px-3 py-1.5 border border-red-300 text-red-600 rounded text-sm disabled:opacity-50">Remove</button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
   projectId: number; eols: EOL[]; trainingSpecs: TrainingSpec[]; runs: Run[];
 }) {

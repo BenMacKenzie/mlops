@@ -116,6 +116,39 @@ export interface OnlineTable {
   pipeline_id: string | null;
 }
 
+// A Databricks-managed online materialization of a declarative feature, on a schedule.
+export interface MaterializedFeature {
+  id: number;
+  project_id: number;
+  feature_entry_id: number | null;
+  feature_name: string;
+  feature_full_name: string | null;
+  online_table_name: string | null;
+  trigger_type: 'derived' | 'manual_cron' | 'table_trigger';
+  cron_expression: string | null;
+  timezone_id: string | null;
+  resolved_cron: string | null;
+  desired_state: 'ACTIVE' | 'PAUSED';
+  schedule_state: string | null;
+  materialized_feature_id: string | null;
+  job_id: number | null;
+  run_id: number | null;
+  pipeline_id: string | null;
+  status: 'NOT_MATERIALIZED' | 'MATERIALIZING' | 'ACTIVE' | 'PAUSED' | 'FAILED';
+  last_materialization_time: string | null;
+  materialize_run_url: string | null;
+  error_message: string | null;
+}
+
+// A declarative feature (aggregation) in a project, with its online materialization (or null).
+export interface DeclarativeFeature {
+  feature_entry_id: number;
+  spec_id: number;
+  spec_name: string;
+  declarative_spec: Record<string, any>;
+  materialized: MaterializedFeature | null;
+}
+
 export interface Deployment {
   id: number;
   project_id: number;
