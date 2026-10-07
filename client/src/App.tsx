@@ -667,7 +667,7 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
     declarative_input: (entry?.declarative_spec as any)?.input || '',
     declarative_function: (entry?.declarative_spec as any)?.function || '',
     declarative_window_type: (entry?.declarative_spec as any)?.time_window?.type || '',
-    declarative_window_duration: (entry?.declarative_spec as any)?.time_window?.window_duration || '',
+    declarative_window_duration: (entry?.declarative_spec as any)?.time_window?.window_duration || '30d',
     declarative_slide_duration: (entry?.declarative_spec as any)?.time_window?.slide_duration || '',
     declarative_filter: (entry?.declarative_spec as any)?.filter_condition || '',
   });
