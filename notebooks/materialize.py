@@ -95,7 +95,10 @@ if feature_defs or declarative_defs:
         return timedelta(days=int(s))
 
     def feature_name_for(dd):
-        # Keep in sync with makeFeatureName() in server.ts so offline + online share a feature.
+        # Prefer the user-supplied name; fall back to a generated one (kept in sync with
+        # makeFeatureName() in server.ts so offline + online share a feature).
+        if dd.get("name"):
+            return dd["name"]
         tw = dd.get("time_window", {})
         base = f"{dd.get('function', 'agg')}_{dd.get('input', 'x')}_{tw.get('window_duration', '')}".lower()
         return re.sub(r'[^a-z0-9]+', '_', base).strip('_')[:120] or "feature"

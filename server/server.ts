@@ -1868,7 +1868,8 @@ appkit.server.extend((app) => {
       const eolResult = await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [entry.eol_id]);
       const eol = eolResult.rows[0];
 
-      const featureName = makeFeatureName(entry.declarative_spec);
+      // Prefer the user-supplied name on the declarative spec; fall back to a generated one.
+      const featureName = (entry.declarative_spec as any).name || makeFeatureName(entry.declarative_spec);
       const featureFullName = `${project.catalog}.${project.schema}.${featureName}`;
       const spec = buildDeclarativeSpec(entry, eol, featureName);
       const triggerType = trigger_type || 'derived';

@@ -356,7 +356,7 @@ function FeatureSummary({ spec, onChanged, locked }: {
   onChanged: () => void;
   locked: boolean;
 }) {
-  type Output = { name: string; source: string; sourceType: 'lookup' | 'on_demand' };
+  type Output = { name: string; source: string; sourceType: 'lookup' | 'on_demand' | 'declarative' };
   const outputs: Output[] = [];
   for (const e of spec.entries) {
     if (e.feature_type === 'lookup') {
@@ -367,6 +367,9 @@ function FeatureSummary({ spec, onChanged, locked }: {
     } else if (e.feature_type === 'on_demand' && e.output_name) {
       const fn = e.function_name?.split('.').pop() || 'function';
       outputs.push({ name: e.output_name, source: fn, sourceType: 'on_demand' });
+    } else if (e.feature_type === 'declarative' && e.declarative_spec) {
+      const ds = e.declarative_spec as any;
+      if (ds.name) outputs.push({ name: ds.name, source: `${ds.function}(${ds.input})`, sourceType: 'declarative' });
     }
   }
 
@@ -459,7 +462,9 @@ function FeatureSummary({ spec, onChanged, locked }: {
                 <td className="px-3 py-1.5">
                   {o.sourceType === 'lookup'
                     ? <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">Lookup</span>
-                    : <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">On-Demand</span>}
+                    : o.sourceType === 'on_demand'
+                      ? <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">On-Demand</span>
+                      : <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded">Declarative</span>}
                 </td>
               </tr>
             );
@@ -537,7 +542,7 @@ function FeatureBuilder({ specId, eolId, eols, entries, onChanged, locked }: {
       return short;
     }
     if (e.feature_type === 'on_demand') return e.output_name || e.function_name?.split('.').pop() || 'untitled';
-    return 'declarative';
+    return (e.declarative_spec as any)?.name || 'declarative';
   };
 
   const typeBadge = (type: string) => {
@@ -679,6 +684,7 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
     outputName: entry?.output_name || '',
     bindings: (entry?.input_bindings || {}) as Record<string, string>,
     // Declarative fields
+    declarative_name: dspec.name || '',
     declarative_input: (entry?.declarative_spec as any)?.input || '',
     declarative_function: (entry?.declarative_spec as any)?.function || '',
     declarative_window_type: (entry?.declarative_spec as any)?.time_window?.type || '',
@@ -686,6 +692,15 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
     declarative_slide_duration: (entry?.declarative_spec as any)?.time_window?.slide_duration || '',
     declarative_filter: (entry?.declarative_spec as any)?.filter_condition || '',
   });
+
+  // Auto-suggest a feature name from function/input/window until the user edits it.
+  const [nameTouched, setNameTouched] = useState<boolean>(!!dspec.name);
+  useEffect(() => {
+    if (featureType !== 'declarative' || nameTouched) return;
+    const suggested = `${form.declarative_function || ''}_${form.declarative_input || ''}_${form.declarative_window_duration || ''}`
+      .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    setForm(f => (f.declarative_name === suggested ? f : { ...f, declarative_name: suggested }));
+  }, [form.declarative_function, form.declarative_input, form.declarative_window_duration, nameTouched, featureType]);
 
   const [catalogs, setCatalogs] = useState<string[]>([]);
   const [schemas, setSchemas] = useState<string[]>([]);
@@ -809,12 +824,15 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
       }
       if (form.selectedLookupKeys.length === 0) { alert('Select at least one entity (group-by) key'); return; }
       if (!form.timestamp_lookup_key) { alert('Select a timestamp column — aggregations require a timeseries column'); return; }
+      const safeName = form.declarative_name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      if (!safeName) { alert('Enter a feature name'); return; }
       const windowSpec: Record<string, any> = { type: form.declarative_window_type, window_duration: form.declarative_window_duration };
       if (form.declarative_window_type === 'sliding' && form.declarative_slide_duration) windowSpec.slide_duration = form.declarative_slide_duration;
       onSave({
         feature_type: 'declarative',
         table_name: `${fullName}.${form.table}`,
         declarative_spec: {
+          name: safeName,
           source_table: `${fullName}.${form.table}`, input: form.declarative_input, function: form.declarative_function,
           time_window: windowSpec, lookup_key: form.selectedLookupKeys.length > 0 ? form.selectedLookupKeys : null,
           timestamp_lookup_key: form.timestamp_lookup_key || null, filter_condition: form.declarative_filter || null,
@@ -964,6 +982,12 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
       {/* Declarative detail */}
       {featureType === 'declarative' && (
         <div className="grid grid-cols-2 gap-3">
+          <div className="col-span-2">
+            <label className="block text-xs font-medium mb-1">Feature Name <span className="text-gray-400">(UC feature + training-table column)</span></label>
+            <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.declarative_name}
+              onChange={e => { setForm({ ...form, declarative_name: e.target.value }); setNameTouched(true); }}
+              placeholder="e.g. sum_amount_30d" disabled={dis} />
+          </div>
           <div>
             <label className="block text-xs font-medium mb-1">Source Table</label>
             <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.table} onChange={e => setForm({ ...form, table: e.target.value })} disabled={dis || !form.schema}>
