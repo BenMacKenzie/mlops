@@ -1,4 +1,3 @@
-# Databricks notebook source
 # Register a model version in Unity Catalog from an MLflow run.
 # Launched by the MLOps app as a Databricks Job.
 

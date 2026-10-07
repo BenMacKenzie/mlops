@@ -1,4 +1,3 @@
-# Databricks notebook source
 # MAGIC %md
 # MAGIC # Materialize Dataset
 # MAGIC App-managed notebook: materializes a training set from an EOL SQL + feature lookups,

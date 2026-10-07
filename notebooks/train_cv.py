@@ -1,4 +1,3 @@
-# Databricks notebook source
 # MAGIC %pip install mlflow catboost
 # MAGIC dbutils.library.restartPython()
 # MAGIC

@@ -1,4 +1,3 @@
-# Databricks notebook source
 # MAGIC %pip install databricks-feature-engineering>=0.18.0 'psycopg[binary]'
 # MAGIC %restart_python
 
