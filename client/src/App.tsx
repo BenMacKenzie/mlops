@@ -653,11 +653,26 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
   const initTable = existingParts[2] || '';
   const initFunction = existingParts[2] || '';
 
+  // EOL entity/timestamp defaults — a declarative aggregation groups by the EOL entity
+  // key(s) and needs a timeseries column; prefill from the EOL but let the user override.
+  const initEol = eols.find((e) => e.id === eolId);
+  const initRawCols: any = initEol?.entity_columns;
+  const initEolColumns: string[] = Array.isArray(initRawCols)
+    ? initRawCols
+    : typeof initRawCols === 'string'
+      ? initRawCols.replace(/^\{|\}$/g, '').split(',').filter(Boolean)
+      : [];
+  const dspec: any = entry?.declarative_spec || {};
+
   const [form, setForm] = useState({
     catalog: initCatalog, schema: initSchema, table: initTable,
     selectedFeatures: (entry?.feature_names || []) as string[],
-    selectedLookupKeys: (entry?.lookup_key || []) as string[],
-    timestamp_lookup_key: entry?.timestamp_lookup_key || '',
+    selectedLookupKeys: (featureType === 'declarative'
+      ? (dspec.lookup_key || initEolColumns)
+      : (entry?.lookup_key || [])) as string[],
+    timestamp_lookup_key: (featureType === 'declarative'
+      ? (dspec.timestamp_lookup_key || initEol?.timestamp_column || '')
+      : (entry?.timestamp_lookup_key || '')),
     default_values: entry?.default_values ? JSON.stringify(entry.default_values) : '',
     // On-demand fields
     selectedFunction: initFunction,
@@ -792,6 +807,8 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
       if (!form.table || !form.declarative_input || !form.declarative_function || !form.declarative_window_type || !form.declarative_window_duration) {
         alert('Fill in all required fields'); return;
       }
+      if (form.selectedLookupKeys.length === 0) { alert('Select at least one entity (group-by) key'); return; }
+      if (!form.timestamp_lookup_key) { alert('Select a timestamp column — aggregations require a timeseries column'); return; }
       const windowSpec: Record<string, any> = { type: form.declarative_window_type, window_duration: form.declarative_window_duration };
       if (form.declarative_window_type === 'sliding' && form.declarative_slide_duration) windowSpec.slide_duration = form.declarative_slide_duration;
       onSave({
@@ -987,6 +1004,28 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
               <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.declarative_slide_duration} onChange={e => setForm({ ...form, declarative_slide_duration: e.target.value })} placeholder="1d" disabled={dis} />
             </div>
           )}
+          <div>
+            <label className="block text-xs font-medium mb-1">Entity / group-by key(s) <span className="text-gray-400">(EOL entity columns)</span></label>
+            <div className="border rounded p-2 space-y-1">
+              {eolColumns.length === 0 && <div className="text-xs text-gray-400">No EOL entity columns</div>}
+              {eolColumns.map(col => (
+                <label key={col} className="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
+                  <input type="checkbox" checked={form.selectedLookupKeys.includes(col)} onChange={() => toggleLookupKey(col)} disabled={dis} />
+                  <span className="font-mono text-xs">{col}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1">Timestamp Column <span className="text-gray-400">(required)</span></label>
+            <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.timestamp_lookup_key} onChange={e => setForm({ ...form, timestamp_lookup_key: e.target.value })} disabled={dis || columns.length === 0}>
+              <option value="">Select...</option>
+              {columns.map(col => <option key={col.name} value={col.name}>{col.name} ({col.type})</option>)}
+              {form.timestamp_lookup_key && !columns.some(c => c.name === form.timestamp_lookup_key) && (
+                <option value={form.timestamp_lookup_key}>{form.timestamp_lookup_key}</option>
+              )}
+            </select>
+          </div>
           <div className="col-span-2">
             <label className="block text-xs font-medium mb-1">Filter Condition</label>
             <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" value={form.declarative_filter} onChange={e => setForm({ ...form, declarative_filter: e.target.value })} placeholder="e.g. amount > 100" disabled={dis} />
