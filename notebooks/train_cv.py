@@ -21,6 +21,9 @@ dbutils.widgets.text("parameters_json", "{}")
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("schema", "")
 dbutils.widgets.text("experiment_name", "")
+# Shared point-in-time column (the EOL/spine observation timestamp). Every declarative
+# feature uses this as its timeseries_column, and it must be a column in the spine.
+dbutils.widgets.text("timeseries_column", "")
 
 # COMMAND ----------
 
@@ -38,6 +41,7 @@ user_params = json.loads(dbutils.widgets.get("parameters_json"))
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 experiment_name = dbutils.widgets.get("experiment_name")
+timeseries_column = dbutils.widgets.get("timeseries_column")
 
 print(f"Task type: {task_type}")
 print(f"EOL SQL: {eol_sql[:200]}...")
@@ -73,48 +77,121 @@ print(f"EOL rows: {eol_df.count()}, columns: {eol_df.columns}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC #### Step 2: Build FeatureLookups → create_training_set
+# MAGIC #### Step 2: Build declarative Features (Feature View API) → create_training_set
+# MAGIC Each entry is one declarative feature:
+# MAGIC - `column_selection`: point-in-time attribute from a (Type-2) table — {source_table, column, entity, name, include}
+# MAGIC - `aggregation`: windowed agg — {source_table, input, function, window{type,window_duration,slide_duration?}, filter_condition?, entity, name, include}
+# MAGIC - `custom_udf`: UC function over upstream features — {function_name, bindings{param: sibling-feature name}, name, include}
+# MAGIC All features share `timeseries_column` (the spine's observation timestamp). `include=false`
+# MAGIC marks a feature that only feeds a custom_udf (not a model column).
 
 # COMMAND ----------
 
-from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup, FeatureFunction
+from datetime import timedelta
+from databricks.feature_engineering import FeatureEngineeringClient
+from databricks.feature_engineering.entities import (
+    DeltaTableSource, ColumnSelection, AggregationFunction,
+    TumblingWindow, SlidingWindow, RollingWindow,
+)
+from databricks.ml_features.entities.data_source import FeatureViewSource
+from databricks.ml_features.entities.transformation import CustomUDF
+from databricks.ml_features.entities.function import AGGREGATION_FUNCTION_BY_SHORTHAND
 
 fe = FeatureEngineeringClient()
 
-features = []
-for entry in feature_entries_raw:
-    if entry["type"] == "on_demand":
-        features.append(FeatureFunction(
-            udf_name=entry["function_name"],
-            input_bindings=entry["input_bindings"],
-            output_name=entry["output_name"],
-        ))
-    else:
-        fl_kwargs = {
-            "table_name": entry["table_name"],
-            "lookup_key": entry["lookup_key"],
-        }
-        if entry.get("feature_names"):
-            fl_kwargs["feature_names"] = entry["feature_names"]
-        if entry.get("timestamp_lookup_key"):
-            fl_kwargs["timestamp_lookup_key"] = entry["timestamp_lookup_key"]
-        features.append(FeatureLookup(**fl_kwargs))
+if not timeseries_column:
+    raise ValueError("timeseries_column (the EOL observation timestamp) is required for the Feature View API")
 
-print(f"Built {len(features)} features (FeatureLookups + FeatureFunctions)")
+def _parse_duration(s):
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("window_duration is empty")
+    if s[-1] == "d":
+        return timedelta(days=int(s[:-1]))
+    if s[-1] == "h":
+        return timedelta(hours=int(s[:-1]))
+    if s[-1] == "m":
+        return timedelta(minutes=int(s[:-1]))
+    return timedelta(days=int(s))
 
-# Exclude entity columns + timestamp lookup keys + user-excluded features from the training data
+def _window(w):
+    dur = _parse_duration(w["window_duration"])
+    kind = w["type"]
+    if kind == "tumbling":
+        return TumblingWindow(window_duration=dur)
+    if kind == "sliding":
+        return SlidingWindow(window_duration=dur, slide_duration=_parse_duration(w["slide_duration"]))
+    if kind == "continuous":
+        return RollingWindow(window_duration=dur)
+    raise ValueError(f"Unknown window type: {kind}")
+
+def _full(name):
+    return f"{catalog}.{schema}.{name}"
+
+def _create(name, **kwargs):
+    """create_feature, idempotent on re-run."""
+    try:
+        return fe.create_feature(catalog_name=catalog, schema_name=schema, name=name, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
+            return fe.get_feature(full_name=_full(name))
+        raise
+
+by_name = {}  # entry name -> Feature
+
+# Pass 1: column_selection + aggregation (independent of each other)
+for e in feature_entries_raw:
+    t = e["type"]
+    if t == "column_selection":
+        src_parts = e["source_table"].split(".")
+        source = DeltaTableSource(
+            catalog_name=src_parts[0] if len(src_parts) == 3 else catalog,
+            schema_name=src_parts[1] if len(src_parts) == 3 else schema,
+            table_name=src_parts[-1],
+        )
+        by_name[e["name"]] = _create(
+            e["name"], source=source, function=ColumnSelection(column=e["column"]),
+            entity=e["entity"], timeseries_column=timeseries_column)
+    elif t == "aggregation":
+        src_parts = e["source_table"].split(".")
+        src_kwargs = dict(catalog_name=src_parts[0] if len(src_parts) == 3 else catalog,
+                          schema_name=src_parts[1] if len(src_parts) == 3 else schema,
+                          table_name=src_parts[-1])
+        if e.get("filter_condition"):
+            src_kwargs["filter_condition"] = e["filter_condition"]
+        op_cls = AGGREGATION_FUNCTION_BY_SHORTHAND.get(e["function"])
+        if op_cls is None:
+            raise ValueError(f"Unsupported aggregation function '{e['function']}'")
+        by_name[e["name"]] = _create(
+            e["name"], source=DeltaTableSource(**src_kwargs),
+            function=AggregationFunction(operator=op_cls(input=e["input"]), time_window=_window(e["window"])),
+            entity=e["entity"], timeseries_column=timeseries_column)
+
+# Pass 2: custom_udf (binds to upstream features created in pass 1)
+for e in feature_entries_raw:
+    if e["type"] != "custom_udf":
+        continue
+    upstreams = [by_name[v] for v in e["bindings"].values()]
+    full_bindings = {param: _full(v) for param, v in e["bindings"].items()}
+    by_name[e["name"]] = _create(
+        e["name"], source=FeatureViewSource(features=upstreams),
+        function=CustomUDF(e["function_name"], input_bindings=full_bindings))
+
+# Model features = those flagged include (default true); input-only upstreams are excluded.
+features = [by_name[e["name"]] for e in feature_entries_raw if e.get("include", True)]
+print(f"Built {len(by_name)} declarative features ({len(features)} included in the model)")
+
+# Exclude entity + the shared timeseries column + user-excluded features from the training frame.
 exclude = list(entity_columns) if entity_columns else []
-for entry in feature_entries_raw:
-    ts_key = entry.get("timestamp_lookup_key")
-    if ts_key and ts_key not in exclude:
-        exclude.append(ts_key)
+if timeseries_column and timeseries_column not in exclude:
+    exclude.append(timeseries_column)
 for col in excluded_features:
     if col not in exclude:
         exclude.append(col)
 
 training_set = fe.create_training_set(
     df=eol_df,
-    feature_lookups=features,
+    features=features,
     label=label_column,
     exclude_columns=exclude,
 )
