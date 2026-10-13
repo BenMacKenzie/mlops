@@ -210,17 +210,11 @@ df = full_df.toPandas().dropna()
 y = df.pop(label_column)
 X = df
 
-cat_features_by_type = [col for col in X.columns if X.dtypes[col] == 'object']
-N = 10
-cat_features_by_distribution = []
-spark_df = full_df
-for col in X.columns:
-    if col in cat_features_by_type:
-        continue
-    if spark_df.select(col).distinct().count() <= N:
-        cat_features_by_distribution.append(col)
-
-cat_features = list(set(cat_features_by_type + cat_features_by_distribution))
+# Categorical = string/object columns only. (We intentionally do NOT flag low-cardinality
+# NUMERIC columns as categorical: the feature store returns a feature's stored type at serving,
+# so a numeric column trained as a CatBoost cat_feature fails inference with
+# "cat_features must be integer or string" when the online value arrives as a float.)
+cat_features = [col for col in X.columns if X.dtypes[col] == 'object']
 print(f"Categorical features: {cat_features}")
 
 # COMMAND ----------

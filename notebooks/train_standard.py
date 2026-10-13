@@ -247,15 +247,9 @@ pdf_eval = eval_df.toPandas().dropna()
 y_eval = pdf_eval.pop(label_column)
 X_eval = pdf_eval
 
-cat_features_by_type = [col for col in X_train.columns if X_train.dtypes[col] == 'object']
-N = 10
-cat_features_by_distribution = []
-for col in X_train.columns:
-    if col in cat_features_by_type:
-        continue
-    if train_df.select(col).distinct().count() <= N:
-        cat_features_by_distribution.append(col)
-cat_features = list(set(cat_features_by_type + cat_features_by_distribution))
+# Categorical = string/object columns only (see train_cv.py: a numeric column trained as a
+# CatBoost cat_feature breaks serving when the feature store returns it as a float).
+cat_features = [col for col in X_train.columns if X_train.dtypes[col] == 'object']
 
 if task_type == "regression":
     base_params = {'loss_function': 'RMSE', 'eval_metric': 'RMSE'}
