@@ -697,6 +697,76 @@ appkit.server.extend((app) => {
     }
   });
 
+  // ── Feature View bridge ──────────────────────────────────────────────
+  // Translate a spec's feature_entry rows (lookup/on_demand/declarative) into the declarative
+  // schema the FV notebooks consume (column_selection / aggregation / custom_udf), so specs built
+  // with the old types work through the Feature View API without a UI change. Every feature shares
+  // the EOL observation timestamp (tsCol). Used by both training (launch) and serving materialization.
+  async function buildFvEntries(req: any, entries: any[], eol: any): Promise<{ featureEntries: any[]; tsCol: string }> {
+    const tsCol: string = eol.timestamp_column;
+    if (!tsCol) {
+      throw new Error(`EOL "${eol.name}" has no timestamp column — the Feature View API needs an observation timestamp (e.g. transaction_ts) selected in the spine.`);
+    }
+    const fname = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
+
+    // Pre-fetch columns + entity for each distinct lookup table (to resolve custom_udf inputs).
+    const lookupTables = new Map<string, { entity: string[]; columns: Set<string> }>();
+    for (const e of entries) {
+      if (e.feature_type === 'lookup' && e.table_name && !lookupTables.has(e.table_name)) {
+        const [cat, sch, tbl] = e.table_name.split('.');
+        let cols: string[] = [];
+        try {
+          const rows = await executeSql(req,
+            `SELECT column_name FROM ${cat}.information_schema.columns WHERE table_schema='${sch}' AND table_name='${tbl}'`);
+          cols = rows.map((r: any) => r.column_name);
+        } catch (err: any) { console.warn(`[bridge] column fetch for ${e.table_name}: ${err.message}`); }
+        lookupTables.set(e.table_name, { entity: e.lookup_key || [], columns: new Set(cols) });
+      }
+    }
+    const findTable = (col: string): { table: string; entity: string[] } | null => {
+      for (const [table, info] of lookupTables) if (info.columns.has(col)) return { table, entity: info.entity };
+      return null;
+    };
+
+    const featureEntries: any[] = [];
+    const colSelByColumn = new Map<string, string>(); // source column -> column_selection feature name
+
+    for (const e of entries) {
+      if (e.feature_type !== 'lookup' || !e.table_name) continue;
+      for (const col of (e.feature_names || [])) {
+        const nm = fname(col);
+        featureEntries.push({ type: 'column_selection', source_table: e.table_name, column: col, entity: e.lookup_key || [], name: nm, include: true });
+        colSelByColumn.set(col, nm);
+      }
+    }
+    for (const e of entries) {
+      if (e.feature_type !== 'declarative' || !e.declarative_spec) continue;
+      const ds = e.declarative_spec;
+      const nm = ds.name || fname(`${ds.function}_${ds.input}_${ds.time_window?.window_duration || ''}`);
+      featureEntries.push({ type: 'aggregation', source_table: ds.source_table, input: ds.input, function: ds.function,
+        window: ds.time_window, filter_condition: ds.filter_condition || null,
+        entity: ds.lookup_key || eol.entity_columns || [], name: nm, include: true });
+    }
+    for (const e of entries) {
+      if (e.feature_type !== 'on_demand' || !e.function_name) continue;
+      const bindings = e.input_bindings || {};
+      const fvBindings: Record<string, string> = {};
+      for (const [param, col] of Object.entries(bindings)) {
+        let up = colSelByColumn.get(col as string);
+        if (!up) {
+          const src = findTable(col as string);
+          if (!src) throw new Error(`custom_udf '${e.function_name}' input column '${col}' is not in any lookup table of this spec`);
+          up = fname(col as string);
+          featureEntries.push({ type: 'column_selection', source_table: src.table, column: col, entity: src.entity, name: up, include: false });
+          colSelByColumn.set(col as string, up);
+        }
+        fvBindings[param] = up;
+      }
+      featureEntries.push({ type: 'custom_udf', function_name: e.function_name, bindings: fvBindings, name: fname(e.output_name || e.function_name.split('.').pop()), include: true });
+    }
+    return { featureEntries, tsCol };
+  }
+
   // Launch a training spec run — single job: materialize + train + fe.log_model()
   app.post('/api/spec-runs/:runId/launch', async (req, res) => {
     try {
@@ -709,75 +779,9 @@ appkit.server.extend((app) => {
       const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
       const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [spec.id])).rows;
 
-      // ── Feature View bridge ──────────────────────────────────────────────
-      // Translate the existing feature_entry rows into the declarative schema the
-      // training notebooks now consume (column_selection / aggregation / custom_udf),
-      // so specs built with the old types train through the Feature View API without
-      // a UI change. Every feature shares the EOL observation timestamp.
-      const tsCol: string = eol.timestamp_column;
-      if (!tsCol) {
-        throw new Error(`EOL "${eol.name}" has no timestamp column — the Feature View API needs an observation timestamp (e.g. transaction_ts) selected in the spine.`);
-      }
-      const fname = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
-
-      // Pre-fetch columns + entity for each distinct lookup table (to resolve custom_udf inputs).
-      const lookupTables = new Map<string, { entity: string[]; columns: Set<string> }>();
-      for (const e of entries) {
-        if (e.feature_type === 'lookup' && e.table_name && !lookupTables.has(e.table_name)) {
-          const [cat, sch, tbl] = e.table_name.split('.');
-          let cols: string[] = [];
-          try {
-            const rows = await executeSql(req,
-              `SELECT column_name FROM ${cat}.information_schema.columns WHERE table_schema='${sch}' AND table_name='${tbl}'`);
-            cols = rows.map((r: any) => r.column_name);
-          } catch (err: any) { console.warn(`[bridge] column fetch for ${e.table_name}: ${err.message}`); }
-          lookupTables.set(e.table_name, { entity: e.lookup_key || [], columns: new Set(cols) });
-        }
-      }
-      const findTable = (col: string): { table: string; entity: string[] } | null => {
-        for (const [table, info] of lookupTables) if (info.columns.has(col)) return { table, entity: info.entity };
-        return null;
-      };
-
-      const featureEntries: any[] = [];
-      const colSelByColumn = new Map<string, string>(); // source column -> column_selection feature name
-
-      // Lookups -> one ColumnSelection per feature column
-      for (const e of entries) {
-        if (e.feature_type !== 'lookup' || !e.table_name) continue;
-        for (const col of (e.feature_names || [])) {
-          const nm = fname(col);
-          featureEntries.push({ type: 'column_selection', source_table: e.table_name, column: col, entity: e.lookup_key || [], name: nm, include: true });
-          colSelByColumn.set(col, nm);
-        }
-      }
-      // Declarative -> aggregation
-      for (const e of entries) {
-        if (e.feature_type !== 'declarative' || !e.declarative_spec) continue;
-        const ds = e.declarative_spec;
-        const nm = ds.name || fname(`${ds.function}_${ds.input}_${ds.time_window?.window_duration || ''}`);
-        featureEntries.push({ type: 'aggregation', source_table: ds.source_table, input: ds.input, function: ds.function,
-          window: ds.time_window, filter_condition: ds.filter_condition || null,
-          entity: ds.lookup_key || eol.entity_columns || [], name: nm, include: true });
-      }
-      // On-demand -> custom_udf, auto-creating input-only ColumnSelection upstreams for bound columns
-      for (const e of entries) {
-        if (e.feature_type !== 'on_demand' || !e.function_name) continue;
-        const bindings = e.input_bindings || {};
-        const fvBindings: Record<string, string> = {};
-        for (const [param, col] of Object.entries(bindings)) {
-          let up = colSelByColumn.get(col as string);
-          if (!up) {
-            const src = findTable(col as string);
-            if (!src) throw new Error(`custom_udf '${e.function_name}' input column '${col}' is not in any lookup table of this spec`);
-            up = fname(col as string);
-            featureEntries.push({ type: 'column_selection', source_table: src.table, column: col, entity: src.entity, name: up, include: false });
-            colSelByColumn.set(col as string, up);
-          }
-          fvBindings[param] = up;
-        }
-        featureEntries.push({ type: 'custom_udf', function_name: e.function_name, bindings: fvBindings, name: fname(e.output_name || e.function_name.split('.').pop()), include: true });
-      }
+      // Translate the spec's feature_entry rows into the Feature View schema (shared by
+      // training and serving-materialization). See buildFvEntries.
+      const { featureEntries, tsCol } = await buildFvEntries(req, entries, eol);
 
       const entityColumns = Array.isArray(eol.entity_columns)
         ? eol.entity_columns
@@ -1835,11 +1839,11 @@ appkit.server.extend((app) => {
   // Run the app-managed materialize_online notebook as a job, wait for it, and return the
   // parsed dbutils.notebook.exit payload ({ status, operation, results }). Throws on failure.
   async function runMaterializeOnline(
-    req: any, jobName: string, params: Record<string, string>,
+    req: any, jobName: string, params: Record<string, string>, notebookFile = 'materialize_online.py',
   ): Promise<{ status: string; operation: string; results: any[] }> {
     const userName = await getUsername(req);
-    const notebookPath = `/Workspace/Users/${userName}/.mlops/materialize_online`;
-    const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'materialize_online.py');
+    const notebookPath = `/Workspace/Users/${userName}/.mlops/${notebookFile.replace(/\.py$/, '')}`;
+    const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', notebookFile);
     await uploadNotebook(req, localNotebook, notebookPath);
 
     const { job_id, run_id, run_url } = await createOrRunJob(req, jobName, notebookPath, params);
@@ -2140,69 +2144,49 @@ appkit.server.extend((app) => {
   });
 
   // Publish all required online tables for a deployment
+  // Materialize the deployment's model features to the ONLINE store so serving can resolve them.
+  // Feature View path: builds the FV feature set from the spec (same bridge as training) and runs
+  // notebooks/materialize_serving.py (ColumnSelection via TableTrigger, Aggregation via CronSchedule,
+  // CustomUDF computed at serve), then grants SELECT to the serving role.
   app.post('/api/deployments/:id/publish-tables', async (req, res) => {
     try {
       const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
       if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
       const dep = depResult.rows[0];
 
-      // Trace: deployment → run → training_spec → feature_entries
-      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id]);
-      const run = runResult.rows[0];
+      // Trace: deployment → run → training_spec → eol → feature_entries
+      const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
       const specId = run.training_spec_id;
-      const entriesResult = specId
-        ? await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 AND table_name IS NOT NULL', [specId])
-        : { rows: [] };
+      if (!specId) { res.status(400).json({ error: 'Run has no training spec' }); return; }
+      const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [specId])).rows[0];
+      const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
+      const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [specId])).rows;
+      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id])).rows[0];
 
-      // Get existing online tables for this project
-      const existingOt = await db.query(
-        'SELECT source_table FROM app.online_table WHERE project_id = $1',
-        [dep.project_id]
-      );
-      const existingTables = new Set(existingOt.rows.map((r: any) => r.source_table));
+      const { featureEntries, tsCol } = await buildFvEntries(req, entries, eol);
 
-      // Publish missing tables using the publish_table notebook
-      const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id]);
-      const project = projResult.rows[0];
-      const userName = await getUsername(req);
-      const notebookPath = `/Workspace/Users/${userName}/.mlops/publish_table`;
-      const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'publish_table.py');
-      await uploadNotebook(req, localNotebook, notebookPath);
+      const out = await runMaterializeOnline(req, `mlops-matserve-${project.name}-${specId}`, {
+        feature_entries_json: JSON.stringify(featureEntries),
+        catalog: project.catalog,
+        schema: project.schema,
+        timeseries_column: tsCol,
+        online_store_name: ONLINE_STORE_NAME,
+        table_prefix: 'mlops_srv_',
+      }, 'materialize_serving.py');
 
-      const onlineStoreName = ONLINE_STORE_NAME; // Lakebase project name
-      let published = 0;
-      const seen = new Set<string>();
-      for (const entry of entriesResult.rows) {
-        const sourceTable = entry.table_name;
-        if (seen.has(sourceTable) || existingTables.has(sourceTable)) continue;
-        seen.add(sourceTable);
-
-        const shortName = sourceTable.split('.').pop();
-        const onlineTableName = `${project.catalog}.${project.schema}.${shortName}_online`;
-
-        // Enable CDF
-        try {
-          await executeSql(req, `ALTER TABLE ${sourceTable} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
-        } catch { /* may already be set */ }
-
-        const params = {
-          online_store_name: onlineStoreName,
-          source_table_name: sourceTable,
-          online_table_name: onlineTableName,
-          publish_mode: 'TRIGGERED',
-        };
-
-        console.log(`[publish-tables] Publishing ${sourceTable} → ${onlineTableName}`);
-        const { run_url } = await createOrRunJob(req, `mlops-publish-${shortName}`, notebookPath, params);
-
-        await db.query(
-          `INSERT INTO app.online_table (project_id, source_table, online_table_name, sync_mode, status, pipeline_id)
-           VALUES ($1,$2,$3,'triggered','PROVISIONING',$4)`,
-          [dep.project_id, sourceTable, onlineTableName, run_url]
-        );
-        published++;
+      // Record the materialized online tables (ONLINE once the pipelines finish the initial load).
+      const onlineTables: string[] = (out as any).online_tables || [];
+      for (const t of onlineTables) {
+        const existing = await db.query('SELECT id FROM app.online_table WHERE project_id=$1 AND online_table_name=$2', [dep.project_id, t]);
+        if (existing.rows.length === 0) {
+          await db.query(
+            `INSERT INTO app.online_table (project_id, source_table, online_table_name, sync_mode, status, pipeline_id)
+             VALUES ($1,$2,$3,'triggered','PROVISIONING',$4)`,
+            [dep.project_id, t, t, (out as any).run_url || null]
+          );
+        }
       }
-      res.json({ published });
+      res.json({ published: onlineTables.length, online_tables: onlineTables, grants: (out as any).grants || [] });
     } catch (e: any) {
       console.error(`[publish-tables] Error: ${e.message}`);
       res.status(500).json({ error: e.message });
