@@ -215,6 +215,9 @@ X = df
 # so a numeric column trained as a CatBoost cat_feature fails inference with
 # "cat_features must be integer or string" when the online value arrives as a float.)
 cat_features = [col for col in X.columns if X.dtypes[col] == 'object']
+# Cast categoricals to string so training matches the serving wrapper (which also stringifies).
+for c in cat_features:
+    X[c] = X[c].astype(str)
 print(f"Categorical features: {cat_features}")
 
 # COMMAND ----------
@@ -285,8 +288,29 @@ print(f"Best iteration: {best_iteration}, Params: {params}")
 
 # MAGIC %md
 # MAGIC #### Step 5: Log model with feature specs
+# MAGIC Wrap the CatBoost model so it reindexes the incoming frame to the training column order
+# MAGIC before predict. The feature store reconstructs the serving frame in a different column
+# MAGIC order than training, and CatBoost resolves cat_features positionally — without this a
+# MAGIC numeric feature lands at a categorical index ("cat_features must be integer or string").
 
 # COMMAND ----------
+
+import mlflow.pyfunc
+
+class ReorderModel(mlflow.pyfunc.PythonModel):
+    def __init__(self, model, feature_order, cat_cols):
+        self.model = model
+        self.feature_order = list(feature_order)
+        self.cat_cols = list(cat_cols)
+    def predict(self, context, model_input, params=None):
+        pdf = model_input.copy()
+        for c in self.feature_order:
+            if c not in pdf.columns:
+                pdf[c] = None
+        pdf = pdf[self.feature_order]
+        for c in self.cat_cols:
+            pdf[c] = pdf[c].astype("string").fillna("")
+        return self.model.predict(pdf)
 
 with mlflow.start_run() as run:
     metrics = scores.iloc[int(best_iteration)].to_dict()
@@ -294,9 +318,9 @@ with mlflow.start_run() as run:
     mlflow.log_params({k: str(v) for k, v in params.items()})
 
     fe.log_model(
-        model=model,
+        model=ReorderModel(model, list(X.columns), cat_features),
         artifact_path="model",
-        flavor=mlflow.catboost,
+        flavor=mlflow.pyfunc,
         training_set=training_set,
         input_example=serving_example,
     )

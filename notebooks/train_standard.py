@@ -250,6 +250,9 @@ X_eval = pdf_eval
 # Categorical = string/object columns only (see train_cv.py: a numeric column trained as a
 # CatBoost cat_feature breaks serving when the feature store returns it as a float).
 cat_features = [col for col in X_train.columns if X_train.dtypes[col] == 'object']
+for c in cat_features:
+    X_train[c] = X_train[c].astype(str)
+    X_eval[c] = X_eval[c].astype(str)
 
 if task_type == "regression":
     base_params = {'loss_function': 'RMSE', 'eval_metric': 'RMSE'}
@@ -298,14 +301,33 @@ else:
 
 print(f"Eval metrics: {eval_metrics}")
 
+# Reindex-by-name wrapper so serving (which reconstructs the frame in a different column order)
+# aligns with CatBoost's positional cat_features. See train_cv.py.
+import mlflow.pyfunc
+
+class ReorderModel(mlflow.pyfunc.PythonModel):
+    def __init__(self, model, feature_order, cat_cols):
+        self.model = model
+        self.feature_order = list(feature_order)
+        self.cat_cols = list(cat_cols)
+    def predict(self, context, model_input, params=None):
+        pdf = model_input.copy()
+        for c in self.feature_order:
+            if c not in pdf.columns:
+                pdf[c] = None
+        pdf = pdf[self.feature_order]
+        for c in self.cat_cols:
+            pdf[c] = pdf[c].astype("string").fillna("")
+        return self.model.predict(pdf)
+
 with mlflow.start_run() as run:
     mlflow.log_metrics(eval_metrics)
     mlflow.log_params({k: str(v) for k, v in params.items()})
 
     fe.log_model(
-        model=model,
+        model=ReorderModel(model, list(X_train.columns), cat_features),
         artifact_path="model",
-        flavor=mlflow.catboost,
+        flavor=mlflow.pyfunc,
         training_set=training_set,
         # Serving input example: spine columns a caller sends (entity/lookup keys + direct
         # features), minus the label. Lookups + on-demand functions are resolved by the endpoint.
