@@ -318,20 +318,37 @@ class ReorderModel(mlflow.pyfunc.PythonModel):
         pdf = pdf[self.feature_order]
         for c in self.cat_cols:
             pdf[c] = pdf[c].astype("string").fillna("")
-        return self.model.predict(pdf)
+        try:
+            return self.model.predict(pdf)
+        except Exception as e:
+            # fe serving wraps this in a RawModelException that swallows the inner cause
+            # (surfaces as "Error ''"). Re-raise with the real error + the frame shape so the
+            # served-model logs show what the online-resolved frame actually looks like.
+            raise RuntimeError(
+                "ReorderModel.predict failed: " + repr(e)
+                + " | feature_order=" + repr(self.feature_order)
+                + " | cat_cols=" + repr(self.cat_cols)
+                + " | input_columns=" + repr(list(model_input.columns))
+                + " | reindexed_columns=" + repr(list(pdf.columns))
+                + " | dtypes=" + repr({c: str(t) for c, t in pdf.dtypes.items()})
+            ) from e
 
 with mlflow.start_run() as run:
     mlflow.log_metrics(eval_metrics)
     mlflow.log_params({k: str(v) for k, v in params.items()})
 
+    # Do NOT pass input_example here. fe.log_model deliberately strips the input schema
+    # from the RAW (inner) model's signature — the feature store feeds it the RESOLVED
+    # feature frame, not the spine. Passing input_example=<spine> makes mlflow.pyfunc.save_model
+    # infer a spine input signature and attach it to the raw model, which then rejects the
+    # resolved frame at serving (RawModelException, swallowed as "Error ''"). The caller-facing
+    # spine schema still comes from the training_set feature spec, and the app's test UI reads
+    # it from the endpoint OpenAPI — so dropping input_example costs nothing.
     fe.log_model(
         model=ReorderModel(model, list(X_train.columns), cat_features),
         artifact_path="model",
         flavor=mlflow.pyfunc,
         training_set=training_set,
-        # Serving input example: spine columns a caller sends (entity/lookup keys + direct
-        # features), minus the label. Lookups + on-demand functions are resolved by the endpoint.
-        input_example=eol_df.drop(label_column).limit(5).toPandas(),
     )
     print(f"Model logged. Run ID: {run.info.run_id}")
 

@@ -1504,7 +1504,7 @@ function RunsTab({ projectId, datasets, runs, reload }: {
                   <td className="px-4 py-3 font-mono text-xs">{formatMetrics(r.eval_metrics || r.training_metrics)}</td>
                   <td className="px-4 py-3 text-xs space-x-2">
                     {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
-                    {r.mlflow_experiment_id && <a href={`${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
+                    {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
                     <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                   </td>
                 </tr>
@@ -1865,7 +1865,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                               <td className="px-3 py-2 font-mono text-xs">{formatMetrics(r.eval_metrics)}</td>
                               <td className="px-3 py-2 text-xs space-x-2">
                                 {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
-                                {r.mlflow_experiment_id && <a href={`${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
+                                {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
                                 <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                               </td>
                             </tr>
