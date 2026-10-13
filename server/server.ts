@@ -709,23 +709,75 @@ appkit.server.extend((app) => {
       const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
       const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [spec.id])).rows;
 
-      const featureEntries = entries.map((e: any) => {
-        if (e.feature_type === 'on_demand') {
-          return {
-            type: 'on_demand',
-            function_name: e.function_name,
-            input_bindings: e.input_bindings,
-            output_name: e.output_name,
-          };
+      // ── Feature View bridge ──────────────────────────────────────────────
+      // Translate the existing feature_entry rows into the declarative schema the
+      // training notebooks now consume (column_selection / aggregation / custom_udf),
+      // so specs built with the old types train through the Feature View API without
+      // a UI change. Every feature shares the EOL observation timestamp.
+      const tsCol: string = eol.timestamp_column;
+      if (!tsCol) {
+        throw new Error(`EOL "${eol.name}" has no timestamp column — the Feature View API needs an observation timestamp (e.g. transaction_ts) selected in the spine.`);
+      }
+      const fname = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
+
+      // Pre-fetch columns + entity for each distinct lookup table (to resolve custom_udf inputs).
+      const lookupTables = new Map<string, { entity: string[]; columns: Set<string> }>();
+      for (const e of entries) {
+        if (e.feature_type === 'lookup' && e.table_name && !lookupTables.has(e.table_name)) {
+          const [cat, sch, tbl] = e.table_name.split('.');
+          let cols: string[] = [];
+          try {
+            const rows = await executeSql(req,
+              `SELECT column_name FROM ${cat}.information_schema.columns WHERE table_schema='${sch}' AND table_name='${tbl}'`);
+            cols = rows.map((r: any) => r.column_name);
+          } catch (err: any) { console.warn(`[bridge] column fetch for ${e.table_name}: ${err.message}`); }
+          lookupTables.set(e.table_name, { entity: e.lookup_key || [], columns: new Set(cols) });
         }
-        return {
-          type: 'lookup',
-          table_name: e.table_name,
-          feature_names: e.feature_names,
-          lookup_key: e.lookup_key,
-          timestamp_lookup_key: e.timestamp_lookup_key || null,
-        };
-      }).filter((e: any) => e.type === 'lookup' || e.type === 'on_demand');
+      }
+      const findTable = (col: string): { table: string; entity: string[] } | null => {
+        for (const [table, info] of lookupTables) if (info.columns.has(col)) return { table, entity: info.entity };
+        return null;
+      };
+
+      const featureEntries: any[] = [];
+      const colSelByColumn = new Map<string, string>(); // source column -> column_selection feature name
+
+      // Lookups -> one ColumnSelection per feature column
+      for (const e of entries) {
+        if (e.feature_type !== 'lookup' || !e.table_name) continue;
+        for (const col of (e.feature_names || [])) {
+          const nm = fname(col);
+          featureEntries.push({ type: 'column_selection', source_table: e.table_name, column: col, entity: e.lookup_key || [], name: nm, include: true });
+          colSelByColumn.set(col, nm);
+        }
+      }
+      // Declarative -> aggregation
+      for (const e of entries) {
+        if (e.feature_type !== 'declarative' || !e.declarative_spec) continue;
+        const ds = e.declarative_spec;
+        const nm = ds.name || fname(`${ds.function}_${ds.input}_${ds.time_window?.window_duration || ''}`);
+        featureEntries.push({ type: 'aggregation', source_table: ds.source_table, input: ds.input, function: ds.function,
+          window: ds.time_window, filter_condition: ds.filter_condition || null,
+          entity: ds.lookup_key || eol.entity_columns || [], name: nm, include: true });
+      }
+      // On-demand -> custom_udf, auto-creating input-only ColumnSelection upstreams for bound columns
+      for (const e of entries) {
+        if (e.feature_type !== 'on_demand' || !e.function_name) continue;
+        const bindings = e.input_bindings || {};
+        const fvBindings: Record<string, string> = {};
+        for (const [param, col] of Object.entries(bindings)) {
+          let up = colSelByColumn.get(col as string);
+          if (!up) {
+            const src = findTable(col as string);
+            if (!src) throw new Error(`custom_udf '${e.function_name}' input column '${col}' is not in any lookup table of this spec`);
+            up = fname(col as string);
+            featureEntries.push({ type: 'column_selection', source_table: src.table, column: col, entity: src.entity, name: up, include: false });
+            colSelByColumn.set(col as string, up);
+          }
+          fvBindings[param] = up;
+        }
+        featureEntries.push({ type: 'custom_udf', function_name: e.function_name, bindings: fvBindings, name: fname(e.output_name || e.function_name.split('.').pop()), include: true });
+      }
 
       const entityColumns = Array.isArray(eol.entity_columns)
         ? eol.entity_columns
@@ -765,6 +817,7 @@ appkit.server.extend((app) => {
         catalog: project.catalog,
         schema: project.schema,
         experiment_name: experimentName,
+        timeseries_column: tsCol,
       };
 
       // Add split params for standard/hpsearch
