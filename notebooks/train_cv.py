@@ -24,6 +24,8 @@ dbutils.widgets.text("experiment_name", "")
 # Shared point-in-time column (the EOL/spine observation timestamp). Every declarative
 # feature uses this as its timeseries_column, and it must be a column in the spine.
 dbutils.widgets.text("timeseries_column", "")
+# Unique, timestamped UC table to persist the resolved training set for reproducibility.
+dbutils.widgets.text("training_table_name", "")
 
 # COMMAND ----------
 
@@ -42,6 +44,7 @@ catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 experiment_name = dbutils.widgets.get("experiment_name")
 timeseries_column = dbutils.widgets.get("timeseries_column")
+training_table_name = dbutils.widgets.get("training_table_name")
 
 print(f"Task type: {task_type}")
 print(f"EOL SQL: {eol_sql[:200]}...")
@@ -199,6 +202,13 @@ training_set = fe.create_training_set(
 full_df = training_set.load_df()
 print(f"Training set: {full_df.count()} rows, {len(full_df.columns)} columns: {full_df.columns}")
 
+# Persist the resolved training set to a unique UC table so this exact model can be reproduced.
+if training_table_name:
+    spark.sql(f"USE CATALOG {catalog}")
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+    full_df.write.mode("overwrite").saveAsTable(training_table_name)
+    print(f"Materialized training set → {training_table_name}")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -352,4 +362,5 @@ dbutils.notebook.exit(json.dumps({
     "status": "SUCCESS",
     "mlflow_run_id": run.info.run_id,
     "metrics": metrics,
+    "training_table": training_table_name,
 }))

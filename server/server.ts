@@ -804,11 +804,14 @@ appkit.server.extend((app) => {
       const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', notebookFile);
       await uploadNotebook(req, localNotebook, notebookPath);
 
-      // Build table names for standard/hpsearch splits
+      // Build UNIQUE, timestamped table names so each run's resolved training set is preserved
+      // (never overwritten) and the exact model can be reproduced later. Applies to every split
+      // strategy, including 'none' (CV) — which previously materialized nothing.
       const specSlug = spec.name.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
-      const trainingTableName = `${project.catalog}.${project.schema}.${specSlug}_train`;
-      const evalTableName = spec.split_strategy !== 'none' ? `${project.catalog}.${project.schema}.${specSlug}_eval` : '';
-      const testTableName = spec.split_strategy === 'train_eval_test' ? `${project.catalog}.${project.schema}.${specSlug}_test` : '';
+      const tableTs = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14); // YYYYMMDDHHMMSS
+      const trainingTableName = `${project.catalog}.${project.schema}.${specSlug}_train_${tableTs}`;
+      const evalTableName = spec.split_strategy !== 'none' ? `${project.catalog}.${project.schema}.${specSlug}_eval_${tableTs}` : '';
+      const testTableName = spec.split_strategy === 'train_eval_test' ? `${project.catalog}.${project.schema}.${specSlug}_test_${tableTs}` : '';
 
       const params: Record<string, string> = {
         eol_sql: eol.sql_definition,
@@ -822,13 +825,14 @@ appkit.server.extend((app) => {
         schema: project.schema,
         experiment_name: experimentName,
         timeseries_column: tsCol,
+        // Materialize the resolved training set on every run (all notebooks write this table).
+        training_table_name: trainingTableName,
       };
 
       // Add split params for standard/hpsearch
       if (spec.split_strategy !== 'none') {
         params.split_method = spec.split_method || 'random';
         params.split_config_json = JSON.stringify(spec.split_config || { eval_pct: 20, seed: 42 });
-        params.training_table_name = trainingTableName;
         params.eval_table_name = evalTableName;
         if (testTableName) params.test_table_name = testTableName;
       }

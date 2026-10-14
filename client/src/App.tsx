@@ -1505,6 +1505,7 @@ function RunsTab({ projectId, datasets, runs, reload }: {
                   <td className="px-4 py-3 text-xs space-x-2">
                     {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
                     {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
+                    {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Data</a>}
                     <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                   </td>
                 </tr>
@@ -1866,6 +1867,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                               <td className="px-3 py-2 text-xs space-x-2">
                                 {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
                                 {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
+                                {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Data</a>}
                                 <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                               </td>
                             </tr>
@@ -1901,15 +1903,20 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
     api.getDeploymentSchema(dep.id).then(setSchema).catch(() => setSchema(null));
   }, [dep.id]);
 
-  // The caller only provides the model's REQUIRED inputs — the spine columns: entity
-  // keys + request-time/pass-through features (amount, pos_entry_mode, security_code).
-  // The optional inputs are FeatureLookup features resolved automatically from the
-  // online store, so the form never asks for them. Fall back to entity keys / sample
-  // shape only if the schema endpoint is unavailable.
-  const inputCols = schema?.required?.length
-    ? schema.required
+  // Every property in the endpoint's request schema is a CALLER-supplied input (the spine:
+  // entity/lookup keys + request-time pass-through columns like amount, pos_entry_mode,
+  // security_code, transaction_ts). FeatureLookup / aggregation / on-demand features are
+  // resolved server-side from the online store and do NOT appear in the request schema at
+  // all — so there is nothing in `optional` that comes "from the online store". `required`
+  // must be filled by the caller; `optional` columns are also caller-supplied but may be
+  // omitted. Fall back to sample / entity shape only if the schema endpoint is unavailable.
+  const requiredCols = schema?.required ?? [];
+  const optionalCols = schema?.optional ?? [];
+  const inputCols = (requiredCols.length || optionalCols.length)
+    ? [...requiredCols, ...optionalCols]
     : (samples.length > 0 ? Object.keys(samples[0]) : entityColumns);
-  const lookedUp = schema?.optional ?? [];
+  // When the schema is unavailable, require everything we render; otherwise only `required`.
+  const mustFill = requiredCols.length ? requiredCols : inputCols;
 
   const selectSample = (sample: Record<string, any>) => {
     const newInputs: Record<string, string> = {};
@@ -1923,6 +1930,8 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
       const record: Record<string, any> = {};
       for (const col of inputCols) {
         const v = inputs[col] ?? '';
+        // Omit empty optional inputs (don't send "" for a pass-through the caller left blank).
+        if (!mustFill.includes(col) && v === '') continue;
         // Coerce by the declared schema type; leave as string when type unknown.
         const t = schema?.types?.[col];
         record[col] = (t === 'number' || t === 'integer') && v !== '' && !isNaN(Number(v)) ? Number(v) : v;
@@ -1961,6 +1970,7 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
           <div key={col}>
             <label className="block text-xs text-gray-500 mb-1">
               {col}{schema?.types?.[col] ? <span className="text-gray-400"> ({schema.types[col]})</span> : null}
+              {!mustFill.includes(col) ? <span className="text-gray-400"> · optional</span> : null}
             </label>
             <input
               className="px-3 py-1.5 border rounded font-mono text-sm w-40"
@@ -1972,15 +1982,14 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
         ))}
         <button
           onClick={send}
-          disabled={loading || inputCols.length === 0 || inputCols.some(c => !inputs[c])}
+          disabled={loading || inputCols.length === 0 || mustFill.some(c => !inputs[c])}
           className="px-4 py-1.5 bg-purple-600 text-white text-sm rounded hover:bg-purple-700 disabled:bg-gray-300"
         >{loading ? 'Sending...' : 'Send'}</button>
       </div>
-      {lookedUp.length > 0 && (
-        <p className="text-xs text-gray-400 mb-2">
-          Auto-resolved from online store: {lookedUp.join(', ')}
-        </p>
-      )}
+      <p className="text-xs text-gray-400 mb-2">
+        All fields above are supplied by the calling system. FeatureLookup and aggregation
+        features are resolved automatically from the online store and are not request inputs.
+      </p>
       {(result || error) && (
         <pre className="px-3 py-2 border rounded font-mono text-xs overflow-auto bg-gray-50 whitespace-pre-wrap max-h-32">
           {error ? <span className="text-red-500">{error}</span> : JSON.stringify(result, null, 2)}
