@@ -1371,6 +1371,7 @@ function RunsTab({ projectId, datasets, runs, reload }: {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ dataset_id: '', parameters: '' });
   const [registerError, setRegisterError] = useState('');
+  const [registeringId, setRegisteringId] = useState<number | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Poll for status on RUNNING runs
@@ -1485,27 +1486,31 @@ function RunsTab({ projectId, datasets, runs, reload }: {
                     {r.error_message && <div className="text-xs text-red-500 mt-1">{r.error_message}</div>}
                   </td>
                   <td className="px-4 py-3 font-mono text-xs">
-                    {r.model_name ? (
+                    {r.model_name && r.model_version ? (
                       <a
-                        href={`${host}/explore/data/models/${r.model_name.replace(/\./g, '/')}${r.model_version ? `/version/${r.model_version}` : ''}`}
+                        href={`${host}/explore/data/models/${r.model_name.replace(/\./g, '/')}/version/${r.model_version}`}
                         target="_blank" rel="noopener noreferrer"
                         className="text-blue-600 hover:underline"
                       >{r.model_name.split('.').pop()} v{r.model_version}</a>
                     ) : r.status === 'SUCCESS' ? (
                       <button
-                        className="px-2 py-1 bg-purple-600 text-white text-xs rounded hover:bg-purple-700"
-                        onClick={() => {
+                        className="px-2 py-1 bg-purple-600 text-white text-xs rounded hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                        disabled={registeringId === r.id}
+                        onClick={async () => {
                           setRegisterError('');
-                          api.registerModel(r.id).then(reload).catch((e) => setRegisterError(e.message));
+                          setRegisteringId(r.id);
+                          try { await api.registerModel(r.id); await reload(); }
+                          catch (e: any) { setRegisterError(e.message); }
+                          finally { setRegisteringId(null); }
                         }}
-                      >Register</button>
+                      >{registeringId === r.id ? 'Registering…' : 'Register'}</button>
                     ) : '-'}
                   </td>
                   <td className="px-4 py-3 font-mono text-xs">{formatMetrics(r.eval_metrics || r.training_metrics)}</td>
                   <td className="px-4 py-3 text-xs space-x-2">
                     {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
                     {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
-                    {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Data</a>}
+                    {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Training set</a>}
                     <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                   </td>
                 </tr>
@@ -1534,6 +1539,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [eolExpandedFor, setEolExpandedFor] = useState<number | null>(null);
   const [registerError, setRegisterError] = useState('');
+  const [registeringId, setRegisteringId] = useState<number | null>(null);
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1635,10 +1641,12 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
 
   const registerModel = async (runId: number) => {
     setRegisterError('');
+    setRegisteringId(runId);
     try {
       await api.registerModel(runId);
-      reload();
+      await reload();
     } catch (e: any) { setRegisterError(e.message); }
+    finally { setRegisteringId(null); }
   };
 
   const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
@@ -1855,19 +1863,23 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                                 {r.error_message && <div className="text-xs text-red-500 mt-1">{r.error_message}</div>}
                               </td>
                               <td className="px-3 py-2 font-mono text-xs">
-                                {r.model_name ? (
-                                  <a href={`${host}/explore/data/models/${r.model_name.replace(/\./g, '/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                                {r.model_name && r.model_version ? (
+                                  <a href={`${host}/explore/data/models/${r.model_name.replace(/\./g, '/')}/version/${r.model_version}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
                                     {r.model_name.split('.').pop()} v{r.model_version}
                                   </a>
                                 ) : r.status === 'SUCCESS' ? (
-                                  <button className="px-2 py-1 bg-purple-600 text-white text-xs rounded hover:bg-purple-700" onClick={() => registerModel(r.id)}>Register</button>
+                                  <button
+                                    className="px-2 py-1 bg-purple-600 text-white text-xs rounded hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                                    disabled={registeringId === r.id}
+                                    onClick={() => registerModel(r.id)}
+                                  >{registeringId === r.id ? 'Registering…' : 'Register'}</button>
                                 ) : '-'}
                               </td>
                               <td className="px-3 py-2 font-mono text-xs">{formatMetrics(r.eval_metrics)}</td>
                               <td className="px-3 py-2 text-xs space-x-2">
                                 {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
                                 {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
-                                {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Data</a>}
+                                {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Training set</a>}
                                 <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                               </td>
                             </tr>
