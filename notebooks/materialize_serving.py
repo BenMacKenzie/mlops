@@ -12,7 +12,7 @@
 # MAGIC   - Aggregation features → offline + online, CronSchedule (different trigger → separate call)
 # MAGIC   - CustomUDF features are computed at serving from their upstreams — not materialized.
 # MAGIC Then grants SELECT on each online table to PUBLIC (serving role). Mirrors notebooks/train_cv.py
-# MAGIC feature-building + notebooks/publish_table.py grant.
+# MAGIC feature-building, then grants via psycopg to the online store.
 
 # COMMAND ----------
 

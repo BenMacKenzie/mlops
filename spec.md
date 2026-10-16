@@ -1,7 +1,7 @@
 # MLOps Model Manager
 
 **Created:** 2026-04-11
-**Status:** Deployed to Databricks Apps + end-to-end verified (2026-09-30) on fe-vm-serverless-stable-77rg2n
+**Status:** Deployed to Databricks Apps + end-to-end verified (2026-09-30) on fe-vm-serverless-stable-77rg2n. Migrated to the Feature View API for training + serving (2026-10-13); legacy dataset/publish paths removed (2026-10-16).
 **Workspace:** https://fevm-serverless-stable-77rg2n.cloud.databricks.com
 **Default Catalog:** serverless_stable_77rg2n_catalog (user-configurable per project)
 **Lakebase Project:** mlops (app state + online store)
@@ -18,7 +18,7 @@ The app should let a user:
 1. Define a **project** with a catalog/schema for ML assets
 2. Define an **EOL** (entity/observation/label) — the SQL "spine" for training data
 3. Create a **training spec** — features, split strategy, task type, and parameters — all in one place
-4. **Run** training — a single job that materializes the dataset, trains the model, and logs with feature specs via `fe.log_model()`
+4. **Run** training — a single job that builds Feature View features, resolves + persists the training set, trains the model, and logs with feature specs via `fe.log_model()`
 5. **Register** models to Unity Catalog and **deploy** to serving endpoints with auto feature lookup
 
 ## Architecture
@@ -29,7 +29,7 @@ The app should let a user:
 │  ┌────────────┐  ┌──────────────────────────────┐   │
 │  │  Express    │  │  React Frontend (Vite)       │   │
 │  │  Backend    │  │  - Project management         │   │
-│  │  (API)      │  │  - Dataset builder            │   │
+│  │  (API)      │  │  - Training spec builder      │   │
 │  │             │  │  - Training dashboard          │   │
 │  │  Plugins:   │  │  - MLflow experiment viewer    │   │
 │  │  - lakebase │  │  - Model registry browser      │   │
@@ -44,8 +44,8 @@ The app should let a user:
 │  (mlops)         │  │                  │  │                  │
 │  - projects      │  │  - Feature tables│  │  - Experiments   │
 │  - training specs│  │  - Models        │  │  - Runs          │
-│  - runs          │  │  - Synced tables │  │  - Model Registry│
-│  - synced tables │  │                  │  │                  │
+│  - runs          │  │  - Features      │  │  - Model Registry│
+│  - online tables │  │  - Online tables │  │                  │
 │  - deployments   │  │                  │  │                  │
 └─────────────────┘  └──────────────────┘  └──────────────────┘
           │                    │                      │
@@ -54,8 +54,8 @@ The app should let a user:
 ┌──────────────────┐  ┌──────────────────────────────┐
 │  Databricks Jobs │  │  Databricks Model Serving    │
 │  - Train         │  │  - Auto feature lookup       │
-│  (materialize +  │  │    (from synced tables)       │
-│   train + log)   │  │                               │
+│  - Materialize   │  │    (from online tables)       │
+│    (online)      │  │                               │
 └──────────────────┘  └──────────────────────────────┘
 ```
 
@@ -67,11 +67,11 @@ The app should let a user:
 | Backend | Express (via AppKit) |
 | App Framework | `@databricks/appkit` with lakebase + analytics plugins |
 | OLTP Store | Lakebase (Postgres) — instance: `mlops` |
-| Feature Tables | Unity Catalog (Databricks Feature Engineering) |
+| Features | Unity Catalog Feature Views (`databricks-feature-engineering>=0.18`: `ColumnSelection`, `AggregationFunction`, `CustomUDF`) |
 | Experiment Tracking | MLflow (via Databricks workspace) |
 | Model Registry | Unity Catalog Model Registry |
-| Compute | Databricks Jobs (app-managed notebooks: train, register) |
-| Online Feature Store | Lakebase Synced Tables (synced from UC feature tables) |
+| Compute | Databricks Jobs (app-managed notebooks: train, register, materialize online) |
+| Online Feature Store | Lakebase online store `mlops`, populated by `fe.materialize_features` (managed pipelines) |
 | Serving | Databricks Model Serving endpoints (with auto feature lookup) |
 | Auth | AppKit dual-identity (service principal + user OBO) |
 
@@ -185,19 +185,22 @@ A single end-to-end execution: materialize dataset → train model → log with 
 | ended_at | TIMESTAMP | |
 
 #### `app.online_table`
-Tracks feature tables published to the Lakebase online store for serving. Project-level — shared across all deployments. (UI labels these "Synced Tables".)
+Tracks online-store tables created by a deployment's **Publish Tables** (`materialize_serving.py`). Project-level; a table can be shared by several deployments (see `deployment.serving_tables`).
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | BIGSERIAL PK | |
 | project_id | BIGINT FK → project | |
-| source_table | VARCHAR(255) | Fully-qualified UC table name |
-| online_table_name | VARCHAR(255) | Destination UC name (`{catalog}.{schema}.{name}_online`) |
+| source_table | VARCHAR(255) | Same as `online_table_name` for materialized tables (legacy rows: the published source table) |
+| online_table_name | VARCHAR(255) | e.g. `{catalog}.{schema}.mlops_srv_cs__xxxx` (ColumnSelections by entity) / `mlops_srv_aggon__xxxx` (aggregations) |
 | status | VARCHAR(50) | `'PROVISIONING'`, `'ONLINE'`, `'OFFLINE'` — reconciled by `check-status` |
-| pipeline_id | VARCHAR(255) | Lakebase sync pipeline URL |
+| pipeline_id | VARCHAR(255) | URL of the materialize job run |
+
+#### `app.materialized_feature`
+One Online Features tab materialization per declarative feature entry (schedule + live pipeline state). Its own tables use prefix `mlops_feat_`; operations never touch the serving path's `mlops_srv_*` materializations of a same-named feature.
 
 #### `app.deployment`
-Links a registered model version to a serving endpoint. All feature tables from the model's training spec must be synced before the endpoint can be created.
+Links a registered model version to a serving endpoint. **Publish Tables** must have run and every table in `serving_tables` must be ONLINE before the endpoint can be created.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -208,6 +211,7 @@ Links a registered model version to a serving endpoint. All feature tables from 
 | endpoint_name | VARCHAR(255) | Serving endpoint name |
 | endpoint_status | VARCHAR(50) | `'NOT_CREATED'`, `'CREATING'`, `'READY'`, `'FAILED'` |
 | endpoint_config | JSONB | Instance type, scaling, etc. |
+| serving_tables | TEXT[] | Online tables the model resolves features from; written by Publish Tables (NULL = not yet published) |
 | created_at | TIMESTAMP | |
 
 ### Entity Relationship Summary
@@ -217,6 +221,7 @@ project 1──* entity_observation_label
 project 1──* training_spec
 project 1──* run
 project 1──* online_table
+project 1──* materialized_feature
 project 1──* deployment
 
 entity_observation_label 1──* training_spec
@@ -234,7 +239,7 @@ run 1──* deployment
 
 ### 2. Project Detail
 - Overview: catalog/schema, model name, summary counts
-- Tabs: **EOL**, **Training**, **Deployment**
+- Tabs: **Overview**, **EOLs**, **Training**, **Online Features**, **Deployment**
 
 ### 3. EOL Builder (within project)
 - Write SQL definition for the entity/observation/label "spine"
@@ -284,7 +289,7 @@ Adapts to the selected entry's type. Catalog and schema **default to the most re
    - **Columns from any lookup entry** in the spec (grouped by source table)
    - **EOL columns** (entity keys, timestamp, label)
 4. Output column name
-5. At serving time, the endpoint resolves lookup features first, then passes bound values to the UC function. On-demand outputs do **not** require synced tables.
+5. Bridged to a Feature View `CustomUDF` whose upstreams are input-only `ColumnSelection` features for each bound column. At serving time the endpoint resolves the upstreams from the online store and computes the UDF; the UDF output itself is not materialized.
 
 *Declarative detail (beta):*
 1. Source table (catalog/schema/table cascade), input column, function, time window
@@ -299,10 +304,11 @@ Adapts to the selected entry's type. Catalog and schema **default to the most re
 **Running:**
 - Click **Run** on a training spec → launches a single Databricks Job that:
   1. Executes EOL SQL → spine DataFrame
-  2. Builds `FeatureLookup` objects (from lookup entries) + `FeatureFunction` objects (from on-demand entries) → `fe.create_training_set()` → `load_df()`
-  3. Splits per strategy/method
-  4. Trains model (CatBoost, configured by task_type + parameters)
-  5. Logs with `fe.log_model()` (embeds feature specs — both lookups and on-demand functions — for serving)
+  2. Builds declarative Feature View features from the spec's entries (the server's `buildFvEntries` bridge: lookup → one `ColumnSelection` per column, declarative → `AggregationFunction`, on-demand → `CustomUDF` over input-only `ColumnSelection` upstreams) → `fe.create_training_set(features=[...])` → `load_df()`
+  3. Persists the resolved training set to a unique timestamped table (`{spec}_train_{YYYYMMDDHHMMSS}`) for reproducibility
+  4. Splits per strategy/method
+  5. Trains model (CatBoost, configured by task_type + parameters; only string columns are categorical)
+  6. Logs with `fe.log_model()` (embeds the feature spec for serving; **no `input_example`** — it would attach a spine signature to the raw model and break online inference)
 - View runs with status, metrics, job/MLflow links
 - **Register model:** One-click registration via app-managed notebook (`register_model.py`)
 - Auto-polls running jobs every 10s
@@ -324,41 +330,53 @@ Server endpoints for UC metadata:
 - `GET /api/uc/function-params?catalog=X&schema=Y&function=Z` — get function parameter names and types (from `information_schema.parameters`)
 - `PUT /api/training-spec-entries/:id` — update an existing entry (blocked if spec has runs)
 
-### 5. Deployment (within project)
+### 5. Online Features (within project)
 
-Manages synced tables (online feature store) and serving endpoints.
+Schedules Databricks-managed online materialization of a spec's **declarative** features via
+`fe.materialize_features` (`materialize_online.py`): derived cadence, custom Quartz cron, or on-table-change;
+pause / resume / refresh / remove. Its tables use prefix `mlops_feat_`. Remove deletes only this tab's
+materializations (offline first — that cascades to the online one) and drops the UC feature only if nothing
+else (e.g. a deployment's serving pipeline) still materializes it.
 
-Since training notebooks use `fe.log_model()`, models have feature specs embedded. Databricks serving endpoints automatically resolve feature lookups from synced tables at inference time. On-demand features (`FeatureFunction`) are computed at inference time by calling the UC function — they do **not** require synced tables. If the requesting system supplies a feature in the request payload, it is used instead of the lookup — built-in Databricks behavior.
+### 6. Deployment (within project)
+
+Manages the online tables a model serves from and its serving endpoint.
+
+Training logs models with `fe.log_model()` over Feature View features, so the feature spec is embedded and the
+serving endpoint resolves features from the online store at inference time. The caller sends only the spine
+(entity keys + observation timestamp + pass-through columns); `CustomUDF` features (e.g. `distance`) are
+computed at serving from their upstream features.
 
 **Two sections in the tab:**
 
-1. **Synced Tables** (project-level) — all distinct source tables from **lookup** feature entries across all training specs. On-demand entries are excluded (they don't need online tables). Shows sync status, pipeline link, and which training specs reference each table. When a deployment is selected, highlights tables required by that model.
+1. **Online Tables** (project-level) — every `app.online_table` row, its status, job link, and which
+   deployments use it (from `deployment.serving_tables`). Selecting a deployment highlights its tables.
+   **Remove** only stops tracking the row; it does not drop the table or its pipeline.
 2. **Deployments** — each links a registered model to a serving endpoint.
 
 **Creating a deployment:**
 1. Give it a name (e.g. `production`)
 2. Select a registered model version from dropdown
-3. All required **lookup** feature tables must be synced (ONLINE) before endpoint creation. On-demand features are ready automatically (the UC function just needs to exist and be accessible).
-4. Link to Databricks endpoint UI for management (stop/start)
+3. Click **Publish Tables** — runs `materialize_serving.py` on the spec's feature set:
+   - `ColumnSelection` features → online only, `TableTrigger` (features sharing an entity co-locate in one table, `mlops_srv_cs__*`)
+   - Aggregations → offline + online, `CronSchedule` (`mlops_srv_aggoff__*` / `mlops_srv_aggon__*`)
+   - `CustomUDF` → not materialized
+   - Waits for each online table's pipeline to create it, then grants USAGE + SELECT to `PUBLIC` (serving role) via psycopg.
+   - Records the online tables in `deployment.serving_tables`. Idempotent — re-running reports existing tables.
+4. **Create Endpoint** appears once every serving table is ONLINE. First provisioning is slow (~20–25 min, feature-serving sidecar).
+5. Link to Databricks endpoint UI for management (stop/start)
 
-**Syncing tables:**
-- One-click publish via the `publish_table.py` notebook, which calls
-  `FeatureEngineeringClient.publish_table()` against the `mlops` online store
-  (auto-creates the store on first use). Tracked in `app.online_table`.
-- Source feature table must have a **PRIMARY KEY** (feature lookup + online publish require it)
-- CDF auto-enabled on source tables before publish
-- Naming: `{project_catalog}.{project_schema}.{short_name}_online`
-- "Sync All Required" button per deployment
-- **Feature-table integer columns must be `BIGINT` (or `DOUBLE`), not `INT`.** Spark `INT` yields an
-  int32 model signature, but the online-store lookup returns int64 at serving time and MLflow rejects
-  the int64→int32 narrowing. Use `BIGINT`/`DOUBLE` so the signature is int64.
+**Gotchas:**
+- Every feature source table needs a timestamp column with the **same name as the spine's observation timestamp** (the point-in-time join key); Type-1 dimension tables were converted to SCD2 with `transaction_ts`.
+- Feature-table integer columns must be `BIGINT`/`DOUBLE`, not `INT` (online lookup returns int64; MLflow rejects int64→int32).
+- Endpoints created via local dev (as the user) aren't on the app SP's ACL — grant the SP CAN_MANAGE or the deployed app shows them FAILED.
 
 **Test interface (schema-driven, dynamic to the model signature):**
 - Reads the endpoint's OpenAPI (`GET /api/deployments/:id/schema`) and renders one input
-  per **required** model input — the request-time values the calling system supplies
-  (entity keys + any pass-through/direct features like `amount`, `pos_entry_mode`,
-  `security_code`). FeatureLookup features are shown as "auto-resolved from online store"
-  and never requested. Adapts automatically to whatever model/version the endpoint serves.
+  per caller-supplied input from the request schema — required ones (entity keys) plus optional
+  spine columns (`transaction_ts`, `amount`, `pos_entry_mode`, `security_code`), marked optional.
+  Resolved features never appear in the request schema and are not asked for. Adapts automatically
+  to whatever model/version the endpoint serves.
 - Sample records (from the EOL spine, minus label — `GET /api/deployments/:id/samples`)
   prefill the required fields on click.
 - Values are coerced to their declared types, then sent as `{"dataframe_records": [{...}]}`.
@@ -380,12 +398,12 @@ The app interacts with MLflow via the Databricks REST API (from the Express back
 | Get endpoint status | `GET /api/2.0/serving-endpoints/{name}` | Poll for readiness |
 | Query endpoint | `POST /serving-endpoints/{name}/invocations` | Test inference; caller supplies the required request-time inputs (entity keys + pass-through features), lookups auto-resolved |
 | Get serving input schema | `GET /api/2.0/serving-endpoints/{name}/openapi` | Drives the dynamic test form: `required` = caller-provided inputs, the rest = looked-up features |
-| Publish feature table online | `FeatureEngineeringClient.publish_table()` (in `publish_table.py` notebook) | Publishes a UC feature table to the `mlops` online store (Lakebase). `create_online_store()` is called on first use. |
-| Poll online table status | `GET /api/2.0/database/synced_tables/{name}` (requires pipeline View — the app SP lacks it) → falls back to `SELECT count(*)` via the warehouse | The app row is written `PROVISIONING` at publish time and never auto-updated; `check-status` reconciles it to `ONLINE` when the synced table has rows. Re-publishing via `publish_table(publish_mode='TRIGGERED')` re-syncs in place. |
+| Materialize features online | `fe.materialize_features(features, offline_config, online_config, trigger)` (in `materialize_serving.py` / `materialize_online.py`) | Managed pipelines populate the `mlops` online store. Aggregations require `offline_config`; offline/online `table_name_prefix` must differ. |
+| Pause / resume / list materializations | `w.feature_engineering.update_materialized_feature(..., update_mask="pipeline_schedule_state")` / `fe.list_materialized_features(feature_name=)` | Only the online materialization is pausable; the list lags right after a PATCH (use the PATCH's return). Only offline materializations are directly deletable. |
+| Poll online table status | `GET /api/2.0/database/synced_tables/{name}` (requires pipeline View — the app SP lacks it) → falls back to `SELECT count(*)` via the warehouse | The app row is written `PROVISIONING` at publish time; `check-status` reconciles it to `ONLINE` when the table has rows. |
 
-> **Online store note:** the deployment path uses the `FeatureEngineeringClient` online-store API
-> (`create_online_store` / `get_online_store` / `publish_table`), **not** the older
-> `POST /api/2.0/online-tables` or `POST /api/2.0/postgres/synced_tables` REST endpoints. The online
+> **Online store note:** the serving path uses `fe.materialize_features` with `OnlineStoreConfig(online_store_name="mlops")`,
+> **not** `fe.publish_table` or the older `POST /api/2.0/online-tables` / `synced_tables` REST endpoints. The online
 > store and the app-state DB share the single Lakebase project `mlops`.
 
 ## App-Managed Notebooks
@@ -394,7 +412,7 @@ All training notebooks live in this codebase under `notebooks/` and are uploaded
 
 ### Training Notebooks
 
-Each notebook handles the full pipeline: materialize → split → train → log with `fe.log_model()`.
+Each notebook handles the full pipeline: build features → resolve + persist training set → split → train → log with `fe.log_model()`. Other app-managed notebooks: `register_model.py`, `materialize_serving.py` (Publish Tables), `materialize_online.py` (Online Features tab).
 
 | Notebook | Split Strategy | Description |
 |----------|---------------|-------------|
@@ -407,45 +425,32 @@ Each notebook handles both classification and regression via the `task_type` par
 ### Notebook Parameters (widget contract)
 
 All training notebooks accept:
-- `eol_sql` — the spine SQL (entity keys + label)
+- `eol_sql` — the spine SQL (entity keys + observation timestamp + label)
 - `label_column` — target column name
 - `entity_columns_json` — JSON array of entity key column names
-- `feature_entries_json` — JSON array of feature entry definitions (replaces `feature_lookups_json`). Each entry has a `"type"` field: `"lookup"` or `"on_demand"`. Lookup entries contain `table_name`, `feature_names`, `lookup_key`, etc. On-demand entries contain `function_name`, `input_bindings`, `output_name`.
+- `feature_entries_json` — JSON array of Feature View entries built by the server (`buildFvEntries`). Each has a `"type"`:
+  `column_selection` (`source_table`, `column`, `entity`), `aggregation` (`source_table`, `input`, `function`, `window`, `entity`, optional `filter_condition`),
+  or `custom_udf` (`function_name`, `bindings` param → upstream feature name). `include: false` marks input-only upstreams.
+- `excluded_features_json` — feature names to drop from the model's training columns
+- `timeseries_column` — the shared observation-timestamp column (in the spine AND every source table)
 - `task_type` — `'classification'` or `'regression'`
-- `split_method` — `'random'` or `'temporal'` (ignored for CV)
-- `split_config_json` — `{"eval_pct": 20, "test_pct": 10, "seed": 42}`
+- `split_method`, `split_config_json` — `train_standard.py` only
 - `parameters_json` — hyperparameters (e.g. `{"iterations": 100}`)
-- `catalog` — Unity Catalog catalog
-- `schema` — UC schema
+- `catalog`, `schema` — Unity Catalog location for features/tables
 - `experiment_name` — MLflow experiment name (short; notebook prepends `/Users/<username>/`)
+- `training_table_name` (+ `eval_table_name` for train/eval) — unique timestamped tables the resolved sets are written to
 
 ### Notebook Pipeline (what each notebook does)
 
 1. Execute EOL SQL → spine DataFrame
-2. Build `FeatureLookup` and `FeatureFunction` objects from `feature_entries_json`:
-   ```python
-   entries = json.loads(feature_entries_json)
-   features = []
-   for e in entries:
-       features.append(FeatureLookup(
-           table_name=e["table_name"],
-           feature_names=e["feature_names"],
-           lookup_key=e["lookup_key"],
-           timestamp_lookup_key=e.get("timestamp_lookup_key"),
-       ))
-       # Attach on-demand functions from this lookup entry
-       for od in e.get("on_demand_features", []):
-           features.append(FeatureFunction(
-               udf_name=od["function_name"],
-               input_bindings=od["input_bindings"],
-               output_name=od["output_name"],
-           ))
-   ```
-3. `fe.create_training_set(spine, features, label)` → training_set
-4. `training_set.load_df()` → full DataFrame with features (lookups resolved from tables, on-demand functions executed)
-5. Split per `split_method` + `split_config` (or skip for CV)
-6. Train model (CatBoost, configured by `task_type` + `parameters_json`)
-7. `fe.log_model(model, training_set=training_set, ...)` → model with feature specs embedded (both lookups and on-demand functions)
+2. Create (idempotently) a UC feature per entry: `ColumnSelection` / `AggregationFunction` over `DeltaTableSource`
+   (with `entity` + `timeseries_column`), and `CustomUDF` over `FeatureViewSource(features=[upstreams])` with
+   `input_bindings` values as **full three-part** upstream names
+3. `fe.create_training_set(df=spine, features=[...], label=...)` → `load_df()` (point-in-time join on `timeseries_column`)
+4. Persist the resolved set to `training_table_name` (and eval table)
+5. Split per `split_method` + `split_config` (or CV)
+6. Train CatBoost, wrapped in a pyfunc that reindexes incoming columns to the training order (CatBoost categoricals are positional)
+7. `fe.log_model(model, training_set=training_set, flavor=mlflow.pyfunc, ...)` — no `input_example`
 8. Return metrics + table names via `dbutils.notebook.exit()`
 
 ### Registration Notebook
@@ -519,21 +524,21 @@ See `deploy.sh` for the full deployment script.
 
 4. **App-managed training notebooks** — Training notebooks live in the app's `notebooks/` folder, not in a user's git repo. The app selects the right notebook based on `split_strategy` (CV, standard, or hyperparameter search). Each notebook handles both classification and regression via the `task_type` parameter. This gives the app full control over the training pipeline and ensures `fe.log_model()` is always used correctly.
 
-5. **Single-job training pipeline** — Each run executes one Databricks Job that does everything: EOL SQL → feature lookups → `fe.create_training_set()` → split → train → `fe.log_model()`. No separate materialize step. The `training_set` object flows through the entire pipeline, ensuring the model's feature specs are embedded for serving.
+5. **Single-job training pipeline** — Each run executes one Databricks Job that does everything: EOL SQL → Feature View features → `fe.create_training_set()` → persist training set → split → train → `fe.log_model()`. No separate materialize step. The `training_set` object flows through the entire pipeline, ensuring the model's feature specs are embedded for serving.
 
-6. **`fe.log_model()` enables auto-feature-lookup** — Training notebooks log models with `FeatureEngineeringClient.log_model()`, embedding the feature spec. Databricks serving endpoints automatically look up features from synced tables at inference time.
+6. **`fe.log_model()` enables auto-feature-lookup** — Training notebooks log models with `FeatureEngineeringClient.log_model()`, embedding the feature spec. Databricks serving endpoints automatically resolve features from the online store at inference time.
 
 7. **Declarative features stored as JSONB** — Since the declarative feature API is in beta, storing the full definition as JSONB in `feature_entry.declarative_spec` is more flexible than normalizing.
 
 8. **Training specs lock on first run** — A training spec can be edited freely until its first run is created. After that, it's locked — features, split config, and parameters are frozen to preserve lineage. The UI disables editing and shows a "Copy" action instead. This is enforced server-side: PUT/POST endpoints reject changes to specs that have runs.
 
-9. **Online store via FeatureEngineeringClient** — Feature tables are published to the `mlops` Lakebase online store via `fe.publish_table()` (in the `publish_table.py` notebook), **not** the older `POST /api/2.0/postgres/synced_tables` REST API. The online store is created on first use with `fe.create_online_store()`; it coexists with the app-state DB in the same Lakebase project `mlops`. Source tables need a PRIMARY KEY and CDF (auto-enabled). Published tables are project-level, shared across deployments.
+9. **Feature Views end to end** — Spec entries keep their UI types (lookup / on-demand / declarative) and the server bridges them to Feature View features for both training and serving. Serving tables are materialized per deployment with `fe.materialize_features` into the `mlops` online store (same Lakebase project as app state) and recorded in `deployment.serving_tables`. `create_training_set` can't mix `features=` with `FeatureLookup`s, so everything goes through Feature Views. UC features are shared by name between the Online Features tab and the serving path, so each path only operates on materializations under its own table prefix (`mlops_feat_` vs `mlops_srv_`).
 
 10. **Notebook-based model registration** — Model registration uses an app-managed notebook (`register_model.py`) that calls `mlflow.register_model()`. The REST API cannot resolve artifact paths when DBFS root is disabled — the Python SDK has internal access.
 
 11. **MLflow via REST API for reads, notebooks for writes** — The Express backend calls MLflow REST endpoints for reading (experiments, runs, metrics). Model logging and registration require the Python SDK and run inside notebooks.
 
-12. **On-demand features as peer entries with cross-table bindings** — On-demand features are their own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, and `output_name` columns. Input bindings can reference columns from *any* lookup entry in the spec (not just one table) + EOL columns. This supports functions like `distance(customer_zip, merchant_zip)` that need inputs from multiple tables. The app references existing UC functions — it does not author them. On-demand outputs don't require synced tables; the serving endpoint calls the UC function at inference time. **The referenced UC function must be a Python UDF (`LANGUAGE PYTHON`)** — `FeatureFunction` rejects SQL UDFs at `create_training_set` ("Only Python UDFs are supported").
+12. **On-demand features as peer entries with cross-table bindings** — On-demand features are their own `feature_entry` rows (`feature_type = 'on_demand'`) with `function_name`, `input_bindings`, and `output_name` columns. Input bindings can reference columns from *any* lookup entry in the spec (not just one table) + EOL columns. This supports functions like `distance(customer_zip, merchant_zip)` that need inputs from multiple tables. The app references existing UC functions — it does not author them. The server bridges each to a `CustomUDF` over input-only `ColumnSelection` upstreams; the output is computed at serving time, not materialized. **The referenced UC function must be a Python UDF (`LANGUAGE PYTHON`)** — SQL UDFs are rejected at `create_training_set` ("Only Python UDFs are supported").
 
 13. **Master-detail feature builder** — Feature entries (lookup, on-demand, declarative) are managed via a two-panel layout: left panel shows the entry list, right panel shows the editable detail form for the selected entry. Catalog/schema default to the most recently used values across entries. All entries are fully editable (add/remove columns, change bindings) until the spec's first run locks it. Copy-to-edit after locking.
 
@@ -554,7 +559,9 @@ online-store API + SP grants).
 - [ ] `train_hpsearch.py` — hyperparameter-search notebook for the `train_eval_test` split (not yet written)
 - [x] Remove legacy git-notebook fields from the create-project form (git_url/notebook_path/training/eval notebook selectors + GitHub auto-fetch) and the stale `serverless_stable_1dpktm_catalog` default — done 2026-10-01 (commit a2acd87). **Remaining:** the DB columns (`git_url`, `notebook_path`, `training_notebook`, `evaluation_notebook` on `app.project`, NOT NULL DEFAULT '') and the unused legacy `git_source` training path in `server.ts` can be dropped in a later migration.
 - [ ] MLflow experiment viewer + run-comparison UI
-- [ ] (Optional) Re-publish `customer_features_online` to clear its permanently-failed sync pipeline — the initial snapshot still serves, but incremental sync died after the INT→BIGINT retype changed the source table id
+- [x] ~~Re-publish `customer_features_online`~~ — moot: Feature View models serve from `mlops_srv_*`; the old `*_features_online` rows are unused (Remove them from the Deployment tab)
+- [ ] (Optional) UI refactor: author the three Feature View types directly instead of bridging lookup/on-demand/declarative entries server-side
+- [ ] (Later) Drop the legacy `app.feature_definition` / `app.dataset` tables and `run.dataset_id` (code paths removed 2026-10-16; DDL still creates them)
 - [ ] (Optional) Populate the native "Query endpoint" example (needs a retrain; the app's schema-driven test UI already covers testing)
 - [ ] (Future) One shared Databricks Job per project, reused across runs (`job_id` on project; `notebook_params` already vary per run)
 
