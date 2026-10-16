@@ -1,4 +1,4 @@
-import type { Project, EOL, FeatureDefinition, FeatureEntry, Dataset, Run, OnlineTable, Deployment, TrainingSpec, DeclarativeFeature, MaterializedFeature } from './types';
+import type { Project, EOL, FeatureEntry, Run, OnlineTable, Deployment, TrainingSpec, DeclarativeFeature, MaterializedFeature } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -75,51 +75,11 @@ export const deleteEOL = (id: number) =>
 export const copyEOL = (id: number, name?: string) =>
   request<EOL>(`/api/eols/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
 
-// ── Feature Definitions ──
-export const getFeatures = (projectId: number) =>
-  request<FeatureDefinition[]>(`/api/projects/${projectId}/features`);
-export const createFeature = (projectId: number, data: { eol_id: number | null; name: string }) =>
-  request<FeatureDefinition>(`/api/projects/${projectId}/features`, { method: 'POST', body: JSON.stringify(data) });
-export const deleteFeature = (id: number) =>
-  request<{ ok: boolean }>(`/api/features/${id}`, { method: 'DELETE' });
-export const copyFeature = (id: number, name?: string) =>
-  request<FeatureDefinition>(`/api/features/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
-
-// ── Feature Entries ──
-export const createFeatureEntry = (featureId: number, data: any) =>
-  request<FeatureEntry>(`/api/features/${featureId}/entries`, { method: 'POST', body: JSON.stringify(data) });
-export const deleteFeatureEntry = (id: number) =>
-  request<{ ok: boolean }>(`/api/feature-entries/${id}`, { method: 'DELETE' });
-
-// ── Datasets ──
-export const getDatasets = (projectId: number) =>
-  request<Dataset[]>(`/api/projects/${projectId}/datasets`);
-export const createDataset = (projectId: number, data: { name: string; feature_definition_id: number; eval_split_type: string; eval_split_config: any }) =>
-  request<Dataset>(`/api/projects/${projectId}/datasets`, { method: 'POST', body: JSON.stringify(data) });
-export const updateDataset = (id: number, data: Partial<Dataset>) =>
-  request<Dataset>(`/api/datasets/${id}`, { method: 'PUT', body: JSON.stringify(data) });
-export const deleteDataset = (id: number) =>
-  request<{ ok: boolean }>(`/api/datasets/${id}`, { method: 'DELETE' });
-
-// ── Runs (train + evaluate) ──
-export const getRuns = (projectId: number) =>
-  request<Run[]>(`/api/projects/${projectId}/runs`);
-export const createRun = (projectId: number, data: { dataset_id: number; parameters?: Record<string, any> }) =>
-  request<Run>(`/api/projects/${projectId}/runs`, { method: 'POST', body: JSON.stringify(data) });
-export const launchRun = (projectId: number, runId: number) =>
-  request<{ job_id: number; run_id: number; run_url: string }>(`/api/projects/${projectId}/runs/${runId}/launch`, { method: 'POST' });
-export const checkRunStatus = (runId: number) =>
-  request<Run>(`/api/runs/${runId}/check-status`, { method: 'POST' });
+// ── Runs (shared) ──
 export const deleteRun = (id: number) =>
   request<{ ok: boolean }>(`/api/runs/${id}`, { method: 'DELETE' });
 export const registerModel = (runId: number) =>
   request<Run>(`/api/runs/${runId}/register-model`, { method: 'POST' });
-
-// ── Job launchers ──
-export const materializeDataset = (projectId: number, datasetId: number) =>
-  request<{ job_id: number; run_id: number; run_url: string }>(`/api/projects/${projectId}/datasets/${datasetId}/materialize`, { method: 'POST' });
-export const checkDatasetStatus = (projectId: number, datasetId: number) =>
-  request<Dataset>(`/api/projects/${projectId}/datasets/${datasetId}/check-status`, { method: 'POST' });
 
 // ── Online Tables ──
 export const getOnlineTables = (projectId: number) =>

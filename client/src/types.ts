@@ -54,31 +54,6 @@ export interface TrainingSpec {
   entries: FeatureEntry[];
 }
 
-// Legacy — kept for backward compat with old runs
-export interface FeatureDefinition {
-  id: number;
-  project_id: number;
-  eol_id: number | null;
-  name: string;
-  entries: FeatureEntry[];
-}
-
-export interface Dataset {
-  id: number;
-  project_id: number;
-  name: string;
-  feature_definition_id: number | null;
-  eval_split_type: string;
-  eval_split_config: Record<string, any> | null;
-  status: 'NOT_STARTED' | 'MATERIALIZING' | 'READY' | 'FAILED';
-  training_table: string | null;
-  eval_table: string | null;
-  materialize_job_id: number | null;
-  materialize_run_id: number | null;
-  materialize_run_url: string | null;
-  row_count: number | null;
-}
-
 export interface Run {
   id: number;
   project_id: number;
