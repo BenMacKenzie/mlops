@@ -18,7 +18,8 @@
 # MAGIC   - `create`  — create_feature(s) + materialize_features with the chosen trigger
 # MAGIC   - `pause`   — pause the materialization pipeline (schedule state → PAUSED)
 # MAGIC   - `resume`  — resume (schedule state → ACTIVE)
-# MAGIC   - `delete`  — delete the materialized feature(s) (stops the pipeline) and the UC feature
+# MAGIC   - `delete`  — delete this notebook's materialized feature(s) (stops the pipeline), and the
+# MAGIC                 UC feature too unless another materialization (e.g. serving) still uses it
 # MAGIC   - `status`  — report current state (schedule, last run) without mutating anything
 
 # COMMAND ----------
@@ -254,13 +255,22 @@ def _grant_online_select(mf):
         print(f"[grant] WARNING (serving may need a manual grant): {e}")
 
 
-def _materialized_for(full_name):
-    """Return the list of SDK MaterializedFeature objects for a UC feature."""
+def _all_materialized_for(full_name):
+    """Return every SDK MaterializedFeature for a UC feature (any owner)."""
     try:
         return fe.list_materialized_features(feature_name=full_name) or []
     except Exception as e:  # noqa: BLE001
         print(f"[list] {full_name}: {e}")
         return []
+
+
+def _materialized_for(full_name):
+    """Return only the materializations THIS notebook created (destination table name starts with
+    table_name_prefix). A UC feature is shared by name with the deployment serving path
+    (materialize_serving.py, prefix mlops_srv_), so pause/resume/delete/status must never touch
+    those — doing so would pause or tear down a live endpoint's feature pipelines."""
+    return [m for m in _all_materialized_for(full_name)
+            if (getattr(m, "table_name", None) or "").split(".")[-1].startswith(table_name_prefix)]
 
 
 def op_set_state(target_state):
@@ -295,18 +305,41 @@ def op_set_state(target_state):
 
 
 def op_delete():
+    """Delete this notebook's materializations, then the UC feature only if nothing else (e.g. a
+    deployment's serving pipeline) still materializes it. Errors are reported, not swallowed."""
     results = []
     for full_name in feature_full_names:
-        for mf in _materialized_for(full_name):
+        row = {"feature_full_name": full_name, "deleted_materializations": [], "errors": []}
+        # Only OFFLINE materializations are directly deletable; deleting one cascades to its online
+        # sibling. So delete offline first, then re-list and directly delete only online ones that
+        # are still left (an online-only materialization with no offline sibling).
+        own = _materialized_for(full_name)
+        for mf in sorted(own, key=lambda m: bool(getattr(m, "is_online", False))):
+            if getattr(mf, "is_online", False):
+                still = {getattr(m, "materialized_feature_id", None) for m in _materialized_for(full_name)}
+                if getattr(mf, "materialized_feature_id", None) not in still:
+                    row["deleted_materializations"].append(getattr(mf, "table_name", None))
+                    continue
             try:
                 fe.delete_materialized_feature(materialized_feature=mf)
+                row["deleted_materializations"].append(getattr(mf, "table_name", None))
             except Exception as e:  # noqa: BLE001
-                print(f"[delete] materialized {full_name}: {e}")
-        try:
-            fe.delete_feature(full_name=full_name)
-        except Exception as e:  # noqa: BLE001
-            print(f"[delete] feature {full_name}: {e}")
-        results.append({"feature_full_name": full_name, "deleted": True})
+                row["errors"].append(f"materialized {getattr(mf, 'table_name', None)}: {e}")
+        remaining = [getattr(m, "table_name", None) for m in _all_materialized_for(full_name)]
+        if remaining:
+            row["feature_kept"] = f"still materialized by {remaining}"
+        else:
+            try:
+                fe.delete_feature(full_name=full_name)
+                row["feature_deleted"] = True
+            except Exception as e:  # noqa: BLE001
+                msg = str(e).upper()
+                if any(k in msg for k in ("NOT FOUND", "DOES NOT EXIST", "NOT REGISTERED")):
+                    row["feature_deleted"] = True  # already gone (e.g. retry after a partial delete)
+                else:
+                    row["errors"].append(f"feature: {e}")
+        print(f"[delete] {row}")
+        results.append(row)
     return results
 
 

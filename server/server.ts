@@ -1434,6 +1434,17 @@ appkit.server.extend((app) => {
         feature_full_names_json: JSON.stringify([row.feature_full_name]),
       });
       const r = (out.results && out.results[0]) || {};
+      if (!r.materialized_feature_id) {
+        // This tab has no materialization of its own for the feature (status only sees mlops_feat_*;
+        // a same-named feature may still be materialized by a deployment's serving pipeline).
+        await db.query(
+          `UPDATE app.materialized_feature SET status='NOT_MATERIALIZED', schedule_state=NULL,
+             materialized_feature_id=NULL, online_table_name=NULL, pipeline_id=NULL WHERE id=$1`,
+          [row.id]
+        );
+        res.json((await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id])).rows[0]);
+        return;
+      }
       // Reconcile every field the API reports; COALESCE so a not-yet-provisioned null
       // (e.g. pipeline_id early on) doesn't wipe a value we already captured.
       await db.query(
@@ -1457,33 +1468,37 @@ appkit.server.extend((app) => {
     }
   });
 
-  // Remove the materialization (stops the pipeline + deletes the UC feature) and the row.
+  // Remove this tab's materialization (stops its pipeline), the UC feature unless serving still
+  // materializes it, and the row.
   app.delete('/api/materialized-features/:id', async (req, res) => {
     try {
       const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
       if (result.rows.length === 0) { res.json({ ok: true }); return; }
       const row = result.rows[0];
       const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
+      let deleted: any[] = [];
       if (row.feature_full_name && row.status !== 'NOT_MATERIALIZED') {
-        try {
-          await runMaterializeOnline(req, `mlops-matfeat-delete-${row.feature_name}`, {
-            operation: 'delete',
-            declarative_features_json: '[]',
-            catalog: project.catalog,
-            schema: project.schema,
-            online_store_name: ONLINE_STORE_NAME,
-            table_name_prefix: 'mlops_feat_',
-            trigger_type: row.trigger_type,
-            cron_expression: '',
-            timezone_id: '',
-            feature_full_names_json: JSON.stringify([row.feature_full_name]),
-          });
-        } catch (e: any) {
-          console.warn(`[matfeat] delete job warning: ${e.message}`);
-        }
+        // Only this tab's own (mlops_feat_*) materializations are deleted; the UC feature is kept
+        // if a deployment's serving pipeline still materializes it. Surface errors and keep the
+        // row so the user can retry, rather than silently forgetting a live pipeline.
+        const out: any = await runMaterializeOnline(req, `mlops-matfeat-delete-${row.feature_name}`, {
+          operation: 'delete',
+          declarative_features_json: '[]',
+          catalog: project.catalog,
+          schema: project.schema,
+          online_store_name: ONLINE_STORE_NAME,
+          table_name_prefix: 'mlops_feat_',
+          trigger_type: row.trigger_type,
+          cron_expression: '',
+          timezone_id: '',
+          feature_full_names_json: JSON.stringify([row.feature_full_name]),
+        });
+        deleted = out?.results || [];
+        const errors = deleted.flatMap((r: any) => r.errors || []);
+        if (errors.length) { res.status(500).json({ error: `Delete failed: ${errors.join('; ')}`, results: deleted }); return; }
       }
       await db.query('DELETE FROM app.materialized_feature WHERE id = $1', [req.params.id]);
-      res.json({ ok: true });
+      res.json({ ok: true, results: deleted });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
