@@ -132,5 +132,7 @@ export interface Deployment {
   endpoint_name: string;
   endpoint_status: 'NOT_CREATED' | 'CREATING' | 'READY' | 'FAILED';
   endpoint_config: Record<string, any> | null;
+  // Online tables the model serves from (null = not yet published)
+  serving_tables: string[] | null;
   created_at: string | null;
 }

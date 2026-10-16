@@ -25,7 +25,7 @@ const appkit = await createApp({
 const db = appkit.lakebase;
 
 // Lakebase project config for synced tables (feature store online serving).
-// The online store name must match the Lakebase project name for fe.publish_table().
+// The online store name must match the Lakebase project name (fe online store).
 const LAKEBASE_BRANCH = process.env.LAKEBASE_BRANCH || 'projects/mlops/branches/production';
 const ONLINE_STORE_NAME = (LAKEBASE_BRANCH.match(/^projects\/([^/]+)/)?.[1]) || 'mlops';
 
@@ -1121,106 +1121,14 @@ appkit.server.extend((app) => {
     }
   });
 
-  app.post('/api/projects/:projectId/online-tables', async (req, res) => {
-    try {
-      const { source_table, primary_key_columns, timeseries_key, sync_mode } = req.body;
-      if (!source_table) {
-        res.status(400).json({ error: 'source_table required' }); return;
-      }
-
-      const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [req.params.projectId]);
-      if (projResult.rows.length === 0) { res.status(404).json({ error: 'Project not found' }); return; }
-      const project = projResult.rows[0];
-
-      const publishMode = (sync_mode || 'triggered').toUpperCase();
-      const shortName = source_table.split('.').pop();
-      const onlineTableName = `${project.catalog}.${project.schema}.${shortName}_online`;
-      const onlineStoreName = ONLINE_STORE_NAME; // Lakebase project name
-
-      // Enable CDF on source table (required for TRIGGERED/CONTINUOUS)
-      try {
-        await executeSql(req, `ALTER TABLE ${source_table} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
-        console.log(`[publish] Enabled CDF on ${source_table}`);
-      } catch (e: any) {
-        console.warn(`[publish] CDF enable warning: ${e.message}`);
-      }
-
-      // Ensure PK NOT NULL constraints (required by online store)
-      try {
-        const parts = source_table.split('.');
-        const pkRows = await executeSql(req,
-          `SELECT column_name FROM ${parts[0]}.information_schema.constraint_column_usage
-           WHERE table_catalog='${parts[0]}' AND table_schema='${parts[1]}' AND table_name='${parts[2]}'`);
-        for (const pk of pkRows) {
-          await executeSql(req, `ALTER TABLE ${source_table} ALTER COLUMN ${pk.column_name} SET NOT NULL`);
-        }
-      } catch (e: any) {
-        console.warn(`[publish] PK NOT NULL warning: ${e.message}`);
-      }
-
-      // Upload and run the publish_table notebook
-      const userName = await getUsername(req);
-      const notebookPath = `/Workspace/Users/${userName}/.mlops/publish_table`;
-      const localNotebook = path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'publish_table.py');
-      await uploadNotebook(req, localNotebook, notebookPath);
-
-      const params = {
-        online_store_name: onlineStoreName,
-        source_table_name: source_table,
-        online_table_name: onlineTableName,
-        publish_mode: publishMode,
-      };
-
-      console.log(`[publish] Publishing ${source_table} → ${onlineTableName} (store: ${onlineStoreName})`);
-      const { run_id: jobRunId, run_url } = await createOrRunJob(
-        req, `mlops-publish-${shortName}`, notebookPath, params
-      );
-
-      // Insert tracking record as PROVISIONING
-      const result = await db.query(
-        `INSERT INTO app.online_table (project_id, source_table, online_table_name, primary_key_columns, timeseries_key, sync_mode, status, pipeline_id)
-         VALUES ($1,$2,$3,$4,$5,$6,'PROVISIONING',$7) RETURNING *`,
-        [req.params.projectId, source_table, onlineTableName, primary_key_columns || [], timeseries_key || null, sync_mode || 'triggered', run_url]
-      );
-
-      // Poll for notebook completion (publish jobs are usually fast)
-      let attempts = 0;
-      while (attempts < 60) {
-        await new Promise(r => setTimeout(r, 5000));
-        attempts++;
-        const jobRun = await databricksApi(req, 'GET', `jobs/runs/get?run_id=${jobRunId}`);
-        const lifeCycleState = jobRun.state?.life_cycle_state;
-        const resultState = jobRun.state?.result_state;
-
-        if (lifeCycleState === 'TERMINATED' && resultState === 'SUCCESS') {
-          await db.query('UPDATE app.online_table SET status=$1, pipeline_id=$2 WHERE id=$3',
-            ['ONLINE', run_url, result.rows[0].id]);
-          const updated = await db.query('SELECT * FROM app.online_table WHERE id = $1', [result.rows[0].id]);
-          console.log(`[publish] Published: ${onlineTableName}`);
-          res.status(201).json(updated.rows[0]);
-          return;
-        } else if (lifeCycleState === 'TERMINATED') {
-          const errMsg = jobRun.state?.state_message || resultState || 'Unknown error';
-          await db.query('UPDATE app.online_table SET status=$1, pipeline_id=$2 WHERE id=$3',
-            ['FAILED', errMsg, result.rows[0].id]);
-          throw new Error(`Publish failed: ${errMsg}`);
-        }
-      }
-      throw new Error('Publish timed out after 5 minutes');
-    } catch (e: any) {
-      console.error(`[publish] Error: ${e.message}`);
-      res.status(500).json({ error: e.message });
-    }
-  });
-
   app.post('/api/online-tables/:id/check-status', async (req, res) => {
     try {
       const result = await db.query('SELECT * FROM app.online_table WHERE id = $1', [req.params.id]);
       if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       const ot = result.rows[0];
 
-      // Reconcile the stored status against reality. fe.publish_table creates a synced
-      // database table backed by a DLT pipeline; the app row is written as
+      // Reconcile the stored status against reality. fe.materialize_features creates an
+      // online table backed by a managed pipeline; the app row is written as
       // 'PROVISIONING' at publish time and never updated afterwards, so without this
       // the UI shows PROVISIONING forever even once the table is online and serving.
       if (ot.online_table_name && ot.status !== 'NOT_PUBLISHED') {
@@ -1656,6 +1564,7 @@ appkit.server.extend((app) => {
           );
         }
       }
+      await db.query('UPDATE app.deployment SET serving_tables=$1 WHERE id=$2', [onlineTables, dep.id]);
       res.json({ published: onlineTables.length, online_tables: onlineTables, grants: (out as any).grants || [] });
     } catch (e: any) {
       console.error(`[publish-tables] Error: ${e.message}`);
@@ -2067,10 +1976,13 @@ db.query(`
     endpoint_name VARCHAR(255) NOT NULL, endpoint_status VARCHAR(50) DEFAULT 'NOT_CREATED',
     endpoint_config JSONB, created_at TIMESTAMP DEFAULT NOW()
   );
+  -- Online tables a deployment's model resolves features from (set by publish-tables;
+  -- NULL = not yet published, [] = published, nothing to serve from the online store).
+  ALTER TABLE app.deployment ADD COLUMN IF NOT EXISTS serving_tables TEXT[];
   -- One Databricks-managed online materialization per declarative feature entry.
   -- Tracks the chosen schedule (trigger) and the live pipeline state read back from the
-  -- feature-engineering API. Distinct from app.online_table (which mirrors precomputed
-  -- FeatureLookup tables via fe.publish_table).
+  -- feature-engineering API. Distinct from app.online_table (which tracks the per-deployment
+  -- serving tables created by publish-tables).
   CREATE TABLE IF NOT EXISTS app.materialized_feature (
     id BIGSERIAL PRIMARY KEY,
     project_id BIGINT NOT NULL REFERENCES app.project(id) ON DELETE CASCADE,

@@ -84,8 +84,6 @@ export const registerModel = (runId: number) =>
 // ── Online Tables ──
 export const getOnlineTables = (projectId: number) =>
   request<OnlineTable[]>(`/api/projects/${projectId}/online-tables`);
-export const publishOnlineTable = (projectId: number, data: { source_table: string; primary_key_columns: string[]; timeseries_key?: string | null; sync_mode: string }) =>
-  request<OnlineTable>(`/api/projects/${projectId}/online-tables`, { method: 'POST', body: JSON.stringify(data) });
 export const checkOnlineTableStatus = (id: number) =>
   request<OnlineTable>(`/api/online-tables/${id}/check-status`, { method: 'POST' });
 export const deleteOnlineTable = (id: number) =>

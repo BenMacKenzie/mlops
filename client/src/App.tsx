@@ -1804,58 +1804,17 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
     return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
   }, [onlineTables, deployments, load]);
 
-  // Derive all distinct source tables from all feature entries across all training specs
-  const allFeatureTables = (() => {
-    const tableMap = new Map<string, { table: string; lookupKey: string[]; timestampKey: string | null; specNames: string[] }>();
-    for (const spec of trainingSpecs) {
-      for (const entry of spec.entries) {
-        if (!entry.table_name) continue;
-        const existing = tableMap.get(entry.table_name);
-        if (existing) {
-          if (!existing.specNames.includes(spec.name)) existing.specNames.push(spec.name);
-        } else {
-          tableMap.set(entry.table_name, {
-            table: entry.table_name,
-            lookupKey: entry.lookup_key || [],
-            timestampKey: entry.timestamp_lookup_key,
-            specNames: [spec.name],
-          });
-        }
-      }
-    }
-    return Array.from(tableMap.values());
-  })();
+  // Map online table name → online table record
+  const onlineTableMap = new Map(onlineTables.map(ot => [ot.online_table_name, ot]));
 
-  // Map source_table → online table record
-  const onlineTableMap = new Map(onlineTables.map(ot => [ot.source_table, ot]));
-
-  // For a selected deployment, compute its required tables
+  // For a selected deployment, the online tables it serves from (recorded by publish-tables)
   const selectedDep = deployments.find(d => d.id === selectedDepId);
-  const requiredTables = (() => {
-    if (!selectedDep) return new Set<string>();
-    const run = runs.find(r => r.id === selectedDep.run_id);
-    if (!run) return new Set<string>();
-    const spec = trainingSpecs.find(s => s.id === run.training_spec_id);
-    if (!spec) return new Set<string>();
-    return new Set(spec.entries.map(e => e.table_name).filter(Boolean) as string[]);
-  })();
+  const requiredTables = new Set(selectedDep?.serving_tables || []);
 
   const registeredRuns = runs.filter(r => r.model_name && r.model_version);
 
-  const publishTable = async (table: string, lookupKey: string[], timestampKey: string | null) => {
-    try {
-      await api.publishOnlineTable(projectId, {
-        source_table: table,
-        primary_key_columns: lookupKey,
-        timeseries_key: timestampKey,
-        sync_mode: 'triggered',
-      });
-      load();
-    } catch (e: any) { alert(`Publish failed: ${e.message}`); }
-  };
-
   const removeOnlineTable = async (ot: OnlineTable) => {
-    if (!confirm(`Remove synced table for ${ot.source_table}?`)) return;
+    if (!confirm(`Stop tracking ${ot.online_table_name}? (This does not drop the table or its pipeline.)`)) return;
     try {
       await api.deleteOnlineTable(ot.id);
       load();
@@ -1902,26 +1861,21 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
     return [];
   };
 
-  // Check if all required tables for a deployment are ONLINE
-  const allTablesOnline = (dep: Deployment) => {
-    const run = runs.find(r => r.id === dep.run_id);
-    if (!run) return false;
-    const spec = trainingSpecs.find(s => s.id === run.training_spec_id);
-    if (!spec) return true;
-    const tables = spec.entries.map(e => e.table_name).filter(Boolean);
-    return tables.every(t => onlineTableMap.get(t!)?.status === 'ONLINE');
-  };
+  // A deployment is ready once publish-tables has run and every online table it needs is ONLINE
+  const allTablesOnline = (dep: Deployment) =>
+    dep.serving_tables != null && dep.serving_tables.every(t => onlineTableMap.get(t)?.status === 'ONLINE');
 
   const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
 
   return (
     <div>
-      {/* ── Online Feature Tables ── */}
+      {/* ── Online Tables (created per deployment by "Publish Tables") ── */}
       <div className="mb-8">
-        <h2 className="text-lg font-medium mb-4">Feature Tables (Online Store)</h2>
+        <h2 className="text-lg font-medium mb-4">Online Tables</h2>
         {selectedDep && (
           <div className="mb-3 p-2 bg-blue-50 rounded text-sm text-blue-700">
             Highlighting tables required by deployment <span className="font-medium">{selectedDep.name}</span>
+            {selectedDep.serving_tables == null && <span className="ml-1">(not published yet)</span>}
             <button className="ml-2 text-blue-500 hover:underline text-xs" onClick={() => setSelectedDepId(null)}>Clear</button>
           </div>
         )}
@@ -1929,52 +1883,40 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
           <table className="w-full text-left text-sm">
             <thead className="bg-gray-50">
               <tr>
-                <th className="px-4 py-3 font-medium text-gray-500">Source Table</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Sync Status</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Datasets</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Pipeline</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Online Table</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Status</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Used By</th>
+                <th className="px-4 py-3 font-medium text-gray-500">Job</th>
                 <th className="px-4 py-3 font-medium text-gray-500"></th>
               </tr>
             </thead>
             <tbody className="divide-y">
-              {allFeatureTables.map(ft => {
-                const ot = onlineTableMap.get(ft.table);
-                const isRequired = selectedDep ? requiredTables.has(ft.table) : false;
+              {onlineTables.map(ot => {
+                const usedBy = deployments.filter(d => d.serving_tables?.includes(ot.online_table_name));
+                const isRequired = selectedDep ? requiredTables.has(ot.online_table_name) : false;
                 const rowClass = selectedDep ? (isRequired ? 'bg-blue-50' : 'opacity-40') : '';
                 return (
-                  <tr key={ft.table} className={`hover:bg-gray-50 ${rowClass}`}>
-                    <td className="px-4 py-3 font-mono text-xs">{ft.table}</td>
-                    <td className="px-4 py-3">
-                      {ot ? (
-                        <StatusBadge status={ot.status} />
-                      ) : (
-                        <span className="text-xs text-gray-400">Not synced</span>
-                      )}
+                  <tr key={ot.id} className={`hover:bg-gray-50 ${rowClass}`}>
+                    <td className="px-4 py-3 font-mono text-xs" title={ot.online_table_name}>{ot.online_table_name.split('.').pop()}</td>
+                    <td className="px-4 py-3"><StatusBadge status={ot.status} /></td>
+                    <td className="px-4 py-3 text-xs text-gray-500">
+                      {usedBy.length > 0 ? usedBy.map(d => d.name).join(', ') : <span className="text-gray-400">unused</span>}
                     </td>
-                    <td className="px-4 py-3 text-xs text-gray-500">{ft.specNames.join(', ')}</td>
                     <td className="px-4 py-3 text-xs">
-                      {ot?.pipeline_id?.startsWith('http') ? (
+                      {ot.pipeline_id?.startsWith('http') ? (
                         <a href={ot.pipeline_id} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">View</a>
                       ) : (
                         <span className="text-gray-400">-</span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-xs space-x-2">
-                      {!ot && (
-                        <button
-                          onClick={() => publishTable(ft.table, ft.lookupKey, ft.timestampKey)}
-                          className="px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
-                        >Sync</button>
-                      )}
-                      {ot && (
-                        <button onClick={() => removeOnlineTable(ot)} className="text-red-500 text-xs hover:underline">Remove</button>
-                      )}
+                    <td className="px-4 py-3 text-xs">
+                      <button onClick={() => removeOnlineTable(ot)} className="text-red-500 text-xs hover:underline">Remove</button>
                     </td>
                   </tr>
                 );
               })}
-              {allFeatureTables.length === 0 && (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">No feature tables yet — create training specs with feature entries first</td></tr>
+              {onlineTables.length === 0 && (
+                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">No online tables yet — use "Publish Tables" on a deployment below</td></tr>
               )}
             </tbody>
           </table>
@@ -2065,7 +2007,7 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
 
                     {dep.endpoint_status === 'NOT_CREATED' && !tablesReady && (
                       <button onClick={() => publishAllRequired(dep.id)} className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700">
-                        Sync All Tables
+                        Publish Tables
                       </button>
                     )}
                     {dep.endpoint_status === 'NOT_CREATED' && tablesReady && (
@@ -2074,7 +2016,7 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
                       </button>
                     )}
                     {dep.endpoint_status === 'NOT_CREATED' && !tablesReady && (
-                      <span className="text-xs text-yellow-600 py-1">Tables not synced</span>
+                      <span className="text-xs text-yellow-600 py-1">{dep.serving_tables == null ? 'Tables not published' : 'Tables provisioning'}</span>
                     )}
                     {dep.endpoint_status === 'CREATING' && (
                       <button onClick={() => api.checkDeploymentStatus(dep.id).then(load)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">
