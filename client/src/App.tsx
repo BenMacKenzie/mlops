@@ -1234,7 +1234,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
               <select className="w-full px-3 py-2 border rounded" value={form.split_strategy} onChange={e => setForm({ ...form, split_strategy: e.target.value })}>
                 <option value="none">None (CV)</option>
                 <option value="train_eval">Train / Eval</option>
-                <option value="train_eval_test">Train / Eval / Test</option>
+                <option value="train_eval_test" disabled>Train / Eval / Test (coming soon)</option>
               </select>
             </div>
             {form.split_strategy !== 'none' && (
@@ -1420,7 +1420,14 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                               <td className="px-3 py-2 text-xs space-x-2">
                                 {r.databricks_run_url && <a href={r.databricks_run_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Job</a>}
                                 {r.mlflow_experiment_id && <a href={r.mlflow_run_id ? `${host}/ml/experiments/${r.mlflow_experiment_id}/runs/${r.mlflow_run_id}` : `${host}/ml/experiments/${r.mlflow_experiment_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">MLflow</a>}
-                                {r.training_table && <a href={`${host}/explore/data/${r.training_table.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Training set</a>}
+                                {/* Per-run persisted data: one table for CV, train + eval (+ test) for split runs */}
+                                {([
+                                  [r.training_table, r.eval_table || r.test_table ? 'Train' : 'Training set'],
+                                  [r.eval_table, 'Eval'],
+                                  [r.test_table, 'Test'],
+                                ] as [string | null, string][]).filter(([t]) => t).map(([t, label]) => (
+                                  <a key={label} href={`${host}/explore/data/${t!.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline" title={t!}>{label}</a>
+                                ))}
                                 <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
                               </td>
                             </tr>

@@ -176,7 +176,19 @@ training_set = fe.create_training_set(
     exclude_columns=exclude,
 )
 
-full_df = training_set.load_df()
+# `training_set` (observation keys excluded) is only handed to fe.log_model for its feature spec, so
+# the logged model / serving contract is unchanged. The DATA comes from a sibling training set that
+# keeps the keys (entity + timestamp): persisted tables then trace back to the spine and the split can
+# hash on them. Keys are dropped again before fitting.
+key_columns = [c for c in exclude if c not in excluded_features]
+data_set = fe.create_training_set(
+    df=eol_df,
+    features=features,
+    label=label_column,
+    exclude_columns=[c for c in exclude if c not in key_columns],
+)
+
+full_df = data_set.load_df()
 print(f"Full dataset: {full_df.count()} rows, {len(full_df.columns)} columns")
 
 # COMMAND ----------
@@ -186,34 +198,23 @@ print(f"Full dataset: {full_df.count()} rows, {len(full_df.columns)} columns")
 
 # COMMAND ----------
 
-if split_method == "temporal":
-    # Sort by timestamp, latest rows to eval
-    from pyspark.sql.window import Window
-    from pyspark.sql import functions as F
-    timestamp_col = [c for c in full_df.columns if c not in exclude and "date" in c.lower() or "time" in c.lower()]
-    # Use the EOL's timestamp column if available, otherwise fall back to row ordering
-    ts_col = timestamp_col[0] if timestamp_col else None
-    if ts_col:
-        ordered = full_df.orderBy(F.col(ts_col))
-        total = ordered.count()
-        eval_count = int(total * eval_pct)
-        train_count = total - eval_count
-        train_df = ordered.limit(train_count)
-        eval_df = ordered.subtract(train_df)
-    else:
-        # Fallback to random if no timestamp found
-        train_df, eval_df = full_df.randomSplit([1 - eval_pct, eval_pct], seed=seed)
-else:
-    # Random stratified split on label column
-    from pyspark.sql import functions as F
-    label_counts = full_df.groupBy(label_column).count().collect()
-    fractions = {row[label_column]: 1 - eval_pct for row in label_counts}
-    train_df = full_df.stat.sampleBy(label_column, fractions, seed=seed)
-    eval_df = full_df.subtract(train_df)
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
-train_count = train_df.count()
-eval_count = eval_df.count()
-print(f"Train: {train_count}, Eval: {eval_count}")
+# Deterministic split: rank every row by a seeded hash of its observation keys. full_df is lazy and
+# is recomputed by every Spark action, so a sample/subtract split can overlap or drop rows between the
+# two table writes; a key hash gives the same, disjoint, exhaustive assignment on every recompute.
+key_cols = [c for c in list(entity_columns) + [timeseries_column] if c and c in full_df.columns] or full_df.columns
+row_hash = F.xxhash64(*[F.col(c) for c in key_cols], F.lit(seed))
+if split_method == "temporal" and timeseries_column in full_df.columns:
+    # Latest observations go to eval (no future leakage); the hash breaks timestamp ties.
+    split_window = Window.orderBy(F.col(timeseries_column), row_hash)
+else:
+    # Random split stratified on the label: rank within each class so proportions are preserved.
+    split_window = Window.partitionBy(label_column).orderBy(row_hash)
+assigned = full_df.withColumn("_rank", F.percent_rank().over(split_window))
+train_df = assigned.where(F.col("_rank") < 1 - eval_pct).drop("_rank")
+eval_df = assigned.where(F.col("_rank") >= 1 - eval_pct).drop("_rank")
 
 # COMMAND ----------
 
@@ -227,6 +228,10 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
 train_df.write.mode("overwrite").saveAsTable(training_table_name)
 eval_df.write.mode("overwrite").saveAsTable(eval_table_name)
+# Train/evaluate from the persisted tables so they are exactly what the model saw.
+train_df = spark.table(training_table_name)
+eval_df = spark.table(eval_table_name)
+train_count, eval_count = train_df.count(), eval_df.count()
 print(f"Written: {training_table_name} ({train_count}), {eval_table_name} ({eval_count})")
 
 # COMMAND ----------
@@ -239,11 +244,11 @@ print(f"Written: {training_table_name} ({train_count}), {eval_table_name} ({eval
 import catboost
 from catboost import Pool, CatBoostClassifier, CatBoostRegressor
 
-pdf_train = train_df.toPandas().dropna()
+pdf_train = train_df.toPandas().drop(columns=key_columns, errors="ignore").dropna()
 y_train = pdf_train.pop(label_column)
 X_train = pdf_train
 
-pdf_eval = eval_df.toPandas().dropna()
+pdf_eval = eval_df.toPandas().drop(columns=key_columns, errors="ignore").dropna()
 y_eval = pdf_eval.pop(label_column)
 X_eval = pdf_eval
 

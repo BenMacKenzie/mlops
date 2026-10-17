@@ -813,7 +813,10 @@ appkit.server.extend((app) => {
       if (spec.split_strategy === 'train_eval') {
         notebookFile = 'train_standard.py';
       } else if (spec.split_strategy === 'train_eval_test') {
-        notebookFile = 'train_hpsearch.py'; // future
+        // train_hpsearch.py (eval for tuning, test for the final estimate) isn't written yet.
+        const msg = 'Train / Eval / Test (hyperparameter search) is not supported yet — use Train / Eval or None (CV).';
+        await db.query(`UPDATE app.run SET status='FAILED', error_message=$1, ended_at=NOW() WHERE id=$2`, [msg, run.id]);
+        res.status(400).json({ error: msg }); return;
       } else {
         notebookFile = 'train_cv.py';
       }
@@ -909,6 +912,7 @@ appkit.server.extend((app) => {
         let evalMetrics: Record<string, any> | null = null;
         let trainingTable: string | null = run.training_table;
         let evalTable: string | null = run.eval_table;
+        let testTable: string | null = run.test_table;
         try {
           const taskRunId = jobRun.tasks?.[0]?.run_id || run.run_id;
           const output = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${taskRunId}`);
@@ -917,15 +921,16 @@ appkit.server.extend((app) => {
           evalMetrics = nbResult.metrics || null;
           if (nbResult.training_table) trainingTable = nbResult.training_table;
           if (nbResult.eval_table) evalTable = nbResult.eval_table;
+          if (nbResult.test_table) testTable = nbResult.test_table;
         } catch (e: any) {
           console.error(`[spec-run] Output parse error: ${e.message}`);
         }
 
         await db.query(
           `UPDATE app.run SET status='SUCCESS', mlflow_run_id=$1, eval_metrics=$2,
-           training_table=$3, eval_table=$4, ended_at=NOW() WHERE id=$5`,
+           training_table=$3, eval_table=$4, test_table=$5, ended_at=NOW() WHERE id=$6`,
           [mlflowRunId, evalMetrics ? JSON.stringify(evalMetrics) : null,
-           trainingTable, evalTable, run.id]
+           trainingTable, evalTable, testTable, run.id]
         );
       } else if (lifeCycleState === 'TERMINATED') {
         await db.query(

@@ -199,7 +199,19 @@ training_set = fe.create_training_set(
     exclude_columns=exclude,
 )
 
-full_df = training_set.load_df()
+# `training_set` (observation keys excluded) is only handed to fe.log_model for its feature spec, so
+# the logged model / serving contract is unchanged. The DATA comes from a sibling training set that
+# keeps the keys (entity + timestamp): persisted tables then trace back to the spine and the split can
+# hash on them. Keys are dropped again before fitting.
+key_columns = [c for c in exclude if c not in excluded_features]
+data_set = fe.create_training_set(
+    df=eol_df,
+    features=features,
+    label=label_column,
+    exclude_columns=[c for c in exclude if c not in key_columns],
+)
+
+full_df = data_set.load_df()
 print(f"Training set: {full_df.count()} rows, {len(full_df.columns)} columns: {full_df.columns}")
 
 # Persist the resolved training set to a unique UC table so this exact model can be reproduced.
@@ -216,7 +228,9 @@ if training_table_name:
 
 # COMMAND ----------
 
-df = full_df.toPandas().dropna()
+# Train from the persisted table (when written) so it is exactly what the model saw.
+df = (spark.table(training_table_name) if training_table_name else full_df).toPandas()
+df = df.drop(columns=key_columns, errors="ignore").dropna()
 y = df.pop(label_column)
 X = df
 

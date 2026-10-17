@@ -447,7 +447,12 @@ All training notebooks accept:
    (with `entity` + `timeseries_column`), and `CustomUDF` over `FeatureViewSource(features=[upstreams])` with
    `input_bindings` values as **full three-part** upstream names
 3. `fe.create_training_set(df=spine, features=[...], label=...)` → `load_df()` (point-in-time join on `timeseries_column`)
-4. Persist the resolved set to `training_table_name` (and eval table)
+4. Persist the resolved set to `training_table_name` (and eval table). The persisted data comes from a sibling
+   training set that **keeps the observation keys** (entity + timestamp) so rows trace back to the spine; the
+   keys-excluded `training_set` is used only by `fe.log_model`. Splits are deterministic: rows are ranked by a
+   seeded hash of the keys (within each label class for random → exactly stratified; by `timeseries_column`
+   for temporal). The model is then trained **from the persisted tables** (keys dropped), so they are exactly
+   what it saw. `train_eval_test` is rejected until `train_hpsearch.py` exists.
 5. Split per `split_method` + `split_config` (or CV)
 6. Train CatBoost, wrapped in a pyfunc that reindexes incoming columns to the training order (CatBoost categoricals are positional)
 7. `fe.log_model(model, training_set=training_set, flavor=mlflow.pyfunc, ...)` — no `input_example`
