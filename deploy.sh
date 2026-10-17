@@ -54,6 +54,17 @@ databricks api patch /api/2.0/apps/"$APP_NAME" --profile "$PROFILE" --json '{
   "user_api_scopes": ["sql"]
 }' > /dev/null
 
+# Apply schema migrations as the TABLE OWNER (the deploying user) before the new code starts.
+# The app SP can't run DDL (CREATE needs schema CREATE; ALTER needs table ownership), so the
+# server only self-applies server/schema.sql in local dev. Fail the deploy if this fails.
+echo "==> Applying Lakebase schema (server/schema.sql) as the table owner..."
+PGHOST_DEP=$(databricks postgres list-endpoints projects/mlops/branches/production --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['status']['hosts']['host'])")
+PGTOKEN=$(databricks postgres generate-database-credential projects/mlops/branches/production/endpoints/primary --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+PGME=$(databricks current-user me --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['userName'])")
+PSQL=$(command -v psql || echo /opt/homebrew/opt/postgresql@16/bin/psql)
+PGPASSWORD="$PGTOKEN" PGOPTIONS="-c client_min_messages=warning" "$PSQL" "host=$PGHOST_DEP port=5432 dbname=databricks_postgres user=$PGME sslmode=require" \
+  -q -v ON_ERROR_STOP=1 -f server/schema.sql > /dev/null
+
 echo "==> Deploying app (platform installs minimal deps + starts)..."
 databricks apps deploy "$APP_NAME" --source-code-path "$SOURCE_PATH" --profile "$PROFILE"
 
@@ -62,10 +73,6 @@ databricks apps deploy "$APP_NAME" --source-code-path "$SOURCE_PATH" --profile "
 # the SP access to the schema on every deploy (otherwise: "permission denied for schema app").
 echo "==> Granting the app service principal access to the Lakebase 'app' schema..."
 SP_ID=$(databricks apps get "$APP_NAME" --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin).get('service_principal_client_id',''))")
-PGHOST_DEP=$(databricks postgres list-endpoints projects/mlops/branches/production --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['status']['hosts']['host'])")
-PGTOKEN=$(databricks postgres generate-database-credential projects/mlops/branches/production/endpoints/primary --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-PGME=$(databricks current-user me --profile "$PROFILE" -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['userName'])")
-PSQL=$(command -v psql || echo /opt/homebrew/opt/postgresql@16/bin/psql)
 PGPASSWORD="$PGTOKEN" "$PSQL" "host=$PGHOST_DEP port=5432 dbname=databricks_postgres user=$PGME sslmode=require" >/dev/null 2>&1 <<SQL || echo "   (grant step failed — run it manually if the app shows 'permission denied for schema app')"
 GRANT USAGE ON SCHEMA app TO "$SP_ID";
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA app TO "$SP_ID";

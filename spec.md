@@ -506,6 +506,10 @@ Deployment to Databricks Apps uses the **canonical AppKit pattern** (no esbuild 
    `apps deploy`.
 4. Grant the app service principal the Lakebase `app` schema on every deploy (Lakebase
    re-provisions the SP Postgres role per deploy).
+   Schema DDL lives in `server/schema.sql` and is applied by `deploy.sh` via `psql` **as the table
+   owner, before `apps deploy`** — the SP can't run DDL (CREATE needs schema CREATE, ALTER needs
+   ownership), so the server only self-applies it in local dev. AppKit's cache is given an in-memory
+   store (otherwise it tries to create tables in `public` and logs `permission denied for schema public`).
 5. **The deployed app authenticates as its service principal** for management APIs
    (client-credentials OAuth from the injected `DATABRICKS_CLIENT_ID/SECRET`); the user OBO
    token only carries the app's limited `user_api_scopes` (no serving/jobs/mlflow). Grant the
