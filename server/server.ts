@@ -1274,8 +1274,14 @@ appkit.server.extend((app) => {
         try { parsed = raw ? JSON.parse(raw) : {}; } catch { parsed = {}; }
         return { status: 'SUCCESS', operation: parsed.operation, results: parsed.results || [], ...parsed, job_id, run_id, run_url } as any;
       }
-      if (life === 'TERMINATED' || life === 'INTERNAL_ERROR') {
-        throw new Error(jobRun.state?.state_message || result || 'materialize_online job failed');
+      if (['TERMINATED', 'INTERNAL_ERROR', 'SKIPPED'].includes(life)) {
+        // Prefer the notebook's own error (e.g. a feature-store BadRequest) over the generic state message.
+        let message = jobRun.state?.state_message || result || 'materialize_online job failed';
+        try {
+          const out = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${jobRun.tasks?.[0]?.run_id ?? run_id}`);
+          if (out?.error) message = String(out.error).slice(0, 2000);
+        } catch { /* keep the state message */ }
+        throw new Error(message);
       }
     }
     throw new Error('materialize_online job timed out after 10 minutes');
@@ -1572,46 +1578,53 @@ appkit.server.extend((app) => {
   // Feature View path: builds the FV feature set from the spec (same bridge as training) and runs
   // notebooks/materialize_serving.py (ColumnSelection via TableTrigger, Aggregation via CronSchedule,
   // CustomUDF computed at serve), then grants SELECT to the serving role.
+  // Materialize the serving (online) tables for a run's training spec and record them as the
+  // deployment's serving_tables. Shared by Publish Tables and Update model (a different spec needs
+  // its own online tables BEFORE the endpoint switches to it). Waits until the tables exist + are granted.
+  async function publishServingTables(req: any, dep: any, run: any) {
+    // Trace: run → training_spec → eol → feature_entries
+    const specId = run.training_spec_id;
+    if (!specId) throw new Error('Run has no training spec');
+    const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [specId])).rows[0];
+    const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
+    const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [specId])).rows;
+    const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id])).rows[0];
+
+    const { featureEntries, tsCol } = await buildFvEntries(req, entries, eol);
+
+    const out = await runMaterializeOnline(req, `mlops-matserve-${project.name}-${specId}`, {
+      feature_entries_json: JSON.stringify(featureEntries),
+      catalog: project.catalog,
+      schema: project.schema,
+      timeseries_column: tsCol,
+      online_store_name: ONLINE_STORE_NAME,
+      table_prefix: 'mlops_srv_',
+    }, 'materialize_serving.py');
+
+    // Record the materialized online tables (ONLINE once the pipelines finish the initial load).
+    const onlineTables: string[] = (out as any).online_tables || [];
+    for (const t of onlineTables) {
+      const existing = await db.query('SELECT id FROM app.online_table WHERE project_id=$1 AND online_table_name=$2', [dep.project_id, t]);
+      if (existing.rows.length === 0) {
+        await db.query(
+          `INSERT INTO app.online_table (project_id, source_table, online_table_name, sync_mode, status, pipeline_id)
+           VALUES ($1,$2,$3,'triggered','PROVISIONING',$4)`,
+          [dep.project_id, t, t, (out as any).run_url || null]
+        );
+      }
+    }
+    await db.query('UPDATE app.deployment SET serving_tables=$1 WHERE id=$2', [onlineTables, dep.id]);
+    return { onlineTables, grants: (out as any).grants || [] };
+  }
+
   app.post('/api/deployments/:id/publish-tables', async (req, res) => {
     try {
       const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
       if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
       const dep = depResult.rows[0];
-
-      // Trace: deployment → run → training_spec → eol → feature_entries
       const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
-      const specId = run.training_spec_id;
-      if (!specId) { res.status(400).json({ error: 'Run has no training spec' }); return; }
-      const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [specId])).rows[0];
-      const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
-      const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [specId])).rows;
-      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id])).rows[0];
-
-      const { featureEntries, tsCol } = await buildFvEntries(req, entries, eol);
-
-      const out = await runMaterializeOnline(req, `mlops-matserve-${project.name}-${specId}`, {
-        feature_entries_json: JSON.stringify(featureEntries),
-        catalog: project.catalog,
-        schema: project.schema,
-        timeseries_column: tsCol,
-        online_store_name: ONLINE_STORE_NAME,
-        table_prefix: 'mlops_srv_',
-      }, 'materialize_serving.py');
-
-      // Record the materialized online tables (ONLINE once the pipelines finish the initial load).
-      const onlineTables: string[] = (out as any).online_tables || [];
-      for (const t of onlineTables) {
-        const existing = await db.query('SELECT id FROM app.online_table WHERE project_id=$1 AND online_table_name=$2', [dep.project_id, t]);
-        if (existing.rows.length === 0) {
-          await db.query(
-            `INSERT INTO app.online_table (project_id, source_table, online_table_name, sync_mode, status, pipeline_id)
-             VALUES ($1,$2,$3,'triggered','PROVISIONING',$4)`,
-            [dep.project_id, t, t, (out as any).run_url || null]
-          );
-        }
-      }
-      await db.query('UPDATE app.deployment SET serving_tables=$1 WHERE id=$2', [onlineTables, dep.id]);
-      res.json({ published: onlineTables.length, online_tables: onlineTables, grants: (out as any).grants || [] });
+      const { onlineTables, grants } = await publishServingTables(req, dep, run);
+      res.json({ published: onlineTables.length, online_tables: onlineTables, grants });
     } catch (e: any) {
       console.error(`[publish-tables] Error: ${e.message}`);
       res.status(500).json({ error: e.message });
@@ -1842,6 +1855,14 @@ appkit.server.extend((app) => {
       const mvData: any = await mvResp.json();
       if (mvData.model_version?.status && mvData.model_version.status !== 'READY') {
         res.status(400).json({ error: `Model version status is ${mvData.model_version.status}. Wait for READY.` }); return;
+      }
+
+      // A run from a different training spec resolves different features — publish its online tables
+      // first, so the endpoint never serves a model whose features aren't in the online store.
+      const currentRun = (await db.query('SELECT training_spec_id FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
+      if (run.training_spec_id && run.training_spec_id !== currentRun?.training_spec_id) {
+        const { onlineTables } = await publishServingTables(req, dep, run);
+        console.log(`[endpoint] Published ${onlineTables.length} serving tables for spec ${run.training_spec_id}`);
       }
 
       // Update the endpoint config with the new model version
