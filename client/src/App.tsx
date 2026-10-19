@@ -697,10 +697,13 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
   const [nameTouched, setNameTouched] = useState<boolean>(!!dspec.name);
   useEffect(() => {
     if (featureType !== 'declarative' || nameTouched) return;
-    const suggested = `${form.declarative_function || ''}_${form.declarative_input || ''}_${form.declarative_window_duration || ''}`
+    // Include the window type: UC feature names are shared across specs, so sum_amount_30d (tumbling)
+    // and its rolling variant must not collide.
+    const windowKind = ({ continuous: 'rolling', tumbling: 'tumbling', sliding: 'sliding' } as Record<string, string>)[form.declarative_window_type] || '';
+    const suggested = `${form.declarative_function || ''}_${form.declarative_input || ''}_${form.declarative_window_duration || ''}_${windowKind}`
       .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
     setForm(f => (f.declarative_name === suggested ? f : { ...f, declarative_name: suggested }));
-  }, [form.declarative_function, form.declarative_input, form.declarative_window_duration, nameTouched, featureType]);
+  }, [form.declarative_function, form.declarative_input, form.declarative_window_duration, form.declarative_window_type, nameTouched, featureType]);
 
   const [catalogs, setCatalogs] = useState<string[]>([]);
   const [schemas, setSchemas] = useState<string[]>([]);
@@ -1013,7 +1016,7 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
             <label className="block text-xs font-medium mb-1">Window Type</label>
             <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.declarative_window_type} onChange={e => setForm({ ...form, declarative_window_type: e.target.value })} disabled={dis}>
               <option value="">Select...</option>
-              <option value="continuous">Continuous</option>
+              <option value="continuous">Rolling (continuous)</option>
               <option value="tumbling">Tumbling</option>
               <option value="sliding">Sliding</option>
             </select>

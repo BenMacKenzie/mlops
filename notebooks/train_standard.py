@@ -117,12 +117,32 @@ def _window(w):
 def _full(name):
     return f"{catalog}.{schema}.{name}"
 
+def _fn_sig(fn):
+    """Comparable definition of a feature function. The window TYPE is added explicitly — a time
+    window's yaml dict holds only its duration, so tumbling vs rolling would otherwise compare equal."""
+    try:
+        d = fn._to_yaml_dict()
+    except Exception:  # noqa: BLE001
+        d = repr(fn)
+    tw = getattr(fn, "time_window", None)
+    return (type(fn).__name__, json.dumps(d, sort_keys=True, default=str), type(tw).__name__ if tw is not None else None)
+
 def _create(name, **kwargs):
     try:
         return fe.create_feature(catalog_name=catalog, schema_name=schema, name=name, **kwargs)
     except Exception as e:  # noqa: BLE001
         if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
-            return fe.get_feature(full_name=_full(name))
+            # Reuse only if the existing UC feature has the SAME definition — names are shared across
+            # specs, so e.g. a rolling entry named like an existing tumbling feature must not silently
+            # train on the tumbling one.
+            existing = fe.get_feature(full_name=_full(name))
+            if "function" in kwargs:
+                want, have = _fn_sig(kwargs["function"]), _fn_sig(existing.function)
+                if want != have:
+                    raise ValueError(f"Feature {_full(name)} already exists with a different definition "
+                                     f"(existing {have}, requested {want}). Rename this feature entry "
+                                     f"(e.g. include the window type).")
+            return existing
         raise
 
 def _delta(table, **extra):
@@ -244,20 +264,21 @@ print(f"Written: {training_table_name} ({train_count}), {eval_table_name} ({eval
 import catboost
 from catboost import Pool, CatBoostClassifier, CatBoostRegressor
 
-pdf_train = train_df.toPandas().drop(columns=key_columns, errors="ignore").dropna()
+# No dropna (see train_cv.py): CatBoost handles missing numerics; keep every persisted row.
+pdf_train = train_df.toPandas().drop(columns=key_columns, errors="ignore")
 y_train = pdf_train.pop(label_column)
 X_train = pdf_train
 
-pdf_eval = eval_df.toPandas().drop(columns=key_columns, errors="ignore").dropna()
+pdf_eval = eval_df.toPandas().drop(columns=key_columns, errors="ignore")
 y_eval = pdf_eval.pop(label_column)
 X_eval = pdf_eval
 
 # Categorical = string/object columns only (see train_cv.py: a numeric column trained as a
 # CatBoost cat_feature breaks serving when the feature store returns it as a float).
 cat_features = [col for col in X_train.columns if X_train.dtypes[col] == 'object']
-for c in cat_features:
-    X_train[c] = X_train[c].astype(str)
-    X_eval[c] = X_eval[c].astype(str)
+for c in cat_features:  # missing → "" to match the serving wrapper (astype(str) alone gives "nan")
+    X_train[c] = X_train[c].fillna("").astype(str)
+    X_eval[c] = X_eval[c].fillna("").astype(str)
 
 if task_type == "regression":
     base_params = {'loss_function': 'RMSE', 'eval_metric': 'RMSE'}

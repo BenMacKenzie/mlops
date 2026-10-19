@@ -67,12 +67,32 @@ def _full(n): return f"{catalog}.{schema}.{n}"
 def _delta(table, **extra):
     p = table.split(".")
     return DeltaTableSource(catalog_name=p[0] if len(p) == 3 else catalog, schema_name=p[1] if len(p) == 3 else schema, table_name=p[-1], **extra)
+def _fn_sig(fn):
+    """Comparable definition of a feature function. The window TYPE is added explicitly — a time
+    window's yaml dict holds only its duration, so tumbling vs rolling would otherwise compare equal."""
+    try:
+        d = fn._to_yaml_dict()
+    except Exception:  # noqa: BLE001
+        d = repr(fn)
+    tw = getattr(fn, "time_window", None)
+    return (type(fn).__name__, json.dumps(d, sort_keys=True, default=str), type(tw).__name__ if tw is not None else None)
+
 def _create(name, **kw):
     try:
         return fe.create_feature(catalog_name=catalog, schema_name=schema, name=name, **kw)
     except Exception as e:  # noqa: BLE001
         if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
-            return fe.get_feature(full_name=_full(name))
+            # Reuse only if the existing UC feature has the SAME definition — names are shared across
+            # specs, so e.g. a rolling entry named like an existing tumbling feature must not silently
+            # train on the tumbling one.
+            existing = fe.get_feature(full_name=_full(name))
+            if "function" in kw:
+                want, have = _fn_sig(kw["function"]), _fn_sig(existing.function)
+                if want != have:
+                    raise ValueError(f"Feature {_full(name)} already exists with a different definition "
+                                     f"(existing {have}, requested {want}). Rename this feature entry "
+                                     f"(e.g. include the window type).")
+            return existing
         raise
 
 # COMMAND ----------

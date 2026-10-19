@@ -932,10 +932,18 @@ appkit.server.extend((app) => {
           [mlflowRunId, evalMetrics ? JSON.stringify(evalMetrics) : null,
            trainingTable, evalTable, testTable, run.id]
         );
-      } else if (lifeCycleState === 'TERMINATED') {
+      } else if (['TERMINATED', 'INTERNAL_ERROR', 'SKIPPED'].includes(lifeCycleState)) {
+        // A notebook exception ends the run as INTERNAL_ERROR (not TERMINATED) — without this the run
+        // stayed RUNNING forever. Prefer the notebook's own error over the generic state message.
+        let message = state?.state_message || resultState || 'Unknown error';
+        try {
+          const taskRunId = jobRun.tasks?.[0]?.run_id || run.run_id;
+          const output = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${taskRunId}`);
+          if (output?.error) message = String(output.error).slice(0, 2000);
+        } catch { /* keep the state message */ }
         await db.query(
           `UPDATE app.run SET status='FAILED', error_message=$1, ended_at=NOW() WHERE id=$2`,
-          [state?.state_message || resultState || 'Unknown error', run.id]
+          [message, run.id]
         );
       }
       const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
@@ -1111,7 +1119,7 @@ appkit.server.extend((app) => {
           const updated = await db.query('SELECT * FROM app.run WHERE id = $1', [run.id]);
           res.json(updated.rows[0]);
           return;
-        } else if (lifeCycleState === 'TERMINATED') {
+        } else if (['TERMINATED', 'INTERNAL_ERROR', 'SKIPPED'].includes(lifeCycleState)) {
           const errMsg = jobRun.state?.state_message || resultState || 'Unknown error';
           // Clear partial model info
           await db.query(

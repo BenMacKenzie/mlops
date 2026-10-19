@@ -131,13 +131,33 @@ def _window(w):
 def _full(name):
     return f"{catalog}.{schema}.{name}"
 
+def _fn_sig(fn):
+    """Comparable definition of a feature function. The window TYPE is added explicitly — a time
+    window's yaml dict holds only its duration, so tumbling vs rolling would otherwise compare equal."""
+    try:
+        d = fn._to_yaml_dict()
+    except Exception:  # noqa: BLE001
+        d = repr(fn)
+    tw = getattr(fn, "time_window", None)
+    return (type(fn).__name__, json.dumps(d, sort_keys=True, default=str), type(tw).__name__ if tw is not None else None)
+
 def _create(name, **kwargs):
     """create_feature, idempotent on re-run."""
     try:
         return fe.create_feature(catalog_name=catalog, schema_name=schema, name=name, **kwargs)
     except Exception as e:  # noqa: BLE001
         if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
-            return fe.get_feature(full_name=_full(name))
+            # Reuse only if the existing UC feature has the SAME definition — names are shared across
+            # specs, so e.g. a rolling entry named like an existing tumbling feature must not silently
+            # train on the tumbling one.
+            existing = fe.get_feature(full_name=_full(name))
+            if "function" in kwargs:
+                want, have = _fn_sig(kwargs["function"]), _fn_sig(existing.function)
+                if want != have:
+                    raise ValueError(f"Feature {_full(name)} already exists with a different definition "
+                                     f"(existing {have}, requested {want}). Rename this feature entry "
+                                     f"(e.g. include the window type).")
+            return existing
         raise
 
 by_name = {}  # entry name -> Feature
@@ -230,7 +250,9 @@ if training_table_name:
 
 # Train from the persisted table (when written) so it is exactly what the model saw.
 df = (spark.table(training_table_name) if training_table_name else full_df).toPandas()
-df = df.drop(columns=key_columns, errors="ignore").dropna()
+# No dropna: CatBoost handles missing numerics natively, and dropping rows (e.g. an empty
+# aggregation window → NULL) would make the model see less than the persisted table.
+df = df.drop(columns=key_columns, errors="ignore")
 y = df.pop(label_column)
 X = df
 
@@ -240,8 +262,9 @@ X = df
 # "cat_features must be integer or string" when the online value arrives as a float.)
 cat_features = [col for col in X.columns if X.dtypes[col] == 'object']
 # Cast categoricals to string so training matches the serving wrapper (which also stringifies).
+# Missing → "" (astype(str) alone would make "nan"), matching the serving wrapper's fillna("").
 for c in cat_features:
-    X[c] = X[c].astype(str)
+    X[c] = X[c].fillna("").astype(str)
 print(f"Categorical features: {cat_features}")
 
 # COMMAND ----------
@@ -377,4 +400,5 @@ dbutils.notebook.exit(json.dumps({
     "mlflow_run_id": run.info.run_id,
     "metrics": metrics,
     "training_table": training_table_name,
+    "train_rows": len(X),
 }))

@@ -144,6 +144,16 @@ def mf_to_dict(mf):
 # COMMAND ----------
 
 
+def _fn_sig(fn):
+    """Comparable definition of a feature function (window TYPE added — the yaml dict omits it)."""
+    try:
+        d = fn._to_yaml_dict()
+    except Exception:  # noqa: BLE001
+        d = repr(fn)
+    tw = getattr(fn, "time_window", None)
+    return (type(fn).__name__, json.dumps(d, sort_keys=True, default=str), type(tw).__name__ if tw is not None else None)
+
+
 def op_create():
     """Register each declarative feature in UC, then materialize to offline + online stores."""
     # Offline and online destinations must differ (same catalog.schema is fine, but the
@@ -193,6 +203,10 @@ def op_create():
         except Exception as e:  # noqa: BLE001 — already-exists is the expected re-run case
             if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
                 feat = fe.get_feature(full_name=full_name)
+                # Names are shared with training/serving — never silently reuse a different definition.
+                if _fn_sig(agg) != _fn_sig(feat.function):
+                    raise ValueError(f"Feature {full_name} already exists with a different definition "
+                                     f"(existing {_fn_sig(feat.function)}, requested {_fn_sig(agg)}).")
                 print(f"Feature {full_name} already exists — reusing")
             else:
                 raise

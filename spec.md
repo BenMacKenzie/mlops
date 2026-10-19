@@ -537,6 +537,12 @@ See `deploy.sh` for the full deployment script.
 
 6. **`fe.log_model()` enables auto-feature-lookup** — Training notebooks log models with `FeatureEngineeringClient.log_model()`, embedding the feature spec. Databricks serving endpoints automatically resolve features from the online store at inference time.
 
+7a. **UC feature names are shared across specs and paths** — every notebook that creates a feature reuses an
+   existing same-named UC feature only if its definition matches (function, inputs, window **type** + duration);
+   otherwise it fails with a rename hint. Suggested declarative names include the window type
+   (`sum_amount_30d_rolling`). Training does not `dropna()`: CatBoost takes missing numerics as NaN and missing
+   categoricals are filled with `""` (as the serving wrapper does), so the model sees every persisted row.
+
 7. **Declarative features stored as JSONB** — Since the declarative feature API is in beta, storing the full definition as JSONB in `feature_entry.declarative_spec` is more flexible than normalizing.
 
 8. **Training specs lock on first run** — A training spec can be edited freely until its first run is created. After that, it's locked — features, split config, and parameters are frozen to preserve lineage. The UI disables editing and shows a "Copy" action instead. This is enforced server-side: PUT/POST endpoints reject changes to specs that have runs.
