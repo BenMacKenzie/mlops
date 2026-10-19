@@ -1699,11 +1699,13 @@ appkit.server.extend((app) => {
       const apiResult = await databricksApi(req, 'GET', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}`, undefined, 'api/2.0');
       const readyState = apiResult.state?.ready;
 
+      // A config update in progress wins: during "Update model" the endpoint stays ready=READY on the
+      // OLD version until the new one is live, so checking ready first reported the switch done early.
       let newStatus = dep.endpoint_status;
-      if (readyState === 'READY') {
-        newStatus = 'READY';
-      } else if (apiResult.state?.config_update === 'IN_PROGRESS') {
+      if (apiResult.state?.config_update === 'IN_PROGRESS') {
         newStatus = 'CREATING';
+      } else if (readyState === 'READY') {
+        newStatus = 'READY';
       }
       // Check for failure
       if (apiResult.error_code) {

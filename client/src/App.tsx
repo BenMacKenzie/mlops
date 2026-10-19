@@ -1020,6 +1020,10 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
               <option value="tumbling">Tumbling</option>
               <option value="sliding">Sliding</option>
             </select>
+            {/* The online store only materializes Last over a rolling window from a batch (Delta) source. */}
+            {form.declarative_window_type === 'continuous' && form.declarative_function && form.declarative_function !== 'last' && (
+              <p className="text-xs text-amber-600 mt-1">Training only — a rolling {form.declarative_function} can't be served online. Use Sliding (e.g. 1d slide) to deploy.</p>
+            )}
           </div>
           <div>
             <label className="block text-xs font-medium mb-1">Window Duration</label>
