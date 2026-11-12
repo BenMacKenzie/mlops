@@ -1132,6 +1132,13 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
   }, [runs, reload]);
 
   const submitSpec = async () => {
+    // Parse inside a guard: a bad JSON string used to throw here, outside the try, so the
+    // click silently did nothing.
+    let parameters: any = null;
+    if (form.parameters.trim()) {
+      try { parameters = JSON.parse(form.parameters); }
+      catch (e: any) { alert(`Parameters must be valid JSON (e.g. {"iterations": 100}): ${e.message}`); return; }
+    }
     const splitConfig = form.split_strategy !== 'none' ? { eval_pct: parseFloat(form.eval_pct), seed: parseInt(form.seed) } : null;
     const payload = {
       name: form.name,
@@ -1140,7 +1147,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
       split_strategy: form.split_strategy as any,
       split_method: form.split_strategy !== 'none' ? form.split_method as any : null,
       split_config: splitConfig,
-      parameters: form.parameters ? JSON.parse(form.parameters) : null,
+      parameters,
     };
     try {
       if (copyingFromId != null) {
@@ -1267,10 +1274,16 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
               <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.parameters} onChange={e => setForm({ ...form, parameters: e.target.value })} placeholder='{"iterations": 100}' />
             </div>
           </div>
-          <div className="mt-3">
-            <button onClick={submitSpec} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.eol_id}>
+          <div className="mt-3 flex items-center gap-3">
+            <button onClick={submitSpec} disabled={!form.name.trim() || !form.eol_id}
+              className="px-4 py-2 bg-green-600 text-white rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed">
               {copyingFromId != null ? 'Save Copy' : 'Create'}
             </button>
+            {(!form.name.trim() || !form.eol_id) && (
+              <span className="text-xs text-gray-500">
+                Required: {[!form.name.trim() && 'Name', !form.eol_id && 'EOL'].filter(Boolean).join(' and ')}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -1722,7 +1735,7 @@ function OnlineFeaturesTab({ projectId, project }: { projectId: number; project:
                   <div className="col-span-3 flex gap-2">
                     <button onClick={() => submit(f.feature_entry_id)} disabled={busy}
                       className="px-3 py-1.5 bg-green-600 text-white rounded text-sm disabled:opacity-50">
-                      {mf ? 'Re-materialize' : 'Materialize online'}
+                      Materialize online
                     </button>
                     <button onClick={() => setEditEntry(null)} className="px-3 py-1.5 border rounded text-sm">Cancel</button>
                     {form.trigger_type === 'derived' && (
@@ -1731,25 +1744,37 @@ function OnlineFeaturesTab({ projectId, project }: { projectId: number; project:
                   </div>
                 </div>
               ) : (
-                <div className="mt-3 flex gap-2">
-                  {!mf || status === 'NOT_MATERIALIZED' || status === 'FAILED' ? (
-                    <button onClick={() => openEditor(f.feature_entry_id, mf)} disabled={busy}
-                      className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm disabled:opacity-50">
-                      Schedule online
-                    </button>
-                  ) : (
-                    <>
-                      <button onClick={() => toggleState(mf)} disabled={busy}
-                        className="px-3 py-1.5 border rounded text-sm disabled:opacity-50">
+                (() => {
+                  // All four actions are always shown; each is enabled only when it applies.
+                  // Schedule is disabled once materialized: re-running create returns the existing
+                  // materialization unchanged, so changing the trigger means Remove → Schedule.
+                  const scheduled = !!mf && (status === 'ACTIVE' || status === 'PAUSED');
+                  const canSchedule = !mf || status === 'NOT_MATERIALIZED' || status === 'FAILED';
+                  const canRemove = !!mf && status !== 'NOT_MATERIALIZED' && status !== 'MATERIALIZING';
+                  const btn = 'px-3 py-1.5 border rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed';
+                  return (
+                    <div className="mt-3 flex gap-2">
+                      <button onClick={() => openEditor(f.feature_entry_id, mf)} disabled={busy || !canSchedule}
+                        title={canSchedule ? 'Choose a trigger and materialize to the online store' : 'Already scheduled — Remove first to change the schedule'}
+                        className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed">
+                        Schedule
+                      </button>
+                      <button onClick={() => toggleState(mf)} disabled={busy || !scheduled}
+                        title={scheduled ? undefined : 'Nothing scheduled yet'} className={btn}>
                         {status === 'PAUSED' ? 'Resume' : 'Pause'}
                       </button>
-                      <button onClick={() => refresh(mf)} disabled={busy}
-                        className="px-3 py-1.5 border rounded text-sm disabled:opacity-50">Refresh</button>
-                      <button onClick={() => remove(mf)} disabled={busy}
-                        className="px-3 py-1.5 border border-red-300 text-red-600 rounded text-sm disabled:opacity-50">Remove</button>
-                    </>
-                  )}
-                </div>
+                      <button onClick={() => refresh(mf)} disabled={busy || !scheduled}
+                        title={scheduled ? 'Re-read live schedule state and last run time' : 'Nothing scheduled yet'} className={btn}>
+                        Refresh
+                      </button>
+                      <button onClick={() => remove(mf)} disabled={busy || !canRemove}
+                        title={canRemove ? undefined : 'Nothing to remove'}
+                        className={`${btn} border-red-300 text-red-600`}>
+                        Remove
+                      </button>
+                    </div>
+                  );
+                })()
               )}
             </div>
           );
