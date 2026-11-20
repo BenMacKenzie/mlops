@@ -81,5 +81,14 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "$PGME" IN SCHEMA app GRANT SELECT, INSERT, UP
 ALTER DEFAULT PRIVILEGES FOR ROLE "$PGME" IN SCHEMA app GRANT USAGE, SELECT ON SEQUENCES TO "$SP_ID";
 SQL
 
+# The app runs materialization jobs as its SP. Creating a NEW online materialization on the
+# `mlops` online store (= Lakebase project) needs CAN_MANAGE on the project — CAN_USE fails with
+# "PermissionDenied: Cannot materialize features because user does not have permission to use
+# online store 'mlops'". update (PATCH) merges into the existing ACL; idempotent.
+echo "==> Granting the app service principal CAN_MANAGE on the 'mlops' online store (Lakebase project)..."
+databricks permissions update database-projects mlops --profile "$PROFILE" \
+  --json "{\"access_control_list\":[{\"service_principal_name\":\"$SP_ID\",\"permission_level\":\"CAN_MANAGE\"}]}" >/dev/null \
+  || echo "   (online-store grant failed — new online materializations from the app will hit PermissionDenied)"
+
 APP_URL=$(databricks apps get "$APP_NAME" --profile "$PROFILE" -o json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('url',''))" 2>/dev/null || echo "")
 echo "==> Done! App URL: ${APP_URL:-(run 'databricks apps get $APP_NAME --profile $PROFILE' to see the URL)}"

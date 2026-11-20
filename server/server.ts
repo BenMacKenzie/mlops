@@ -1287,6 +1287,9 @@ appkit.server.extend((app) => {
     throw new Error('materialize_online job timed out after 10 minutes');
   }
 
+  const servingNote = (tables: string[]) =>
+    `Materialized by a deployment's serving pipeline (${(tables || []).join(', ')}) — managed from the Deployment tab, not here.`;
+
   // List declarative features for a project (across specs), each annotated with its
   // materialization row (or null if it hasn't been materialized online yet).
   app.get('/api/projects/:projectId/materialized-features', async (req, res) => {
@@ -1361,7 +1364,9 @@ appkit.server.extend((app) => {
          ON CONFLICT (feature_entry_id) DO UPDATE SET
            feature_name=EXCLUDED.feature_name, feature_full_name=EXCLUDED.feature_full_name,
            trigger_type=EXCLUDED.trigger_type, cron_expression=EXCLUDED.cron_expression,
-           timezone_id=EXCLUDED.timezone_id, status='MATERIALIZING', error_message=NULL
+           timezone_id=EXCLUDED.timezone_id, status='MATERIALIZING', error_message=NULL,
+           schedule_state=NULL, resolved_cron=NULL, materialized_feature_id=NULL,
+           online_table_name=NULL, pipeline_id=NULL, last_materialization_time=NULL
          RETURNING *`,
         [req.params.projectId, feature_entry_id, featureName, featureFullName, triggerType,
           cron_expression || null, timezone_id || null]
@@ -1384,6 +1389,16 @@ appkit.server.extend((app) => {
       try {
         const out = await runMaterializeOnline(req, `mlops-matfeat-${featureName}`, params);
         const r = (out.results && out.results[0]) || {};
+        if (r.managed_elsewhere) {
+          // Same-named UC feature already materialized by a deployment (mlops_srv_*). This tab
+          // doesn't own that pipeline, so record it as SERVING rather than claiming it.
+          await db.query(
+            `UPDATE app.materialized_feature SET status='SERVING', error_message=$1 WHERE id=$2`,
+            [servingNote(r.managed_elsewhere), rowId]
+          );
+          res.status(201).json((await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [rowId])).rows[0]);
+          return;
+        }
         const scheduleState = r.schedule_state || 'ACTIVE';
         await db.query(
           `UPDATE app.materialized_feature SET
@@ -1475,9 +1490,12 @@ appkit.server.extend((app) => {
         // This tab has no materialization of its own for the feature (status only sees mlops_feat_*;
         // a same-named feature may still be materialized by a deployment's serving pipeline).
         await db.query(
-          `UPDATE app.materialized_feature SET status='NOT_MATERIALIZED', schedule_state=NULL,
-             materialized_feature_id=NULL, online_table_name=NULL, pipeline_id=NULL WHERE id=$1`,
-          [row.id]
+          `UPDATE app.materialized_feature SET status=$1, error_message=$2, schedule_state=NULL,
+             materialized_feature_id=NULL, online_table_name=NULL, pipeline_id=NULL,
+             resolved_cron=NULL, last_materialization_time=NULL WHERE id=$3`,
+          r.managed_elsewhere
+            ? ['SERVING', servingNote(r.managed_elsewhere), row.id]
+            : ['NOT_MATERIALIZED', null, row.id]
         );
         res.json((await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id])).rows[0]);
         return;
@@ -1492,7 +1510,8 @@ appkit.server.extend((app) => {
            materialized_feature_id=COALESCE($4, materialized_feature_id),
            online_table_name=COALESCE($5, online_table_name),
            pipeline_id=COALESCE($6, pipeline_id),
-           last_materialization_time=COALESCE($7, last_materialization_time)
+           last_materialization_time=COALESCE($7, last_materialization_time),
+           error_message=NULL
          WHERE id=$8`,
         [r.schedule_state || null, r.schedule_state === 'PAUSED' ? 'PAUSED' : 'ACTIVE',
           r.resolved_cron || null, r.materialized_feature_id || null, r.online_table_name || null,

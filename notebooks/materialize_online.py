@@ -219,7 +219,16 @@ def op_create():
             )
         except Exception as e:  # noqa: BLE001
             if "ALREADY" in str(e).upper() or "EXIST" in str(e).upper():
-                materialized = fe.list_materialized_features(feature_name=full_name)
+                # Only claim THIS tab's own (prefix-matched) materializations. The UC feature is
+                # shared by name with the deployment serving path (mlops_srv_*); reporting its
+                # materialization as ours made the tab show ACTIVE for pipelines it doesn't own.
+                materialized = _materialized_for(full_name)
+                if not materialized:
+                    others = [getattr(m, "table_name", None) for m in _all_materialized_for(full_name)]
+                    print(f"{full_name} is materialized only by another owner: {others}")
+                    results.append({"feature_name": name, "feature_full_name": full_name,
+                                     "managed_elsewhere": others})
+                    continue
                 print(f"{full_name} already materialized — returning existing state")
             else:
                 raise
@@ -365,6 +374,10 @@ def op_status():
         row = {"feature_full_name": full_name}
         if online_mf is not None:
             row.update(mf_to_dict(online_mf))
+        else:
+            others = [getattr(m, "table_name", None) for m in _all_materialized_for(full_name)]
+            if others:
+                row["managed_elsewhere"] = others
         results.append(row)
     return results
 

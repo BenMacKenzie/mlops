@@ -109,7 +109,7 @@ export interface MaterializedFeature {
   job_id: number | null;
   run_id: number | null;
   pipeline_id: string | null;
-  status: 'NOT_MATERIALIZED' | 'MATERIALIZING' | 'ACTIVE' | 'PAUSED' | 'FAILED';
+  status: 'NOT_MATERIALIZED' | 'MATERIALIZING' | 'ACTIVE' | 'PAUSED' | 'FAILED' | 'SERVING';
   last_materialization_time: string | null;
   materialize_run_url: string | null;
   error_message: string | null;

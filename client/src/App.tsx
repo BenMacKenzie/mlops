@@ -41,6 +41,7 @@ function StatusBadge({ status }: { status: string }) {
     ACTIVE: 'bg-green-100 text-green-800',
     PAUSED: 'bg-amber-100 text-amber-800',
     NOT_MATERIALIZED: 'bg-gray-200 text-gray-700',
+    SERVING: 'bg-indigo-100 text-indigo-800',
     FAILED: 'bg-red-100 text-red-800',
   };
   return (
@@ -1699,7 +1700,7 @@ function OnlineFeaturesTab({ projectId, project }: { projectId: number; project:
                       {mf.online_table_name && <span>online: <span className="font-mono">{mf.online_table_name}</span></span>}
                     </div>
                   )}
-                  {mf?.error_message && <div className="text-xs text-red-600 mt-1">{mf.error_message}</div>}
+                  {mf?.error_message && <div className={`text-xs mt-1 ${status === 'SERVING' ? 'text-gray-500' : 'text-red-600'}`}>{mf.error_message}</div>}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <StatusBadge status={busy ? 'MATERIALIZING' : status} />
@@ -1748,14 +1749,17 @@ function OnlineFeaturesTab({ projectId, project }: { projectId: number; project:
                   // All four actions are always shown; each is enabled only when it applies.
                   // Schedule is disabled once materialized: re-running create returns the existing
                   // materialization unchanged, so changing the trigger means Remove → Schedule.
+                  // SERVING = a deployment's serving pipeline owns the materialization: read-only here
+                  // (Refresh only, so the row can flip back once that deployment stops using it).
                   const scheduled = !!mf && (status === 'ACTIVE' || status === 'PAUSED');
+                  const serving = status === 'SERVING';
                   const canSchedule = !mf || status === 'NOT_MATERIALIZED' || status === 'FAILED';
-                  const canRemove = !!mf && status !== 'NOT_MATERIALIZED' && status !== 'MATERIALIZING';
+                  const canRemove = !!mf && !serving && status !== 'NOT_MATERIALIZED' && status !== 'MATERIALIZING';
                   const btn = 'px-3 py-1.5 border rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed';
                   return (
                     <div className="mt-3 flex gap-2">
                       <button onClick={() => openEditor(f.feature_entry_id, mf)} disabled={busy || !canSchedule}
-                        title={canSchedule ? 'Choose a trigger and materialize to the online store' : 'Already scheduled — Remove first to change the schedule'}
+                        title={canSchedule ? 'Choose a trigger and materialize to the online store' : serving ? 'Materialized by a deployment — manage it from the Deployment tab' : 'Already scheduled — Remove first to change the schedule'}
                         className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed">
                         Schedule
                       </button>
@@ -1763,8 +1767,8 @@ function OnlineFeaturesTab({ projectId, project }: { projectId: number; project:
                         title={scheduled ? undefined : 'Nothing scheduled yet'} className={btn}>
                         {status === 'PAUSED' ? 'Resume' : 'Pause'}
                       </button>
-                      <button onClick={() => refresh(mf)} disabled={busy || !scheduled}
-                        title={scheduled ? 'Re-read live schedule state and last run time' : 'Nothing scheduled yet'} className={btn}>
+                      <button onClick={() => refresh(mf)} disabled={busy || !(scheduled || serving)}
+                        title={scheduled || serving ? 'Re-read live schedule state and last run time' : 'Nothing scheduled yet'} className={btn}>
                         Refresh
                       </button>
                       <button onClick={() => remove(mf)} disabled={busy || !canRemove}
