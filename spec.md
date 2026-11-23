@@ -330,41 +330,31 @@ Server endpoints for UC metadata:
 - `GET /api/uc/function-params?catalog=X&schema=Y&function=Z` — get function parameter names and types (from `information_schema.parameters`)
 - `PUT /api/training-spec-entries/:id` — update an existing entry (blocked if spec has runs)
 
-### 5. Online Features (within project)
+### 5. Deployment (within project)
 
-Schedules Databricks-managed online materialization of a spec's **declarative** features via
-`fe.materialize_features` (`materialize_online.py`): derived cadence, custom Quartz cron, or on-table-change;
-pause / resume / refresh / remove. Its tables use prefix `mlops_feat_`. Remove deletes only this tab's
-materializations (offline first — that cascades to the online one) and drops the UC feature only if nothing
-else (e.g. a deployment's serving pipeline) still materializes it.
+Online deployments own getting their model's features online — there is no per-feature UI (the former
+Online Features tab was removed 2026-11-20). Training/registering a model, and batch deployments, never put
+anything online.
 
-### 6. Deployment (within project)
+**Deploy** (one button, runs in the background; `deploy_stage` FEATURES → ENDPOINT → DONE | FAILED):
+1. Reads the run's training-spec feature set (same bridge as training) and runs `materialize_serving.py`
+   `ensure`: registers the features, materializes **only those not already online** (ColumnSelection →
+   TableTrigger, co-located per entity in `mlops_srv_cs__*`; Aggregations → offline + online CronSchedule,
+   `mlops_srv_aggoff__*` / `mlops_srv_aggon__*`; CustomUDF computed at serving), waits for the online tables,
+   grants USAGE + SELECT to `PUBLIC` (skipped when already granted).
+2. Records every feature + its online table in `app.deployment_feature` (the usage registry).
+3. Creates the endpoint, or points an existing one at the model version (no-op if already serving it).
+   First provisioning is slow (~20–25 min, feature-serving sidecar). Idempotent — re-running on a healthy
+   deployment changes nothing ("Deploy (sync)" backfills the registry for pre-existing deployments).
 
-Manages the online tables a model serves from and its serving endpoint.
+**Update model** = the same flow with another run: the new model's features go online BEFORE the endpoint
+switches; tables only the old model used go to `pending_release` and are torn down (`materialize_serving.py`
+`release`) once the endpoint is READY on the new version. **Delete** removes the endpoint and releases the
+deployment's tables. A table is released only when no deployment references any feature in it; UC features
+are always kept (training and batch scoring use them). **Stop** keeps the features.
 
-Training logs models with `fe.log_model()` over Feature View features, so the feature spec is embedded and the
-serving endpoint resolves features from the online store at inference time. The caller sends only the spine
-(entity keys + observation timestamp + pass-through columns); `CustomUDF` features (e.g. `distance`) are
-computed at serving from their upstream features.
-
-**Two sections in the tab:**
-
-1. **Online Tables** (project-level) — every `app.online_table` row, its status, job link, and which
-   deployments use it (from `deployment.serving_tables`). Selecting a deployment highlights its tables.
-   **Remove** only stops tracking the row; it does not drop the table or its pipeline.
-2. **Deployments** — each links a registered model to a serving endpoint.
-
-**Creating a deployment:**
-1. Give it a name (e.g. `production`)
-2. Select a registered model version from dropdown
-3. Click **Publish Tables** — runs `materialize_serving.py` on the spec's feature set:
-   - `ColumnSelection` features → online only, `TableTrigger` (features sharing an entity co-locate in one table, `mlops_srv_cs__*`)
-   - Aggregations → offline + online, `CronSchedule` (`mlops_srv_aggoff__*` / `mlops_srv_aggon__*`)
-   - `CustomUDF` → not materialized
-   - Waits for each online table's pipeline to create it, then grants USAGE + SELECT to `PUBLIC` (serving role) via psycopg.
-   - Records the online tables in `deployment.serving_tables`. Idempotent — re-running reports existing tables.
-4. **Create Endpoint** appears once every serving table is ONLINE. First provisioning is slow (~20–25 min, feature-serving sidecar).
-5. Link to Databricks endpoint UI for management (stop/start)
+**Online features panel** (per deployment, read-only): features, type (lookup / aggregation / on-demand), online
+table, last materialized; *Refresh* re-reads freshness (`status` op). Freshness = Databricks-derived schedules.
 
 **Gotchas:**
 - Every feature source table needs a timestamp column with the **same name as the spine's observation timestamp** (the point-in-time join key); Type-1 dimension tables were converted to SCD2 with `transaction_ts`.
@@ -381,6 +371,31 @@ computed at serving from their upstream features.
   prefill the required fields on click.
 - Values are coerced to their declared types, then sent as `{"dataframe_records": [{...}]}`.
 - Displays the prediction response.
+
+### 6. Batch Deployment (within project)
+
+Scheduled batch inference, independent of online deployments (a model can be batch-only — nothing goes online).
+Each batch deployment is a persistent **Databricks job created by and run as the app SP** running
+`notebooks/score_batch.py`; every parameter lives in the job definition, so it **runs without the app**. Run
+history and pause state are read live from the Jobs API (`app.batch_deployment` stores only the configuration).
+
+**Configure:** name · model + **UC alias** (resolved every run, so moving `@champion` moves the job; the form can set
+or move an alias) · **input** = a table or SQL with every request field the model needs (entity keys + request-time
+fields, exactly an online request) and **not** the model's timestamp column · **output table** (appended) ·
+schedule (daily at HH:MM / Quartz cron / manual) + timezone. Validation on save: the input must cover the training
+EOL's columns minus label and timestamp, and must not contain the timestamp.
+
+**Each run:** resolve alias → version; `%pip install` the model's own requirements (every `requirements.txt` in its
+artifacts, minus feature-store/mlflow/pyspark pins); spine = input + `<ts_col>` = run time (one value per run);
+`fe.score_batch` (features point-in-time as of the run; reuses covering offline materializations automatically,
+e.g. a deployment's `mlops_srv_aggoff_*`); append input + features + `prediction` + `scored_at`, `model_name`,
+`model_version`, `batch_deployment_id` to the output table.
+
+**Actions:** Run now · Pause/Resume (schedule) · Delete (deletes the job; output table kept) · recent runs (rows,
+version, errors, link) · Show latest predictions (newest `scored_at` slice).
+
+**Demo:** `cc_fraud_batch` scores `transactions_to_score` (refreshed 05:00 UTC by `mlops-demo-daily-transactions`)
+with `cc_fraud@champion` daily at 06:00 UTC → `cc_fraud_batch_predictions`.
 
 ## MLflow Integration Details
 

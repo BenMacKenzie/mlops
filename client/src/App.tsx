@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import type { Project, EOL, FeatureEntry, Run, OnlineTable, Deployment, TrainingSpec, DeclarativeFeature } from './types';
+import type { Project, EOL, FeatureEntry, Run, Deployment, TrainingSpec, DeploymentFeature, FeatureSchedule, BatchDeployment, ModelAliases } from './types';
 import * as api from './api';
 
 // ── Simple hash-based routing ──
@@ -153,8 +153,8 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
 
   if (!project) return <div className="text-center py-8">Loading...</div>;
 
-  const tabs = ['overview', 'eols', 'training', 'online-features', 'deployment'];
-  const tabLabels: Record<string, string> = { 'online-features': 'Online Features' };
+  const tabs = ['overview', 'eols', 'training', 'deployment', 'batch'];
+  const tabLabels: Record<string, string> = { deployment: 'Online Deployment', batch: 'Batch Deployment' };
 
   return (
     <div>
@@ -176,8 +176,8 @@ function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: s
       {tab === 'overview' && <OverviewTab project={project} eols={eols} trainingSpecs={trainingSpecs} specRuns={specRuns} />}
       {tab === 'eols' && <EOLsTab projectId={projectId} eols={eols} reload={load} />}
       {tab === 'training' && <TrainingSpecTab projectId={projectId} eols={eols} specs={trainingSpecs} runs={specRuns} reload={load} />}
-      {tab === 'online-features' && <OnlineFeaturesTab projectId={projectId} project={project} />}
       {tab === 'deployment' && <DeploymentTab projectId={projectId} eols={eols} trainingSpecs={trainingSpecs} runs={specRuns} />}
+      {tab === 'batch' && <BatchTab projectId={projectId} project={project} runs={specRuns} />}
     </div>
   );
 }
@@ -1583,524 +1583,683 @@ function TestEndpoint({ dep, entityColumns }: { dep: Deployment; entityColumns: 
 // ════════════════════════════════════════════
 //  DEPLOYMENT TAB
 // ════════════════════════════════════════════
-// ── Online Features Tab ──
-// Databricks-managed materialization of declarative (aggregation) features to the online
-// store on a schedule — the "feature views" path. Distinct from the Deployment tab's
-// publishing of precomputed FeatureLookup tables (which only mirrors, never recomputes).
-function windowLabel(tw: any): string {
-  if (!tw) return '';
-  const dur = tw.window_duration || '';
-  if (tw.type === 'sliding') return `sliding ${dur}/${tw.slide_duration || '?'}`;
-  if (tw.type === 'continuous') return `rolling ${dur}`;
-  return `${tw.type || 'window'} ${dur}`;
+const FEATURE_TYPE_LABEL: Record<string, string> = {
+  column_selection: 'lookup',
+  aggregation: 'aggregation',
+  custom_udf: 'on-demand',
+};
+
+const DOW: Record<string, string> = { SUN: 'Sun', MON: 'Mon', TUE: 'Tue', WED: 'Wed', THU: 'Thu', FRI: 'Fri', SAT: 'Sat',
+  '1': 'Sun', '2': 'Mon', '3': 'Tue', '4': 'Wed', '5': 'Thu', '6': 'Fri', '7': 'Sat' };
+const pad2 = (n: string | number) => String(n).padStart(2, '0');
+const isNum = (x: string) => /^\d+$/.test(x);
+
+// Plain-English Quartz cron ("sec min hour dom month dow [year]"); falls back to the raw expression.
+function describeCron(expr: string, tz: string): string {
+  const [sec, min, hour, dom, month, dow] = (expr || '').trim().split(/\s+/);
+  const anyDom = dom === '*' || dom === '?';
+  const anyDow = dow === '*' || dow === '?';
+  if (sec === '0' && month === '*') {
+    if (anyDom && anyDow) {
+      if (isNum(min) && isNum(hour)) return `daily at ${pad2(hour)}:${pad2(min)} ${tz}`;
+      if (isNum(min) && hour === '*') return `hourly at :${pad2(min)}`;
+      if (isNum(min) && /^(0|\*)\/\d+$/.test(hour)) return `every ${hour.split('/')[1]}h at :${pad2(min)}`;
+      if (/^(0|\*)\/\d+$/.test(min) && hour === '*') return `every ${min.split('/')[1]} min`;
+    }
+    if (dom === '?' && dow && !anyDow && isNum(min) && isNum(hour)) {
+      const days = dow.split(',').map(d => DOW[d.toUpperCase()] || d).join(', ');
+      return `weekly on ${days} at ${pad2(hour)}:${pad2(min)} ${tz}`;
+    }
+  }
+  return `cron ${expr} (${tz})`;
 }
 
-function OnlineFeaturesTab({ projectId, project }: { projectId: number; project: Project }) {
-  const [features, setFeatures] = useState<DeclarativeFeature[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [busyEntry, setBusyEntry] = useState<number | null>(null);
-  const [editEntry, setEditEntry] = useState<number | null>(null);
-  const [form, setForm] = useState({ trigger_type: 'derived', cron_expression: '', timezone_id: 'UTC' });
+// Next fire time for the common UTC daily/hourly shapes (null when we can't tell cheaply).
+function nextCronRun(expr: string, tz: string): Date | null {
+  if (tz !== 'UTC') return null;
+  const [sec, min, hour, dom, month, dow] = (expr || '').trim().split(/\s+/);
+  if (sec !== '0' || month !== '*' || !(dom === '*' || dom === '?') || !(dow === '*' || dow === '?') || !isNum(min)) return null;
+  const now = new Date();
+  const t = new Date(now);
+  t.setUTCSeconds(0, 0);
+  t.setUTCMinutes(Number(min));
+  if (isNum(hour)) {
+    t.setUTCHours(Number(hour));
+    if (t <= now) t.setUTCDate(t.getUTCDate() + 1);
+    return t;
+  }
+  if (hour === '*') {
+    if (t <= now) t.setUTCHours(t.getUTCHours() + 1);
+    return t;
+  }
+  return null;
+}
+
+function timeUntil(d: Date): string {
+  const mins = Math.round((d.getTime() - Date.now()) / 60000);
+  if (mins < 60) return `in ${Math.max(mins, 0)}m`;
+  return `in ${Math.round(mins / 60)}h`;
+}
+
+function describeSchedule(s: FeatureSchedule | null | undefined): string {
+  if (!s) return 'unknown';
+  if (s.kind === 'on_request') return 'computed per request';
+  if (s.kind === 'table_trigger') return 'when the source table changes';
+  const auto = s.mode === 'DERIVED' ? ' (auto)' : '';
+  return `${describeCron(s.cron_expression, s.timezone_id)}${auto}`;
+}
+
+function timeAgo(iso: string | null): string {
+  if (!iso) return '—';
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 60) return `${Math.max(mins, 0)}m ago`;
+  if (mins < 60 * 48) return `${Math.round(mins / 60)}h ago`;
+  return `${Math.round(mins / 1440)}d ago`;
+}
+
+// The features an online deployment serves from. Read-only: Deploy / Update model / Delete own the
+// lifecycle (features go online on deploy, and are torn down when no deployment uses them).
+function DeploymentFeatures({ dep }: { dep: Deployment }) {
+  const [features, setFeatures] = useState<DeploymentFeature[]>([]);
+  const [open, setOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
-    setLoading(true);
-    try { setFeatures(await api.getMaterializedFeatures(projectId)); }
-    finally { setLoading(false); }
-  }, [projectId]);
-  useEffect(() => { load(); }, [load]);
+    try { setFeatures(await api.getDeploymentFeatures(dep.id)); } catch { /* ignore */ }
+  }, [dep.id]);
+  useEffect(() => { load(); }, [load, dep.deploy_stage]);
 
-  const openEditor = (entryId: number, mf: any) => {
-    setEditEntry(entryId);
-    setForm({
-      trigger_type: mf?.trigger_type || 'derived',
-      cron_expression: mf?.cron_expression || '',
-      timezone_id: mf?.timezone_id || 'UTC',
-    });
-  };
-
-  const submit = async (entryId: number) => {
-    setBusyEntry(entryId);
-    setEditEntry(null);
-    try {
-      await api.materializeFeature(projectId, {
-        feature_entry_id: entryId,
-        trigger_type: form.trigger_type,
-        cron_expression: form.trigger_type === 'manual_cron' ? form.cron_expression : null,
-        timezone_id: form.trigger_type === 'manual_cron' ? form.timezone_id : null,
-      });
-      await load();
-    } catch (e: any) { alert(`Materialize failed: ${e.message}`); }
-    finally { setBusyEntry(null); }
-  };
-
-  const toggleState = async (mf: any) => {
-    setBusyEntry(mf.feature_entry_id);
-    try {
-      if (mf.status === 'PAUSED') await api.resumeMaterializedFeature(mf.id);
-      else await api.pauseMaterializedFeature(mf.id);
-      await load();
-    } catch (e: any) { alert(`Failed: ${e.message}`); }
-    finally { setBusyEntry(null); }
-  };
-
-  const refresh = async (mf: any) => {
-    setBusyEntry(mf.feature_entry_id);
-    try { await api.refreshMaterializedFeature(mf.id); await load(); }
+  const refresh = async () => {
+    setRefreshing(true);
+    try { setFeatures(await api.refreshDeploymentFeatures(dep.id)); }
     catch (e: any) { alert(`Refresh failed: ${e.message}`); }
-    finally { setBusyEntry(null); }
+    finally { setRefreshing(false); }
   };
 
-  const remove = async (mf: any) => {
-    if (!confirm(`Remove the online materialization for ${mf.feature_name}? This stops the pipeline and deletes the UC feature.`)) return;
-    setBusyEntry(mf.feature_entry_id);
-    try { await api.deleteMaterializedFeature(mf.id); await load(); }
-    catch (e: any) { alert(`Remove failed: ${e.message}`); }
-    finally { setBusyEntry(null); }
-  };
+  if (features.length === 0) {
+    if (dep.deploy_stage == null && dep.endpoint_status !== 'NOT_CREATED') {
+      return <div className="mt-3 text-xs text-amber-700">Online features not tracked yet — click <b>Deploy</b> to sync (nothing is re-materialized).</div>;
+    }
+    return null;
+  }
+  const tables = new Set(features.map(f => f.online_table).filter(Boolean));
+  const times = features.map(f => f.last_materialization_time).filter(Boolean) as string[];
+  const freshest = times.sort().pop() || null;
+  const paused = features.filter(f => f.pipeline_state === 'PAUSED').length;
+  const missing = features.filter(f => f.pipeline_state === 'MISSING').length;
 
-  if (loading) return <div className="text-center py-8">Loading...</div>;
+  // One line per feature type: "Aggregations: daily at 00:00 UTC (auto), next in 5h".
+  const groups: { label: string; type: string }[] = [
+    { label: 'Aggregations', type: 'aggregation' },
+    { label: 'Lookups', type: 'column_selection' },
+    { label: 'On-demand', type: 'custom_udf' },
+  ];
+  const summary = groups.map(g => {
+    const fs = features.filter(f => f.feature_type === g.type);
+    if (fs.length === 0) return null;
+    const descs = [...new Set(fs.map(f => describeSchedule(f.schedule)))];
+    const crons = fs.map(f => f.schedule).filter((x): x is Extract<FeatureSchedule, { kind: 'cron' }> => x?.kind === 'cron');
+    const next = crons.map(c => nextCronRun(c.cron_expression, c.timezone_id)).filter(Boolean).sort((a, b) => a!.getTime() - b!.getTime())[0];
+    return { label: g.label, text: descs.join(' / '), next };
+  }).filter(Boolean) as { label: string; text: string; next?: Date | null }[];
 
   return (
-    <div className="space-y-4">
-      <div className="bg-blue-50 border border-blue-200 rounded p-3 text-sm text-gray-700">
-        Declarative aggregation features are recomputed and pushed to the online store
-        (<span className="font-mono">{project.catalog}.{project.schema}</span>) by a Databricks-managed
-        pipeline on the schedule you choose here. Changing a schedule requires removing and re-adding;
-        <span className="font-medium"> pause/resume</span> is applied live.
+    <div className="mt-3 border-t pt-3">
+      <div className="flex items-center gap-3 text-sm">
+        <button onClick={() => setOpen(!open)} className="text-gray-700 hover:text-gray-900">
+          {open ? '▾' : '▸'} Online features: <span className="font-medium">{features.length}</span>
+          <span className="text-gray-500"> in {tables.size} online table{tables.size === 1 ? '' : 's'}</span>
+          {freshest && <span className="text-gray-500"> · last materialized {timeAgo(freshest)}</span>}
+        </button>
+        <button onClick={refresh} disabled={refreshing} className="text-xs text-blue-600 hover:underline disabled:opacity-50">
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
       </div>
-
-      {features.length === 0 && (
-        <div className="text-gray-500 text-sm py-6 text-center">
-          No declarative features defined. Add aggregation features to a training spec (Training tab) first.
+      <div className="mt-1 ml-4 text-xs text-gray-600 space-y-0.5">
+        {summary.map(g => (
+          <div key={g.label}>
+            <span className="font-medium text-gray-700">{g.label}:</span> {g.text}
+            {g.next && <span className="text-gray-500"> · next run {timeUntil(g.next)}</span>}
+          </div>
+        ))}
+        {paused > 0 && <div className="text-amber-700">{paused} feature pipeline(s) paused</div>}
+        {missing > 0 && <div className="text-red-600">{missing} feature(s) no longer materialized online — click Deploy to restore</div>}
+      </div>
+      {open && (
+        <table className="w-full text-left text-xs mt-2">
+          <thead className="text-gray-500">
+            <tr><th className="py-1 font-medium">Feature</th><th className="py-1 font-medium">Type</th><th className="py-1 font-medium">Online table</th><th className="py-1 font-medium">Refresh schedule</th><th className="py-1 font-medium">Last materialized</th></tr>
+          </thead>
+          <tbody className="divide-y">
+            {features.map(f => (
+              <tr key={f.feature_full_name}>
+                <td className="py-1 font-mono" title={f.feature_full_name}>{f.feature_full_name.split('.').pop()}</td>
+                <td className="py-1 text-gray-600">{FEATURE_TYPE_LABEL[f.feature_type] || f.feature_type}</td>
+                <td className="py-1 font-mono text-gray-600" title={f.online_table || ''}>
+                  {f.online_table ? f.online_table.split('.').pop() : <span className="text-gray-400">computed at serving</span>}
+                </td>
+                <td className="py-1 text-gray-600" title={f.schedule?.kind === 'cron' ? `${f.schedule.cron_expression} (${f.schedule.timezone_id}, ${f.schedule.mode || 'MANUAL'})` : ''}>
+                  {describeSchedule(f.schedule)}{f.pipeline_state === 'PAUSED' && <span className="text-amber-700"> · paused</span>}
+                </td>
+                <td className="py-1 text-gray-600" title={f.last_materialization_time || ''}>
+                  {f.online_table ? timeAgo(f.last_materialization_time) : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {open && (
+        <div className="mt-2 text-xs text-gray-500">
+          <b>Auto</b> = Databricks derives each aggregation's schedule from its time window (e.g. a 1-day slide → daily).
+          Lookups re-sync whenever their source table changes; on-demand features are computed on every request.
         </div>
       )}
-
-      <div className="space-y-3">
-        {features.map((f) => {
-          const spec = f.declarative_spec;
-          const mf = f.materialized;
-          const busy = busyEntry === f.feature_entry_id;
-          const status = mf?.status || 'NOT_MATERIALIZED';
-          return (
-            <div key={f.feature_entry_id} className="bg-white rounded-lg shadow p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="font-medium">
-                    {spec.function}({spec.input}) <span className="text-gray-400">·</span> <span className="font-mono text-sm">{windowLabel(spec.time_window)}</span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-0.5 truncate">
-                    source <span className="font-mono">{spec.source_table}</span>
-                    {spec.filter_condition && <> · filter <span className="font-mono">{spec.filter_condition}</span></>}
-                    <> · spec <span className="font-mono">{f.spec_name}</span></>
-                  </div>
-                  {mf && (
-                    <div className="text-xs text-gray-500 mt-1 space-x-3">
-                      <span>schedule: <span className="font-mono">{mf.trigger_type === 'manual_cron' ? (mf.cron_expression || '—') : mf.trigger_type === 'table_trigger' ? 'on table change' : (mf.resolved_cron || 'auto (derived)')}</span></span>
-                      {mf.last_materialization_time && <span>last run: <span className="font-mono">{mf.last_materialization_time}</span></span>}
-                      {mf.online_table_name && <span>online: <span className="font-mono">{mf.online_table_name}</span></span>}
-                    </div>
-                  )}
-                  {mf?.error_message && <div className={`text-xs mt-1 ${status === 'SERVING' ? 'text-gray-500' : 'text-red-600'}`}>{mf.error_message}</div>}
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <StatusBadge status={busy ? 'MATERIALIZING' : status} />
-                </div>
-              </div>
-
-              {/* Schedule editor */}
-              {editEntry === f.feature_entry_id ? (
-                <div className="mt-3 border-t pt-3 grid grid-cols-3 gap-3 items-end">
-                  <div>
-                    <label className="block text-xs font-medium mb-1">Trigger</label>
-                    <select className="w-full px-2 py-1.5 border rounded text-sm" value={form.trigger_type}
-                      onChange={e => setForm({ ...form, trigger_type: e.target.value })}>
-                      <option value="derived">Auto (derived from window)</option>
-                      <option value="manual_cron">Custom cron</option>
-                      <option value="table_trigger">On source table change</option>
-                    </select>
-                  </div>
-                  {form.trigger_type === 'manual_cron' && (
-                    <>
-                      <div>
-                        <label className="block text-xs font-medium mb-1">Quartz cron</label>
-                        <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" placeholder="0 0 * * * ?"
-                          value={form.cron_expression} onChange={e => setForm({ ...form, cron_expression: e.target.value })} />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium mb-1">Timezone</label>
-                        <input className="w-full px-2 py-1.5 border rounded font-mono text-sm" placeholder="UTC"
-                          value={form.timezone_id} onChange={e => setForm({ ...form, timezone_id: e.target.value })} />
-                      </div>
-                    </>
-                  )}
-                  <div className="col-span-3 flex gap-2">
-                    <button onClick={() => submit(f.feature_entry_id)} disabled={busy}
-                      className="px-3 py-1.5 bg-green-600 text-white rounded text-sm disabled:opacity-50">
-                      Materialize online
-                    </button>
-                    <button onClick={() => setEditEntry(null)} className="px-3 py-1.5 border rounded text-sm">Cancel</button>
-                    {form.trigger_type === 'derived' && (
-                      <span className="text-xs text-gray-500 self-center">Databricks computes the cadence from the window + delay.</span>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                (() => {
-                  // All four actions are always shown; each is enabled only when it applies.
-                  // Schedule is disabled once materialized: re-running create returns the existing
-                  // materialization unchanged, so changing the trigger means Remove → Schedule.
-                  // SERVING = a deployment's serving pipeline owns the materialization: read-only here
-                  // (Refresh only, so the row can flip back once that deployment stops using it).
-                  const scheduled = !!mf && (status === 'ACTIVE' || status === 'PAUSED');
-                  const serving = status === 'SERVING';
-                  const canSchedule = !mf || status === 'NOT_MATERIALIZED' || status === 'FAILED';
-                  const canRemove = !!mf && !serving && status !== 'NOT_MATERIALIZED' && status !== 'MATERIALIZING';
-                  const btn = 'px-3 py-1.5 border rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed';
-                  return (
-                    <div className="mt-3 flex gap-2">
-                      <button onClick={() => openEditor(f.feature_entry_id, mf)} disabled={busy || !canSchedule}
-                        title={canSchedule ? 'Choose a trigger and materialize to the online store' : serving ? 'Materialized by a deployment — manage it from the Deployment tab' : 'Already scheduled — Remove first to change the schedule'}
-                        className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed">
-                        Schedule
-                      </button>
-                      <button onClick={() => toggleState(mf)} disabled={busy || !scheduled}
-                        title={scheduled ? undefined : 'Nothing scheduled yet'} className={btn}>
-                        {status === 'PAUSED' ? 'Resume' : 'Pause'}
-                      </button>
-                      <button onClick={() => refresh(mf)} disabled={busy || !(scheduled || serving)}
-                        title={scheduled || serving ? 'Re-read live schedule state and last run time' : 'Nothing scheduled yet'} className={btn}>
-                        Refresh
-                      </button>
-                      <button onClick={() => remove(mf)} disabled={busy || !canRemove}
-                        title={canRemove ? undefined : 'Nothing to remove'}
-                        className={`${btn} border-red-300 text-red-600`}>
-                        Remove
-                      </button>
-                    </div>
-                  );
-                })()
-              )}
-            </div>
-          );
-        })}
-      </div>
     </div>
+  );
+}
+
+function DeployProgress({ dep }: { dep: Deployment }) {
+  const pending = Object.keys(dep.pending_release || {}).length;
+  let msg: string | null = null;
+  if (dep.deploy_stage === 'FEATURES') msg = 'Putting the model\'s features online — new pipelines take several minutes to load…';
+  else if (dep.deploy_stage === 'ENDPOINT') msg = 'Configuring the serving endpoint…';
+  else if (dep.endpoint_status === 'CREATING') msg = 'Endpoint provisioning — first deploy can take 20–25 min (feature-serving sidecar)…';
+  return (
+    <>
+      {msg && <div className="mt-2 text-xs text-blue-700 flex items-center gap-2"><span className="animate-pulse">●</span>{msg}</div>}
+      {dep.deploy_stage === 'FAILED' && (
+        <div className="mt-2 text-xs text-red-600 whitespace-pre-wrap">Deploy failed: {dep.deploy_error}</div>
+      )}
+      {dep.deploy_stage !== 'FAILED' && dep.deploy_error && (
+        <div className="mt-2 text-xs text-amber-700 whitespace-pre-wrap">{dep.deploy_error}</div>
+      )}
+      {pending > 0 && (
+        <div className="mt-1 text-xs text-gray-500">{pending} feature(s) only the previous model used will be removed once the endpoint is READY.</div>
+      )}
+    </>
   );
 }
 
 function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
   projectId: number; eols: EOL[]; trainingSpecs: TrainingSpec[]; runs: Run[];
 }) {
-  const [onlineTables, setOnlineTables] = useState<OnlineTable[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', run_id: '', endpoint_name: '' });
-  const [selectedDepId, setSelectedDepId] = useState<number | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const load = useCallback(async () => {
-    const [ot, dep] = await Promise.all([
-      api.getOnlineTables(projectId),
-      api.getDeployments(projectId),
-    ]);
-    // Refresh status for any still-provisioning synced table. The stored status is
-    // written as PROVISIONING at publish time and only the server-side check-status
-    // call reconciles it against the real synced-table state, so always re-check
-    // PROVISIONING rows (they otherwise display PROVISIONING forever).
-    const refreshed = await Promise.all(ot.map(async (t) => {
-      if (t.status === 'PROVISIONING') {
-        try { return await api.checkOnlineTableStatus(t.id); } catch { return t; }
-      }
-      return t;
-    }));
-    setOnlineTables(refreshed);
-    setDeployments(dep);
+    setDeployments(await api.getDeployments(projectId));
   }, [projectId]);
-
   useEffect(() => { load(); }, [load]);
 
-  // Poll for PROVISIONING online tables and CREATING endpoints
+  // Poll while a deploy runs in the background or an endpoint is provisioning.
+  const busy = deployments.some(d => d.deploy_stage === 'FEATURES' || d.deploy_stage === 'ENDPOINT' || d.endpoint_status === 'CREATING');
   useEffect(() => {
-    const provisioningOt = onlineTables.filter(ot => ot.status === 'PROVISIONING');
-    const creatingDep = deployments.filter(d => d.endpoint_status === 'CREATING');
-    if (provisioningOt.length === 0 && creatingDep.length === 0) {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-      return;
-    }
-    if (pollRef.current) return;
-    pollRef.current = setInterval(async () => {
-      let changed = false;
-      for (const ot of provisioningOt) {
-        try {
-          const updated = await api.checkOnlineTableStatus(ot.id);
-          if (updated.status !== 'PROVISIONING') changed = true;
-        } catch { /* ignore */ }
+    if (!busy) return;
+    const t = setInterval(async () => {
+      for (const d of deployments.filter(x => x.endpoint_status === 'CREATING' && x.deploy_stage !== 'FEATURES' && x.deploy_stage !== 'ENDPOINT')) {
+        try { await api.checkDeploymentStatus(d.id); } catch { /* ignore */ }
       }
-      for (const d of creatingDep) {
-        try {
-          const updated = await api.checkDeploymentStatus(d.id);
-          if (updated.endpoint_status !== 'CREATING') changed = true;
-        } catch { /* ignore */ }
-      }
-      if (changed) load();
-    }, 15000);
-    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
-  }, [onlineTables, deployments, load]);
-
-  // Map online table name → online table record
-  const onlineTableMap = new Map(onlineTables.map(ot => [ot.online_table_name, ot]));
-
-  // For a selected deployment, the online tables it serves from (recorded by publish-tables)
-  const selectedDep = deployments.find(d => d.id === selectedDepId);
-  const requiredTables = new Set(selectedDep?.serving_tables || []);
+      load();
+    }, 10000);
+    return () => clearInterval(t);
+  }, [busy, deployments, load]);
 
   const registeredRuns = runs.filter(r => r.model_name && r.model_version);
 
-  const removeOnlineTable = async (ot: OnlineTable) => {
-    if (!confirm(`Stop tracking ${ot.online_table_name}? (This does not drop the table or its pipeline.)`)) return;
-    try {
-      await api.deleteOnlineTable(ot.id);
-      load();
-    } catch (e: any) { alert(`Delete failed: ${e.message}`); }
-  };
-
   const submitDeployment = async () => {
     if (!form.name || !form.run_id || !form.endpoint_name) return;
-    await api.createDeployment(projectId, {
-      name: form.name,
-      run_id: parseInt(form.run_id),
-      endpoint_name: form.endpoint_name,
-    });
+    await api.createDeployment(projectId, { name: form.name, run_id: parseInt(form.run_id), endpoint_name: form.endpoint_name });
     setForm({ name: '', run_id: '', endpoint_name: '' });
     setShowForm(false);
     load();
   };
 
-  const publishAllRequired = async (depId: number) => {
-    try {
-      const result = await api.publishDeploymentTables(depId);
-      if (result.published > 0) load();
-    } catch (e: any) { alert(`Publish failed: ${e.message}`); }
+  const deploy = async (dep: Deployment) => {
+    try { await api.deployDeployment(dep.id); load(); }
+    catch (e: any) { alert(`Deploy failed: ${e.message}`); }
   };
 
-  const createEndpoint = async (depId: number) => {
-    try {
-      await api.createDeploymentEndpoint(depId);
-      load();
-    } catch (e: any) { alert(`Endpoint creation failed: ${e.message}`); }
+  const updateModel = async (dep: Deployment, runId: number) => {
+    try { await api.updateDeploymentEndpoint(dep.id, runId); load(); }
+    catch (e: any) { alert(`Update failed: ${e.message}`); }
   };
 
-  // Get entity columns for a deployment (EOL entity columns = inference input keys)
+  const remove = async (dep: Deployment) => {
+    if (!confirm(`Delete deployment ${dep.name}? This deletes endpoint ${dep.endpoint_name} and removes online features no other deployment uses.`)) return;
+    try { await api.deleteDeployment(dep.id); load(); }
+    catch (e: any) { alert(`Delete failed: ${e.message}`); }
+  };
+
+  // EOL entity columns = inference input keys (for the test form)
   const getEntityColumns = (dep: Deployment): string[] => {
     const run = runs.find(r => r.id === dep.run_id);
-    if (!run) return [];
-    const spec = trainingSpecs.find(s => s.id === run.training_spec_id);
-    if (!spec) return [];
-    const eol = eols.find(e => e.id === spec.eol_id);
-    if (!eol) return [];
-    const cols = eol.entity_columns;
+    const spec = run ? trainingSpecs.find(s => s.id === run.training_spec_id) : null;
+    const eol = spec ? eols.find(e => e.id === spec.eol_id) : null;
+    const cols = eol?.entity_columns;
     if (Array.isArray(cols)) return cols;
     if (typeof cols === 'string') return (cols as string).replace(/^\{|\}$/g, '').split(',').filter(Boolean);
     return [];
   };
 
-  // A deployment is ready once publish-tables has run and every online table it needs is ONLINE
-  const allTablesOnline = (dep: Deployment) =>
-    dep.serving_tables != null && dep.serving_tables.every(t => onlineTableMap.get(t)?.status === 'ONLINE');
-
   const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
 
   return (
     <div>
-      {/* ── Online Tables (created per deployment by "Publish Tables") ── */}
-      <div className="mb-8">
-        <h2 className="text-lg font-medium mb-4">Online Tables</h2>
-        {selectedDep && (
-          <div className="mb-3 p-2 bg-blue-50 rounded text-sm text-blue-700">
-            Highlighting tables required by deployment <span className="font-medium">{selectedDep.name}</span>
-            {selectedDep.serving_tables == null && <span className="ml-1">(not published yet)</span>}
-            <button className="ml-2 text-blue-500 hover:underline text-xs" onClick={() => setSelectedDepId(null)}>Clear</button>
-          </div>
-        )}
-        <div className="bg-white rounded-lg shadow overflow-hidden">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-4 py-3 font-medium text-gray-500">Online Table</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Status</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Used By</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Job</th>
-                <th className="px-4 py-3 font-medium text-gray-500"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {onlineTables.map(ot => {
-                const usedBy = deployments.filter(d => d.serving_tables?.includes(ot.online_table_name));
-                const isRequired = selectedDep ? requiredTables.has(ot.online_table_name) : false;
-                const rowClass = selectedDep ? (isRequired ? 'bg-blue-50' : 'opacity-40') : '';
-                return (
-                  <tr key={ot.id} className={`hover:bg-gray-50 ${rowClass}`}>
-                    <td className="px-4 py-3 font-mono text-xs" title={ot.online_table_name}>{ot.online_table_name.split('.').pop()}</td>
-                    <td className="px-4 py-3"><StatusBadge status={ot.status} /></td>
-                    <td className="px-4 py-3 text-xs text-gray-500">
-                      {usedBy.length > 0 ? usedBy.map(d => d.name).join(', ') : <span className="text-gray-400">unused</span>}
-                    </td>
-                    <td className="px-4 py-3 text-xs">
-                      {ot.pipeline_id?.startsWith('http') ? (
-                        <a href={ot.pipeline_id} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">View</a>
-                      ) : (
-                        <span className="text-gray-400">-</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-xs">
-                      <button onClick={() => removeOnlineTable(ot)} className="text-red-500 text-xs hover:underline">Remove</button>
-                    </td>
-                  </tr>
-                );
-              })}
-              {onlineTables.length === 0 && (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">No online tables yet — use "Publish Tables" on a deployment below</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="text-lg font-medium">Deployments</h2>
+        <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+          {showForm ? 'Cancel' : 'New Deployment'}
+        </button>
       </div>
 
-      {/* ── Deployments ── */}
-      <div>
-        <div className="flex justify-between items-center mb-4">
-          <h2 className="text-lg font-medium">Deployments</h2>
-          <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
-            {showForm ? 'Cancel' : 'New Deployment'}
-          </button>
-        </div>
-
-        {showForm && (
-          <div className="mb-4 p-4 border rounded-lg bg-white shadow">
-            <div className="grid grid-cols-3 gap-3">
-              <div>
-                <label className="block text-sm font-medium mb-1">Name</label>
-                <input className="w-full px-3 py-2 border rounded" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. production" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Model (registered run)</label>
-                <select className="w-full px-3 py-2 border rounded" value={form.run_id} onChange={e => {
-                  const runId = e.target.value;
-                  const run = registeredRuns.find(r => r.id === parseInt(runId));
-                  setForm({
-                    ...form,
-                    run_id: runId,
-                    endpoint_name: form.endpoint_name || (run ? `mlops-${run.model_name?.split('.').pop() || ''}` : ''),
-                  });
-                }}>
-                  <option value="">Select model...</option>
-                  {registeredRuns.map(r => (
-                    <option key={r.id} value={r.id}>
-                      {r.model_name?.split('.').pop()} v{r.model_version} (run #{r.id})
-                    </option>
-                  ))}
-                </select>
-                {registeredRuns.length === 0 && <div className="text-xs text-gray-400 mt-1">No registered models — register a model from the Training tab first</div>}
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Endpoint Name</label>
-                <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.endpoint_name} onChange={e => setForm({ ...form, endpoint_name: e.target.value })} placeholder="mlops-model-name" />
-              </div>
+      {showForm && (
+        <div className="mb-4 p-4 border rounded-lg bg-white shadow">
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Name</label>
+              <input className="w-full px-3 py-2 border rounded" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. production" />
             </div>
-            <div className="mt-3 flex gap-2">
-              <button onClick={submitDeployment} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.run_id || !form.endpoint_name}>Create</button>
-              <button onClick={() => setShowForm(false)} className="px-4 py-2 bg-gray-200 rounded text-sm">Cancel</button>
+            <div>
+              <label className="block text-sm font-medium mb-1">Model (registered run)</label>
+              <select className="w-full px-3 py-2 border rounded" value={form.run_id} onChange={e => {
+                const runId = e.target.value;
+                const run = registeredRuns.find(r => r.id === parseInt(runId));
+                setForm({ ...form, run_id: runId, endpoint_name: form.endpoint_name || (run ? `mlops-${run.model_name?.split('.').pop() || ''}` : '') });
+              }}>
+                <option value="">Select model...</option>
+                {registeredRuns.map(r => (
+                  <option key={r.id} value={r.id}>{r.model_name?.split('.').pop()} v{r.model_version} (run #{r.id})</option>
+                ))}
+              </select>
+              {registeredRuns.length === 0 && <div className="text-xs text-gray-400 mt-1">No registered models — register a model from the Training tab first</div>}
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Endpoint Name</label>
+              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.endpoint_name} onChange={e => setForm({ ...form, endpoint_name: e.target.value })} placeholder="mlops-model-name" />
             </div>
           </div>
-        )}
-
-        <div className="space-y-4">
-          {deployments.map(dep => {
-            const run = runs.find(r => r.id === dep.run_id);
-            const spec = run ? trainingSpecs.find(s => s.id === run.training_spec_id) : null;
-            const isSelected = selectedDepId === dep.id;
-            const tablesReady = allTablesOnline(dep);
-
-            return (
-              <div key={dep.id} className={`p-4 bg-white rounded-lg shadow ${isSelected ? 'ring-2 ring-blue-400' : ''}`}>
-                <div className="flex justify-between items-start">
-                  <div>
-                    <h3 className="font-medium">
-                      {dep.name} <StatusBadge status={dep.endpoint_status} />
-                    </h3>
-                    <div className="text-sm text-gray-500 mt-1">
-                      Model: {run?.model_name ? (
-                        <a
-                          href={`${host}/explore/data/models/${run.model_name.replace(/\./g, '/')}${run.model_version ? `/version/${run.model_version}` : ''}`}
-                          target="_blank" rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline font-mono"
-                        >{run.model_name.split('.').pop()} v{run.model_version}</a>
-                      ) : 'unknown'}
-                      {spec && <> | Spec: <span className="font-mono">{spec.name}</span></>}
-                    </div>
-                    <div className="text-sm text-gray-500">
-                      Endpoint: <span className="font-mono">{dep.endpoint_name}</span>
-                    </div>
-                  </div>
-                  <div className="flex gap-2 items-start">
-                    <button
-                      onClick={() => setSelectedDepId(isSelected ? null : dep.id)}
-                      className={`px-2 py-1 text-xs rounded ${isSelected ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
-                    >{isSelected ? 'Hide Tables' : 'Show Tables'}</button>
-
-                    {dep.endpoint_status === 'NOT_CREATED' && !tablesReady && (
-                      <button onClick={() => publishAllRequired(dep.id)} className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700">
-                        Publish Tables
-                      </button>
-                    )}
-                    {dep.endpoint_status === 'NOT_CREATED' && tablesReady && (
-                      <button onClick={() => createEndpoint(dep.id)} className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">
-                        Create Endpoint
-                      </button>
-                    )}
-                    {dep.endpoint_status === 'NOT_CREATED' && !tablesReady && (
-                      <span className="text-xs text-yellow-600 py-1">{dep.serving_tables == null ? 'Tables not published' : 'Tables provisioning'}</span>
-                    )}
-                    {dep.endpoint_status === 'CREATING' && (
-                      <button onClick={() => api.checkDeploymentStatus(dep.id).then(load)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">
-                        Check Status
-                      </button>
-                    )}
-                    {(dep.endpoint_status === 'READY' || dep.endpoint_status === 'CREATING') && registeredRuns.length > 0 && (
-                      <select
-                        className="px-2 py-1 border rounded text-xs"
-                        value=""
-                        onChange={e => {
-                          const newRunId = parseInt(e.target.value);
-                          if (newRunId && newRunId !== dep.run_id) {
-                            api.updateDeploymentEndpoint(dep.id, newRunId).then(load).catch(err => alert(err.message));
-                          }
-                        }}
-                      >
-                        <option value="">Update model...</option>
-                        {registeredRuns.filter(r => r.id !== dep.run_id).map(r => (
-                          <option key={r.id} value={r.id}>
-                            {r.model_name?.split('.').pop()} v{r.model_version} (run #{r.id})
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                    {dep.endpoint_status !== 'NOT_CREATED' && host && (
-                      <a href={`${host}/ml/endpoints/${dep.endpoint_name}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline">Endpoint UI</a>
-                    )}
-                    <button onClick={() => { api.deleteDeployment(dep.id).then(load); }} className="text-red-500 text-sm">Delete</button>
-                  </div>
-                </div>
-
-                {/* Test interface for READY endpoints */}
-                {dep.endpoint_status === 'READY' && <TestEndpoint dep={dep} entityColumns={getEntityColumns(dep)} />}
-              </div>
-            );
-          })}
-          {deployments.length === 0 && (
-            <div className="text-center py-8 text-gray-400">No deployments yet</div>
-          )}
+          <div className="mt-3 flex gap-2">
+            <button onClick={submitDeployment} className="px-4 py-2 bg-green-600 text-white rounded text-sm" disabled={!form.name || !form.run_id || !form.endpoint_name}>Create</button>
+            <button onClick={() => setShowForm(false)} className="px-4 py-2 bg-gray-200 rounded text-sm">Cancel</button>
+          </div>
         </div>
+      )}
+
+      <div className="space-y-4">
+        {deployments.map(dep => {
+          const run = runs.find(r => r.id === dep.run_id);
+          const spec = run ? trainingSpecs.find(s => s.id === run.training_spec_id) : null;
+          const inProgress = dep.deploy_stage === 'FEATURES' || dep.deploy_stage === 'ENDPOINT';
+          const untracked = dep.deploy_stage == null && dep.endpoint_status !== 'NOT_CREATED';
+          const canDeploy = !inProgress && (dep.endpoint_status === 'NOT_CREATED' || dep.endpoint_status === 'FAILED' || dep.deploy_stage === 'FAILED' || untracked);
+          const canUpdate = !inProgress && (dep.endpoint_status === 'READY' || dep.endpoint_status === 'CREATING') && registeredRuns.length > 1;
+
+          return (
+            <div key={dep.id} className="p-4 bg-white rounded-lg shadow">
+              <div className="flex justify-between items-start">
+                <div>
+                  <h3 className="font-medium">
+                    {dep.name} <StatusBadge status={inProgress ? 'RUNNING' : dep.endpoint_status} />
+                  </h3>
+                  <div className="text-sm text-gray-500 mt-1">
+                    Model: {run?.model_name ? (
+                      <a href={`${host}/explore/data/models/${run.model_name.replace(/\./g, '/')}${run.model_version ? `/version/${run.model_version}` : ''}`}
+                        target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline font-mono"
+                      >{run.model_name.split('.').pop()} v{run.model_version}</a>
+                    ) : 'unknown'}
+                    {spec && <> | Spec: <span className="font-mono">{spec.name}</span></>}
+                  </div>
+                  <div className="text-sm text-gray-500">Endpoint: <span className="font-mono">{dep.endpoint_name}</span></div>
+                </div>
+                <div className="flex gap-2 items-start">
+                  {canDeploy && (
+                    <button onClick={() => deploy(dep)} className="px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700"
+                      title="Put the model's features online (only what's missing), then create or update the endpoint">
+                      {untracked ? 'Deploy (sync)' : dep.deploy_stage === 'FAILED' ? 'Retry deploy' : 'Deploy'}
+                    </button>
+                  )}
+                  {canUpdate && (
+                    <select className="px-2 py-1 border rounded text-xs" value="" onChange={e => {
+                      const newRunId = parseInt(e.target.value);
+                      if (newRunId && newRunId !== dep.run_id) updateModel(dep, newRunId);
+                    }}>
+                      <option value="">Update model...</option>
+                      {registeredRuns.filter(r => r.id !== dep.run_id).map(r => (
+                        <option key={r.id} value={r.id}>{r.model_name?.split('.').pop()} v{r.model_version} (run #{r.id})</option>
+                      ))}
+                    </select>
+                  )}
+                  {dep.endpoint_status !== 'NOT_CREATED' && host && (
+                    <a href={`${host}/ml/endpoints/${dep.endpoint_name}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline py-1">Endpoint UI</a>
+                  )}
+                  <button onClick={() => remove(dep)} disabled={inProgress} className="text-red-500 text-sm disabled:opacity-40">Delete</button>
+                </div>
+              </div>
+
+              <DeployProgress dep={dep} />
+              <DeploymentFeatures dep={dep} />
+
+              {dep.endpoint_status === 'READY' && !inProgress && <TestEndpoint dep={dep} entityColumns={getEntityColumns(dep)} />}
+            </div>
+          );
+        })}
+        {deployments.length === 0 && (
+          <div className="text-center py-8 text-gray-400">No deployments yet — create one, then <b>Deploy</b> puts its model's features online and creates the endpoint.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════
+//  BATCH DEPLOYMENT TAB
+// ════════════════════════════════════════════
+// Scheduled batch inference: score a table of request fields with model@alias; the job adds the model's
+// timestamp column = run time, resolves features point-in-time and appends input + features + prediction
+// to the output table. The job runs without the app (all settings live in the Databricks job).
+
+type ScheduleMode = 'none' | 'daily' | 'cron';
+const emptyBatchForm = {
+  name: '', model_name: '', model_alias: '', input_mode: 'table' as 'table' | 'sql', input_table: '', input_sql: '',
+  output_table: '', schedule: 'daily' as ScheduleMode, daily_time: '06:00', cron_expression: '', timezone_id: 'UTC',
+};
+
+function scheduleToCron(f: typeof emptyBatchForm): string | null {
+  if (f.schedule === 'none') return null;
+  if (f.schedule === 'daily') {
+    const [h, m] = (f.daily_time || '06:00').split(':');
+    return `0 ${Number(m) || 0} ${Number(h) || 0} * * ?`;
+  }
+  return f.cron_expression.trim() || null;
+}
+
+function ModelAliasPicker({ modelName, value, onChange }: { modelName: string; value: string; onChange: (a: string) => void }) {
+  const [info, setInfo] = useState<ModelAliases | null>(null);
+  const [setting, setSetting] = useState({ open: false, alias: 'champion', version: '' });
+  const load = useCallback(async () => {
+    if (!modelName) { setInfo(null); return; }
+    try { setInfo(await api.getModelAliases(modelName)); } catch { setInfo({ aliases: [], versions: [] }); }
+  }, [modelName]);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    try {
+      await api.setModelAlias(modelName, setting.alias, Number(setting.version));
+      setSetting({ ...setting, open: false });
+      await load();
+      onChange(setting.alias);
+    } catch (e: any) { alert(`Set alias failed: ${e.message}`); }
+  };
+
+  if (!modelName) return <select className="w-full px-3 py-2 border rounded text-sm" disabled><option>Pick a model first</option></select>;
+  return (
+    <div>
+      <select className="w-full px-3 py-2 border rounded text-sm" value={value} onChange={e => onChange(e.target.value)}>
+        <option value="">Select alias...</option>
+        {(info?.aliases || []).map(a => <option key={a.alias} value={a.alias}>@{a.alias} → v{a.version}</option>)}
+      </select>
+      {!setting.open ? (
+        <button className="text-xs text-blue-600 hover:underline mt-1" onClick={() => setSetting({ ...setting, open: true, version: String(info?.versions?.[0] || '') })}>
+          {info && info.aliases.length === 0 ? 'No aliases yet — set one' : 'Set / move an alias'}
+        </button>
+      ) : (
+        <div className="flex gap-1 mt-1 items-center text-xs">
+          @<input className="px-1 py-0.5 border rounded w-24 font-mono" value={setting.alias} onChange={e => setSetting({ ...setting, alias: e.target.value })} />
+          →
+          <select className="px-1 py-0.5 border rounded" value={setting.version} onChange={e => setSetting({ ...setting, version: e.target.value })}>
+            {(info?.versions || []).map(v => <option key={v} value={v}>v{v}</option>)}
+          </select>
+          <button className="px-2 py-0.5 bg-blue-600 text-white rounded" onClick={save} disabled={!setting.alias || !setting.version}>Set</button>
+          <button className="px-2 py-0.5 border rounded" onClick={() => setSetting({ ...setting, open: false })}>Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BatchPreview({ id }: { id: number }) {
+  const [rows, setRows] = useState<Record<string, any>[] | null>(null);
+  useEffect(() => { api.previewBatch(id).then(setRows).catch(() => setRows([])); }, [id]);
+  if (rows === null) return <div className="text-xs text-gray-400 mt-2">Loading preview…</div>;
+  if (rows.length === 0) return <div className="text-xs text-gray-400 mt-2">No predictions yet — run it once.</div>;
+  const cols = Object.keys(rows[0]);
+  return (
+    <div className="mt-2 overflow-x-auto border rounded">
+      <table className="text-xs">
+        <thead className="bg-gray-50"><tr>{cols.map(c => (
+          <th key={c} className={`px-2 py-1 text-left font-medium whitespace-nowrap ${c === 'prediction' ? 'text-blue-700' : 'text-gray-500'}`}>{c}</th>
+        ))}</tr></thead>
+        <tbody className="divide-y">{rows.map((r, i) => (
+          <tr key={i}>{cols.map(c => (
+            <td key={c} className={`px-2 py-1 font-mono whitespace-nowrap ${c === 'prediction' ? 'font-semibold' : ''}`}>{r[c] == null ? '∅' : String(r[c])}</td>
+          ))}</tr>
+        ))}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function BatchTab({ projectId, project, runs }: { projectId: number; project: Project; runs: Run[] }) {
+  const [items, setItems] = useState<BatchDeployment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState(emptyBatchForm);
+  const [saving, setSaving] = useState(false);
+  const [previewId, setPreviewId] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    try { setItems(await api.getBatchDeployments(projectId)); }
+    finally { setLoading(false); }
+  }, [projectId]);
+  useEffect(() => { load(); }, [load]);
+
+  // Poll while any run is in flight.
+  const active = items.some(b => b.runs.some(r => ['RUNNING', 'PENDING', 'QUEUED', 'BLOCKED', 'TERMINATING'].includes(r.state)));
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(load, 15000);
+    return () => clearInterval(t);
+  }, [active, load]);
+
+  const models = [...new Set(runs.filter(r => r.model_name && r.model_version).map(r => r.model_name as string))];
+
+  const openForm = () => {
+    setForm({ ...emptyBatchForm, model_name: models[0] || '' });
+    setShowForm(true);
+  };
+
+  const submit = async () => {
+    setSaving(true);
+    try {
+      await api.createBatchDeployment(projectId, {
+        name: form.name, model_name: form.model_name, model_alias: form.model_alias,
+        input_table: form.input_mode === 'table' ? form.input_table : null,
+        input_sql: form.input_mode === 'sql' ? form.input_sql : null,
+        output_table: form.output_table || `${project.catalog}.${project.schema}.${form.name}_predictions`,
+        cron_expression: scheduleToCron(form), timezone_id: form.timezone_id || 'UTC',
+      });
+      setShowForm(false);
+      await load();
+    } catch (e: any) { alert(`Create failed: ${e.message}`); }
+    finally { setSaving(false); }
+  };
+
+  const act = async (fn: () => Promise<any>, label: string) => {
+    try { await fn(); await load(); } catch (e: any) { alert(`${label} failed: ${e.message}`); }
+  };
+
+  const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
+  const cronPreview = scheduleToCron(form);
+  const outPlaceholder = `${project.catalog}.${project.schema}.${form.name || '<name>'}_predictions`;
+
+  if (loading) return <div className="text-center py-8">Loading...</div>;
+
+  return (
+    <div>
+      <div className="bg-blue-50 border border-blue-200 rounded p-3 text-sm text-gray-700 mb-4">
+        A batch deployment scores every row of an <b>input table</b> — the fields a requesting system would send
+        (entity keys + request-time fields) — with <span className="font-mono">model@alias</span>. Each run sets the
+        model's timestamp column to the <b>run time</b>, computes features point-in-time, and appends input + features +
+        prediction to the <b>output table</b>. It's a Databricks job: it runs on schedule without this app.
+      </div>
+
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="text-lg font-medium">Batch Deployments</h2>
+        <button onClick={() => (showForm ? setShowForm(false) : openForm())} className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+          {showForm ? 'Cancel' : 'New Batch Deployment'}
+        </button>
+      </div>
+
+      {showForm && (
+        <div className="mb-4 p-4 border rounded-lg bg-white shadow space-y-3">
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Name</label>
+              <input className="w-full px-3 py-2 border rounded text-sm" value={form.name} placeholder="e.g. daily_scoring"
+                onChange={e => setForm({ ...form, name: e.target.value.replace(/[^A-Za-z0-9_]/g, '_') })} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Model</label>
+              <select className="w-full px-3 py-2 border rounded text-sm" value={form.model_name} onChange={e => setForm({ ...form, model_name: e.target.value, model_alias: '' })}>
+                <option value="">Select model...</option>
+                {models.map(m => <option key={m} value={m}>{m.split('.').pop()}</option>)}
+              </select>
+              {models.length === 0 && <div className="text-xs text-gray-400 mt-1">Register a model from the Training tab first</div>}
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Alias (followed each run)</label>
+              <ModelAliasPicker modelName={form.model_name} value={form.model_alias} onChange={a => setForm(f => ({ ...f, model_alias: a }))} />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-1">
+              Input — request fields to score
+              <span className="ml-3 font-normal text-xs">
+                <label className="mr-3"><input type="radio" checked={form.input_mode === 'table'} onChange={() => setForm({ ...form, input_mode: 'table' })} /> table</label>
+                <label><input type="radio" checked={form.input_mode === 'sql'} onChange={() => setForm({ ...form, input_mode: 'sql' })} /> SQL</label>
+              </span>
+            </label>
+            {form.input_mode === 'table' ? (
+              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.input_table}
+                placeholder={`${project.catalog}.${project.schema}.transactions_to_score`} onChange={e => setForm({ ...form, input_table: e.target.value.trim() })} />
+            ) : (
+              <textarea className="w-full px-3 py-2 border rounded font-mono text-sm" rows={3} value={form.input_sql}
+                placeholder="SELECT customer_id, merchant_id, amount, ... FROM ..." onChange={e => setForm({ ...form, input_sql: e.target.value })} />
+            )}
+            <div className="text-xs text-gray-500 mt-1">Must contain every request field the model was trained with, and <b>not</b> its timestamp column (set to the run time).</div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <div className="col-span-1">
+              <label className="block text-sm font-medium mb-1">Output table (appended)</label>
+              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.output_table}
+                placeholder={outPlaceholder} onChange={e => setForm({ ...form, output_table: e.target.value.trim() })} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Schedule</label>
+              <div className="flex gap-2">
+                <select className="px-2 py-2 border rounded text-sm" value={form.schedule} onChange={e => setForm({ ...form, schedule: e.target.value as ScheduleMode })}>
+                  <option value="daily">Daily at</option>
+                  <option value="cron">Custom cron</option>
+                  <option value="none">Manual only</option>
+                </select>
+                {form.schedule === 'daily' && (
+                  <input type="time" className="px-2 py-2 border rounded text-sm" value={form.daily_time} onChange={e => setForm({ ...form, daily_time: e.target.value })} />
+                )}
+                {form.schedule === 'cron' && (
+                  <input className="flex-1 px-2 py-2 border rounded font-mono text-sm" placeholder="0 0 6 * * ?" value={form.cron_expression}
+                    onChange={e => setForm({ ...form, cron_expression: e.target.value })} />
+                )}
+              </div>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Timezone</label>
+              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.timezone_id} disabled={form.schedule === 'none'}
+                onChange={e => setForm({ ...form, timezone_id: e.target.value })} />
+            </div>
+          </div>
+          <div className="text-xs text-gray-500">
+            {cronPreview ? <>Runs {describeCron(cronPreview, form.timezone_id || 'UTC')}.</> : 'Runs only when you click Run now (or from the Jobs UI).'}
+          </div>
+
+          <div className="flex gap-2">
+            <button onClick={submit} disabled={saving || !form.name || !form.model_name || !form.model_alias || !(form.input_mode === 'table' ? form.input_table : form.input_sql)}
+              className="px-4 py-2 bg-green-600 text-white rounded text-sm disabled:opacity-50">{saving ? 'Creating job…' : 'Create'}</button>
+            <button onClick={() => setShowForm(false)} className="px-4 py-2 bg-gray-200 rounded text-sm">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="space-y-4">
+        {items.map(b => {
+          const last = b.runs[0];
+          const lastOk = b.runs.find(r => r.state === 'SUCCESS');
+          const next = b.cron_expression && !b.paused ? nextCronRun(b.cron_expression, b.timezone_id) : null;
+          return (
+            <div key={b.id} className="p-4 bg-white rounded-lg shadow">
+              <div className="flex justify-between items-start">
+                <div className="text-sm">
+                  <h3 className="font-medium text-base">
+                    {b.name} <StatusBadge status={b.job_error ? 'FAILED' : b.paused ? 'PAUSED' : b.cron_expression ? 'ACTIVE' : 'NOT_STARTED'} />
+                  </h3>
+                  <div className="text-gray-500 mt-1">
+                    Model: <span className="font-mono">{b.model_name.split('.').pop()}@{b.model_alias}</span>
+                    {lastOk?.model_version && <span> (last run used v{lastOk.model_version})</span>}
+                  </div>
+                  <div className="text-gray-500">Input: <span className="font-mono">{b.input_table || 'SQL query'}</span>
+                    <span className="text-gray-400"> · {b.ts_col} = run time</span></div>
+                  <div className="text-gray-500">Output: <span className="font-mono">{b.output_table}</span></div>
+                  <div className="text-gray-500">
+                    Schedule: {b.cron_expression ? describeCron(b.cron_expression, b.timezone_id) : 'manual only'}
+                    {b.paused && <span className="text-amber-700"> · paused</span>}
+                    {next && <span> · next run {timeUntil(next)}</span>}
+                  </div>
+                  {b.job_error && <div className="text-red-600 text-xs mt-1">Job: {b.job_error}</div>}
+                </div>
+                <div className="flex gap-2 items-start">
+                  <button onClick={() => act(() => api.runBatchNow(b.id), 'Run')} className="px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">Run now</button>
+                  {b.cron_expression && (
+                    <button onClick={() => act(() => (b.paused ? api.resumeBatch(b.id) : api.pauseBatch(b.id)), b.paused ? 'Resume' : 'Pause')}
+                      className="px-3 py-1 border rounded text-xs">{b.paused ? 'Resume' : 'Pause'}</button>
+                  )}
+                  {host && b.job_id && <a href={`${host}/#job/${b.job_id}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-xs hover:underline py-1">Job</a>}
+                  <button onClick={() => { if (confirm(`Delete batch deployment ${b.name}? Deletes its job; ${b.output_table} is kept.`)) act(() => api.deleteBatchDeployment(b.id), 'Delete'); }}
+                    className="text-red-500 text-sm">Delete</button>
+                </div>
+              </div>
+
+              <div className="mt-3 border-t pt-2">
+                <div className="text-xs font-medium text-gray-600 mb-1">Recent runs</div>
+                {b.runs.length === 0 ? <div className="text-xs text-gray-400">No runs yet</div> : (
+                  <table className="text-xs w-full">
+                    <tbody className="divide-y">
+                      {b.runs.map(r => (
+                        <tr key={r.run_id}>
+                          <td className="py-1 pr-3 text-gray-600">{r.start_time ? new Date(r.start_time).toLocaleString() : '—'}</td>
+                          <td className="py-1 pr-3"><StatusBadge status={r.state} /></td>
+                          <td className="py-1 pr-3 text-gray-600">{r.trigger === 'PERIODIC' ? 'scheduled' : r.trigger === 'ONE_TIME' ? 'manual' : r.trigger || ''}</td>
+                          <td className="py-1 pr-3 text-gray-600">{r.rows != null ? `${r.rows} rows` : ''}{r.model_version ? ` · v${r.model_version}` : ''}</td>
+                          <td className="py-1 pr-3 text-red-600 truncate max-w-md" title={r.error}>{r.error ? r.error.split('\n')[0].slice(0, 120) : ''}</td>
+                          <td className="py-1"><a href={r.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">view</a></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                {last && (
+                  <button className="text-xs text-blue-600 hover:underline mt-2" onClick={() => setPreviewId(previewId === b.id ? null : b.id)}>
+                    {previewId === b.id ? 'Hide predictions' : 'Show latest predictions'}
+                  </button>
+                )}
+                {previewId === b.id && <BatchPreview id={b.id} />}
+              </div>
+            </div>
+          );
+        })}
+        {items.length === 0 && !showForm && <div className="text-center py-8 text-gray-400">No batch deployments yet</div>}
       </div>
     </div>
   );

@@ -1138,117 +1138,14 @@ appkit.server.extend((app) => {
   });
 
   // ════════════════════════════════════════════
-  //  ONLINE TABLES
-  // ════════════════════════════════════════════
-  app.get('/api/projects/:projectId/online-tables', async (req, res) => {
-    try {
-      const result = await db.query(
-        'SELECT * FROM app.online_table WHERE project_id = $1 ORDER BY source_table',
-        [req.params.projectId]
-      );
-      res.json(result.rows);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.post('/api/online-tables/:id/check-status', async (req, res) => {
-    try {
-      const result = await db.query('SELECT * FROM app.online_table WHERE id = $1', [req.params.id]);
-      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
-      const ot = result.rows[0];
-
-      // Reconcile the stored status against reality. fe.materialize_features creates an
-      // online table backed by a managed pipeline; the app row is written as
-      // 'PROVISIONING' at publish time and never updated afterwards, so without this
-      // the UI shows PROVISIONING forever even once the table is online and serving.
-      if (ot.online_table_name && ot.status !== 'NOT_PUBLISHED') {
-        let resolved: string | null = null;
-
-        // Preferred signal: the synced-table's real sync state. This requires View on
-        // the backing DLT pipeline, which the app SP usually lacks (the pipeline is
-        // owned by the publishing user and recreated with a new id on every publish),
-        // so it commonly 403s — hence the row-count fallback below.
-        try {
-          const st = await databricksApi(
-            req, 'GET',
-            `database/synced_tables/${encodeURIComponent(ot.online_table_name)}`,
-            undefined, 'api/2.0'
-          );
-          const detailed: string = st?.data_synchronization_status?.detailed_state || '';
-          // Any SYNCED_TABLE_ONLINE_* state means the table is online and serving
-          // (including ONLINE_PIPELINE_FAILED, where only the latest incremental
-          // update failed but the initial snapshot is still served).
-          if (detailed.startsWith('SYNCED_TABLE_ONLINE')) resolved = 'ONLINE';
-          else if (detailed.includes('PROVISIONING') || detailed.includes('PIPELINING')) resolved = 'PROVISIONING';
-          else if (detailed.includes('OFFLINE') || detailed.includes('FAILED')) resolved = 'OFFLINE';
-        } catch { /* fall through to the row-count check */ }
-
-        // Fallback the SP can always run: if the synced table has rows it is online and
-        // serving. Uses the SP's existing SELECT grant via the SQL warehouse, so it
-        // needs no pipeline permission and survives re-publishes.
-        if (!resolved) {
-          try {
-            const fq = ot.online_table_name.split('.').map((p: string) => `\`${p}\``).join('.');
-            const rows = await executeSql(req, `SELECT count(*) AS n FROM ${fq}`);
-            if (Number(rows?.[0]?.n ?? 0) > 0) resolved = 'ONLINE';
-          } catch { /* leave status unchanged if we genuinely can't tell */ }
-        }
-
-        if (resolved && resolved !== ot.status) {
-          await db.query('UPDATE app.online_table SET status=$1 WHERE id=$2', [resolved, ot.id]);
-          ot.status = resolved;
-        }
-      }
-      res.json(ot);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.delete('/api/online-tables/:id', async (req, res) => {
-    try {
-      await db.query('DELETE FROM app.online_table WHERE id = $1', [req.params.id]);
-      res.json({ ok: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  // ════════════════════════════════════════════
-  //  MATERIALIZED FEATURES (declarative → online store, on a schedule)
+  //  FEATURE MATERIALIZATION JOBS
   // ════════════════════════════════════════════
 
-  // Build a materialize_online declarative spec from a feature_entry + its EOL, and a
-  // stable UC feature name. Returns null if the entry isn't a usable declarative feature.
-  function buildDeclarativeSpec(entry: any, eol: any, featureName: string) {
-    const spec = entry.declarative_spec;
-    if (!spec) return null;
-    return {
-      name: featureName,
-      source_table: spec.source_table,
-      input: spec.input,
-      function: spec.function,
-      time_window: spec.time_window,
-      filter_condition: spec.filter_condition || null,
-      // Entity + point-in-time columns come from the EOL (same as the materialize route).
-      lookup_key: spec.lookup_key || eol?.entity_columns || [],
-      entity_columns: eol?.entity_columns || [],
-      timestamp_lookup_key: spec.timestamp_lookup_key || eol?.timestamp_column || null,
-      timeseries_column: eol?.timestamp_column || null,
-    };
-  }
-
-  function makeFeatureName(spec: any): string {
-    const win = spec?.time_window?.window_duration || '';
-    const base = `${spec?.function || 'agg'}_${spec?.input || 'x'}_${win}`.toLowerCase();
-    return base.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
-  }
-
-  // Run the app-managed materialize_online notebook as a job, wait for it, and return the
+  // Run an app-managed materialization notebook as a job, wait for it, and return the
   // parsed dbutils.notebook.exit payload ({ status, operation, results }). Throws on failure.
   async function runMaterializeOnline(
-    req: any, jobName: string, params: Record<string, string>, notebookFile = 'materialize_online.py',
+    req: any, jobName: string, params: Record<string, string>, notebookFile = 'materialize_serving.py',
+    maxMinutes = 10,
   ): Promise<{ status: string; operation: string; results: any[] }> {
     const userName = await getUsername(req);
     const notebookPath = `/Workspace/Users/${userName}/.mlops/${notebookFile.replace(/\.py$/, '')}`;
@@ -1258,7 +1155,7 @@ appkit.server.extend((app) => {
     const { job_id, run_id, run_url } = await createOrRunJob(req, jobName, notebookPath, params);
 
     let attempts = 0;
-    while (attempts < 120) {
+    while (attempts < maxMinutes * 12) {
       await new Promise(r => setTimeout(r, 5000));
       attempts++;
       const jobRun = await databricksApi(req, 'GET', `jobs/runs/get?run_id=${run_id}`);
@@ -1276,7 +1173,7 @@ appkit.server.extend((app) => {
       }
       if (['TERMINATED', 'INTERNAL_ERROR', 'SKIPPED'].includes(life)) {
         // Prefer the notebook's own error (e.g. a feature-store BadRequest) over the generic state message.
-        let message = jobRun.state?.state_message || result || 'materialize_online job failed';
+        let message = jobRun.state?.state_message || result || `${notebookFile} job failed`;
         try {
           const out = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${jobRun.tasks?.[0]?.run_id ?? run_id}`);
           if (out?.error) message = String(out.error).slice(0, 2000);
@@ -1284,281 +1181,8 @@ appkit.server.extend((app) => {
         throw new Error(message);
       }
     }
-    throw new Error('materialize_online job timed out after 10 minutes');
+    throw new Error(`${notebookFile} job timed out after ${maxMinutes} minutes`);
   }
-
-  const servingNote = (tables: string[]) =>
-    `Materialized by a deployment's serving pipeline (${(tables || []).join(', ')}) — managed from the Deployment tab, not here.`;
-
-  // List declarative features for a project (across specs), each annotated with its
-  // materialization row (or null if it hasn't been materialized online yet).
-  app.get('/api/projects/:projectId/materialized-features', async (req, res) => {
-    try {
-      const entries = await db.query(
-        `SELECT fe.id AS feature_entry_id, fe.declarative_spec, ts.id AS spec_id, ts.name AS spec_name, ts.eol_id
-         FROM app.feature_entry fe
-         JOIN app.training_spec ts ON fe.training_spec_id = ts.id
-         WHERE ts.project_id = $1 AND fe.feature_type = 'declarative' AND fe.declarative_spec IS NOT NULL
-         ORDER BY fe.id`,
-        [req.params.projectId]
-      );
-      const mats = await db.query(
-        'SELECT * FROM app.materialized_feature WHERE project_id = $1',
-        [req.params.projectId]
-      );
-      const byEntry = new Map(mats.rows.map((m: any) => [m.feature_entry_id, m]));
-      res.json(entries.rows.map((e: any) => ({
-        feature_entry_id: e.feature_entry_id,
-        spec_id: e.spec_id,
-        spec_name: e.spec_name,
-        declarative_spec: e.declarative_spec,
-        materialized: byEntry.get(e.feature_entry_id) || null,
-      })));
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  // Materialize a declarative feature to the online store on a schedule.
-  app.post('/api/projects/:projectId/materialized-features', async (req, res) => {
-    try {
-      const { feature_entry_id, trigger_type, cron_expression, timezone_id } = req.body;
-      if (!feature_entry_id) { res.status(400).json({ error: 'feature_entry_id required' }); return; }
-
-      const projResult = await db.query('SELECT * FROM app.project WHERE id = $1', [req.params.projectId]);
-      if (projResult.rows.length === 0) { res.status(404).json({ error: 'Project not found' }); return; }
-      const project = projResult.rows[0];
-
-      const entryResult = await db.query(
-        `SELECT fe.*, ts.eol_id FROM app.feature_entry fe
-         JOIN app.training_spec ts ON fe.training_spec_id = ts.id
-         WHERE fe.id = $1`,
-        [feature_entry_id]
-      );
-      if (entryResult.rows.length === 0) { res.status(404).json({ error: 'Feature entry not found' }); return; }
-      const entry = entryResult.rows[0];
-      if (entry.feature_type !== 'declarative' || !entry.declarative_spec) {
-        res.status(400).json({ error: 'Not a declarative feature' }); return;
-      }
-      const eolResult = await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [entry.eol_id]);
-      const eol = eolResult.rows[0];
-
-      // Prefer the user-supplied name on the declarative spec; fall back to a generated one.
-      const featureName = (entry.declarative_spec as any).name || makeFeatureName(entry.declarative_spec);
-      const featureFullName = `${project.catalog}.${project.schema}.${featureName}`;
-      const spec = buildDeclarativeSpec(entry, eol, featureName);
-      const triggerType = trigger_type || 'derived';
-
-      // CDF on the source is required for incremental aggregation materialization.
-      try {
-        await executeSql(req, `ALTER TABLE ${spec!.source_table} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`);
-      } catch (e: any) {
-        console.warn(`[matfeat] CDF enable warning: ${e.message}`);
-      }
-
-      // Upsert the tracking row as MATERIALIZING before launching the job.
-      const upsert = await db.query(
-        `INSERT INTO app.materialized_feature
-           (project_id, feature_entry_id, feature_name, feature_full_name, trigger_type, cron_expression, timezone_id, desired_state, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE','MATERIALIZING')
-         ON CONFLICT (feature_entry_id) DO UPDATE SET
-           feature_name=EXCLUDED.feature_name, feature_full_name=EXCLUDED.feature_full_name,
-           trigger_type=EXCLUDED.trigger_type, cron_expression=EXCLUDED.cron_expression,
-           timezone_id=EXCLUDED.timezone_id, status='MATERIALIZING', error_message=NULL,
-           schedule_state=NULL, resolved_cron=NULL, materialized_feature_id=NULL,
-           online_table_name=NULL, pipeline_id=NULL, last_materialization_time=NULL
-         RETURNING *`,
-        [req.params.projectId, feature_entry_id, featureName, featureFullName, triggerType,
-          cron_expression || null, timezone_id || null]
-      );
-      const rowId = upsert.rows[0].id;
-
-      const params = {
-        operation: 'create',
-        declarative_features_json: JSON.stringify([spec]),
-        catalog: project.catalog,
-        schema: project.schema,
-        online_store_name: ONLINE_STORE_NAME,
-        table_name_prefix: 'mlops_feat_',
-        trigger_type: triggerType,
-        cron_expression: cron_expression || '',
-        timezone_id: timezone_id || '',
-        feature_full_names_json: '[]',
-      };
-
-      try {
-        const out = await runMaterializeOnline(req, `mlops-matfeat-${featureName}`, params);
-        const r = (out.results && out.results[0]) || {};
-        if (r.managed_elsewhere) {
-          // Same-named UC feature already materialized by a deployment (mlops_srv_*). This tab
-          // doesn't own that pipeline, so record it as SERVING rather than claiming it.
-          await db.query(
-            `UPDATE app.materialized_feature SET status='SERVING', error_message=$1 WHERE id=$2`,
-            [servingNote(r.managed_elsewhere), rowId]
-          );
-          res.status(201).json((await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [rowId])).rows[0]);
-          return;
-        }
-        const scheduleState = r.schedule_state || 'ACTIVE';
-        await db.query(
-          `UPDATE app.materialized_feature SET
-             status=$1, schedule_state=$2, resolved_cron=$3, materialized_feature_id=$4,
-             online_table_name=$5, pipeline_id=$6, job_id=$7, run_id=$8, materialize_run_url=$9,
-             last_materialization_time=$10, error_message=NULL
-           WHERE id=$11`,
-          [scheduleState === 'PAUSED' ? 'PAUSED' : 'ACTIVE', scheduleState, r.resolved_cron || null,
-            r.materialized_feature_id || null, r.online_table_name || null, r.pipeline_id || null,
-            r.job_id || (out as any).job_id || null, (out as any).run_id || null, (out as any).run_url || null,
-            r.last_materialization_time || null, rowId]
-        );
-      } catch (e: any) {
-        await db.query('UPDATE app.materialized_feature SET status=$1, error_message=$2 WHERE id=$3',
-          ['FAILED', e.message, rowId]);
-        throw e;
-      }
-
-      const updated = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [rowId]);
-      res.status(201).json(updated.rows[0]);
-    } catch (e: any) {
-      console.error(`[matfeat] Error: ${e.message}`);
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  // Pause / resume: toggle the pipeline schedule state (fast — only pipeline state is
-  // live-updatable; changing the cron requires remove + re-materialize).
-  async function setMaterializedFeatureState(req: any, res: any, op: 'pause' | 'resume') {
-    try {
-      const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
-      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
-      const row = result.rows[0];
-      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
-
-      const out = await runMaterializeOnline(req, `mlops-matfeat-${op}-${row.feature_name}`, {
-        operation: op,
-        declarative_features_json: '[]',
-        catalog: project.catalog,
-        schema: project.schema,
-        online_store_name: ONLINE_STORE_NAME,
-        table_name_prefix: 'mlops_feat_',
-        trigger_type: row.trigger_type,
-        cron_expression: '',
-        timezone_id: '',
-        feature_full_names_json: JSON.stringify([row.feature_full_name]),
-      });
-      const r = (out.results && out.results[0]) || {};
-      const scheduleState = r.schedule_state || (op === 'pause' ? 'PAUSED' : 'ACTIVE');
-      await db.query(
-        `UPDATE app.materialized_feature SET desired_state=$1, schedule_state=$2, status=$3,
-           last_materialization_time=COALESCE($4, last_materialization_time) WHERE id=$5`,
-        [op === 'pause' ? 'PAUSED' : 'ACTIVE', scheduleState, scheduleState === 'PAUSED' ? 'PAUSED' : 'ACTIVE',
-          r.last_materialization_time || null, row.id]
-      );
-      const updated = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id]);
-      res.json(updated.rows[0]);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  }
-  app.post('/api/materialized-features/:id/pause', (req, res) => setMaterializedFeatureState(req, res, 'pause'));
-  app.post('/api/materialized-features/:id/resume', (req, res) => setMaterializedFeatureState(req, res, 'resume'));
-
-  // Refresh live state (schedule state, resolved cron, last materialization time).
-  app.post('/api/materialized-features/:id/refresh', async (req, res) => {
-    try {
-      const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
-      if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
-      const row = result.rows[0];
-      if (!row.feature_full_name || row.status === 'NOT_MATERIALIZED' || row.status === 'MATERIALIZING') {
-        res.json(row); return;
-      }
-      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
-      const out = await runMaterializeOnline(req, `mlops-matfeat-status-${row.feature_name}`, {
-        operation: 'status',
-        declarative_features_json: '[]',
-        catalog: project.catalog,
-        schema: project.schema,
-        online_store_name: ONLINE_STORE_NAME,
-        table_name_prefix: 'mlops_feat_',
-        trigger_type: row.trigger_type,
-        cron_expression: '',
-        timezone_id: '',
-        feature_full_names_json: JSON.stringify([row.feature_full_name]),
-      });
-      const r = (out.results && out.results[0]) || {};
-      if (!r.materialized_feature_id) {
-        // This tab has no materialization of its own for the feature (status only sees mlops_feat_*;
-        // a same-named feature may still be materialized by a deployment's serving pipeline).
-        await db.query(
-          `UPDATE app.materialized_feature SET status=$1, error_message=$2, schedule_state=NULL,
-             materialized_feature_id=NULL, online_table_name=NULL, pipeline_id=NULL,
-             resolved_cron=NULL, last_materialization_time=NULL WHERE id=$3`,
-          r.managed_elsewhere
-            ? ['SERVING', servingNote(r.managed_elsewhere), row.id]
-            : ['NOT_MATERIALIZED', null, row.id]
-        );
-        res.json((await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id])).rows[0]);
-        return;
-      }
-      // Reconcile every field the API reports; COALESCE so a not-yet-provisioned null
-      // (e.g. pipeline_id early on) doesn't wipe a value we already captured.
-      await db.query(
-        `UPDATE app.materialized_feature SET
-           schedule_state=COALESCE($1, schedule_state),
-           status=$2,
-           resolved_cron=COALESCE($3, resolved_cron),
-           materialized_feature_id=COALESCE($4, materialized_feature_id),
-           online_table_name=COALESCE($5, online_table_name),
-           pipeline_id=COALESCE($6, pipeline_id),
-           last_materialization_time=COALESCE($7, last_materialization_time),
-           error_message=NULL
-         WHERE id=$8`,
-        [r.schedule_state || null, r.schedule_state === 'PAUSED' ? 'PAUSED' : 'ACTIVE',
-          r.resolved_cron || null, r.materialized_feature_id || null, r.online_table_name || null,
-          r.pipeline_id || null, r.last_materialization_time || null, row.id]
-      );
-      const updated = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [row.id]);
-      res.json(updated.rows[0]);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  // Remove this tab's materialization (stops its pipeline), the UC feature unless serving still
-  // materializes it, and the row.
-  app.delete('/api/materialized-features/:id', async (req, res) => {
-    try {
-      const result = await db.query('SELECT * FROM app.materialized_feature WHERE id = $1', [req.params.id]);
-      if (result.rows.length === 0) { res.json({ ok: true }); return; }
-      const row = result.rows[0];
-      const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [row.project_id])).rows[0];
-      let deleted: any[] = [];
-      if (row.feature_full_name && row.status !== 'NOT_MATERIALIZED') {
-        // Only this tab's own (mlops_feat_*) materializations are deleted; the UC feature is kept
-        // if a deployment's serving pipeline still materializes it. Surface errors and keep the
-        // row so the user can retry, rather than silently forgetting a live pipeline.
-        const out: any = await runMaterializeOnline(req, `mlops-matfeat-delete-${row.feature_name}`, {
-          operation: 'delete',
-          declarative_features_json: '[]',
-          catalog: project.catalog,
-          schema: project.schema,
-          online_store_name: ONLINE_STORE_NAME,
-          table_name_prefix: 'mlops_feat_',
-          trigger_type: row.trigger_type,
-          cron_expression: '',
-          timezone_id: '',
-          feature_full_names_json: JSON.stringify([row.feature_full_name]),
-        });
-        deleted = out?.results || [];
-        const errors = deleted.flatMap((r: any) => r.errors || []);
-        if (errors.length) { res.status(500).json({ error: `Delete failed: ${errors.join('; ')}`, results: deleted }); return; }
-      }
-      await db.query('DELETE FROM app.materialized_feature WHERE id = $1', [req.params.id]);
-      res.json({ ok: true, results: deleted });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
 
   // ════════════════════════════════════════════
   //  DEPLOYMENTS
@@ -1592,118 +1216,231 @@ appkit.server.extend((app) => {
     }
   });
 
-  // Publish all required online tables for a deployment
-  // Materialize the deployment's model features to the ONLINE store so serving can resolve them.
-  // Feature View path: builds the FV feature set from the spec (same bridge as training) and runs
-  // notebooks/materialize_serving.py (ColumnSelection via TableTrigger, Aggregation via CronSchedule,
-  // CustomUDF computed at serve), then grants SELECT to the serving role.
-  // Materialize the serving (online) tables for a run's training spec and record them as the
-  // deployment's serving_tables. Shared by Publish Tables and Update model (a different spec needs
-  // its own online tables BEFORE the endpoint switches to it). Waits until the tables exist + are granted.
-  async function publishServingTables(req: any, dep: any, run: any) {
-    // Trace: run → training_spec → eol → feature_entries
+  // ── Online features are owned by ONLINE deployments ──────────────────────────────────────
+  // Deploy reads the run's training-spec feature set, materializes ONLY what isn't online yet
+  // (materialize_serving.py `ensure`), grants the serving role, and records which features + online
+  // tables the deployment uses in app.deployment_feature. An online table is torn down (`release`)
+  // only once NO deployment uses any feature in it, and only after the endpoint has stopped serving
+  // the old model (pending_release is processed by check-status once the endpoint is READY).
+  // Training/registering a model and batch deployments never put anything online.
+
+  async function specFeatureParams(req: any, run: any, project: any) {
     const specId = run.training_spec_id;
     if (!specId) throw new Error('Run has no training spec');
     const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [specId])).rows[0];
     const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
     const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1 ORDER BY id', [specId])).rows;
-    const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [dep.project_id])).rows[0];
-
     const { featureEntries, tsCol } = await buildFvEntries(req, entries, eol);
-
-    const out = await runMaterializeOnline(req, `mlops-matserve-${project.name}-${specId}`, {
+    return {
       feature_entries_json: JSON.stringify(featureEntries),
       catalog: project.catalog,
       schema: project.schema,
       timeseries_column: tsCol,
       online_store_name: ONLINE_STORE_NAME,
       table_prefix: 'mlops_srv_',
-    }, 'materialize_serving.py');
-
-    // Record the materialized online tables (ONLINE once the pipelines finish the initial load).
-    const onlineTables: string[] = (out as any).online_tables || [];
-    for (const t of onlineTables) {
-      const existing = await db.query('SELECT id FROM app.online_table WHERE project_id=$1 AND online_table_name=$2', [dep.project_id, t]);
-      if (existing.rows.length === 0) {
-        await db.query(
-          `INSERT INTO app.online_table (project_id, source_table, online_table_name, sync_mode, status, pipeline_id)
-           VALUES ($1,$2,$3,'triggered','PROVISIONING',$4)`,
-          [dep.project_id, t, t, (out as any).run_url || null]
-        );
-      }
-    }
-    await db.query('UPDATE app.deployment SET serving_tables=$1 WHERE id=$2', [onlineTables, dep.id]);
-    return { onlineTables, grants: (out as any).grants || [] };
+      online_tables_json: '[]',
+      feature_tables_json: '{}',
+    };
   }
 
-  app.post('/api/deployments/:id/publish-tables', async (req, res) => {
-    try {
-      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
-      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
-      const dep = depResult.rows[0];
-      const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
-      const { onlineTables, grants } = await publishServingTables(req, dep, run);
-      res.json({ published: onlineTables.length, online_tables: onlineTables, grants });
-    } catch (e: any) {
-      console.error(`[publish-tables] Error: ${e.message}`);
-      res.status(500).json({ error: e.message });
+  const projectOf = async (projectId: number) =>
+    (await db.query('SELECT * FROM app.project WHERE id = $1', [projectId])).rows[0];
+
+  // Materialize whatever the run's features still need online; returns the per-feature report.
+  async function ensureOnlineFeatures(req: any, dep: any, run: any): Promise<any[]> {
+    const project = await projectOf(dep.project_id);
+    const params = { ...(await specFeatureParams(req, run, project)), operation: 'ensure' };
+    const out: any = await runMaterializeOnline(req, `mlops-matserve-${project.name}-${run.training_spec_id}`, params, 'materialize_serving.py', 30);
+    return out.features || [];
+  }
+
+  // {feature_full_name: online_table} for the tables among `rows` that no deployment references any more.
+  async function unusedTables(rows: { feature_full_name: string; online_table: string | null }[]) {
+    const tables = [...new Set(rows.map(r => r.online_table).filter(Boolean))] as string[];
+    if (tables.length === 0) return {} as Record<string, string>;
+    const used = new Set((await db.query(
+      'SELECT DISTINCT online_table FROM app.deployment_feature WHERE online_table = ANY($1)', [tables]
+    )).rows.map((r: any) => r.online_table));
+    const out: Record<string, string> = {};
+    for (const r of rows) if (r.online_table && !used.has(r.online_table)) out[r.feature_full_name] = r.online_table;
+    return out;
+  }
+
+  // Replace a deployment's feature registry; returns tables that became unused.
+  async function setDeploymentFeatures(depId: number, features: any[]) {
+    const before = (await db.query(
+      'SELECT feature_full_name, online_table FROM app.deployment_feature WHERE deployment_id = $1', [depId]
+    )).rows;
+    await db.query('DELETE FROM app.deployment_feature WHERE deployment_id = $1', [depId]);
+    for (const f of features) {
+      await db.query(
+        `INSERT INTO app.deployment_feature (deployment_id, feature_full_name, feature_type, online_table, last_materialization_time)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [depId, f.feature_full_name, f.type, f.online_table || null, f.last_materialization_time || null]
+      );
     }
+    const tables = [...new Set(features.map(f => f.online_table).filter(Boolean))];
+    await db.query('UPDATE app.deployment SET serving_tables = $1 WHERE id = $2', [tables, depId]);
+    return unusedTables(before);
+  }
+
+  // Tear down online tables nobody uses. Re-checks usage first (a later deploy may have re-claimed them).
+  async function releaseTables(req: any, projectId: number, candidates: Record<string, string>) {
+    const rows = Object.entries(candidates || {}).map(([feature_full_name, online_table]) => ({ feature_full_name, online_table }));
+    const featureTables = await unusedTables(rows);
+    const tables = [...new Set(Object.values(featureTables))];
+    if (tables.length === 0) return null;
+    const project = await projectOf(projectId);
+    console.log(`[deploy] Releasing unused online tables: ${tables.join(', ')}`);
+    return runMaterializeOnline(req, `mlops-matserve-release-${project.name}`, {
+      operation: 'release',
+      online_tables_json: JSON.stringify(tables),
+      feature_tables_json: JSON.stringify(featureTables),
+      feature_entries_json: '[]',
+      catalog: project.catalog,
+      schema: project.schema,
+      timeseries_column: '',
+      online_store_name: ONLINE_STORE_NAME,
+      table_prefix: 'mlops_srv_',
+    }, 'materialize_serving.py', 20);
+  }
+
+  // Flatten per-table errors from a `release` run (null if none).
+  const releaseErrors = (out: any): string | null => {
+    const errs = (out?.released || []).flatMap((r: any) => (r.errors || []).map((e: string) => `${String(r.online_table).split('.').pop()}: ${e}`));
+    return errs.length ? errs.join('; ').slice(0, 1500) : null;
+  };
+
+  async function assertModelReady(req: any, run: any) {
+    if (!run?.model_name || !run?.model_version) throw Object.assign(new Error('Run has no registered model'), { status: 400 });
+    const host = process.env.DATABRICKS_HOST || '';
+    const token = await getToken(req);
+    const mvResp = await fetch(
+      `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const status = ((await mvResp.json()) as any).model_version?.status;
+    if (status && status !== 'READY') {
+      throw Object.assign(new Error(`Model version status is ${status}. Wait for it to become READY before deploying.`), { status: 400 });
+    }
+  }
+
+  // Create the endpoint, or point an existing one at this model version (no-op if it already serves it).
+  async function upsertEndpoint(req: any, dep: any, run: any) {
+    const config = dep.endpoint_config || {};
+    const served = {
+      entity_name: run.model_name,
+      entity_version: String(run.model_version),
+      workload_size: config.workload_size || 'Small',
+      scale_to_zero_enabled: config.scale_to_zero_enabled !== false,
+    };
+    const existing = await databricksApi(req, 'GET', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}`, undefined, 'api/2.0');
+    if (existing && !existing.error_code) {
+      const cur = existing.config?.served_entities?.[0];
+      if (cur?.entity_name === served.entity_name && String(cur?.entity_version) === served.entity_version) return 'unchanged';
+      const r = await databricksApi(req, 'PUT', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}/config`, { served_entities: [served] }, 'api/2.0');
+      if (r?.error_code) throw new Error(`Endpoint update failed: ${r.message}`);
+      return 'updated';
+    }
+    const r = await databricksApi(req, 'POST', 'serving-endpoints', { name: dep.endpoint_name, config: { served_entities: [served] } }, 'api/2.0');
+    if (r?.error_code) throw new Error(`Endpoint create failed: ${r.message}`);
+    return 'created';
+  }
+
+  const setStage = (id: number, stage: string, error: string | null = null) =>
+    db.query('UPDATE app.deployment SET deploy_stage = $1, deploy_error = $2 WHERE id = $3', [stage, error, id]);
+  const mergeRelease = async (id: number, add: Record<string, string>) => {
+    if (Object.keys(add).length === 0) return;
+    await db.query(
+      `UPDATE app.deployment SET pending_release = COALESCE(pending_release, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+      [JSON.stringify(add), id]
+    );
+  };
+  const deploying = new Set<number>();
+  const releasing = new Set<number>();
+
+  // Deploy (or switch the model of) an online deployment, in the background:
+  //   FEATURES (ensure online + grant) → ENDPOINT (create / update config) → DONE  |  FAILED (+ deploy_error)
+  // The endpoint then reports CREATING → READY via check-status. Idempotent: re-running on a healthy
+  // deployment materializes nothing new and leaves an endpoint that already serves the version alone.
+  async function startDeploy(req: any, res: any, depId: number, runId?: number) {
+    const dep = (await db.query('SELECT * FROM app.deployment WHERE id = $1', [depId])).rows[0];
+    if (!dep) { res.status(404).json({ error: 'Deployment not found' }); return; }
+    if (deploying.has(dep.id)) { res.status(409).json({ error: 'A deploy is already in progress for this deployment' }); return; }
+    const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [runId || dep.run_id])).rows[0];
+    if (!run) { res.status(404).json({ error: 'Run not found' }); return; }
+    try { await assertModelReady(req, run); } catch (e: any) { res.status(e.status || 500).json({ error: e.message }); return; }
+
+    deploying.add(dep.id);
+    await setStage(dep.id, 'FEATURES');
+    res.json((await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id])).rows[0]);
+
+    (async () => {
+      try {
+        const features = await ensureOnlineFeatures(req, dep, run);
+        // Tables the previous model used but this one doesn't — released only once the endpoint is
+        // READY on the new version (check-status), never while it might still be serving the old one.
+        await mergeRelease(dep.id, await setDeploymentFeatures(dep.id, features));
+        await setStage(dep.id, 'ENDPOINT');
+        const action = await upsertEndpoint(req, dep, run);
+        await db.query(
+          `UPDATE app.deployment SET run_id = $1, endpoint_status = $2 WHERE id = $3`,
+          [run.id, action === 'unchanged' && dep.endpoint_status === 'READY' ? 'READY' : 'CREATING', dep.id]
+        );
+        await setStage(dep.id, 'DONE');
+        console.log(`[deploy] ${dep.name}: ${features.length} features online, endpoint ${action}`);
+      } catch (e: any) {
+        console.error(`[deploy] ${dep.name} failed: ${e.message}`);
+        await setStage(dep.id, 'FAILED', String(e.message).slice(0, 4000));
+      } finally {
+        deploying.delete(dep.id);
+      }
+    })();
+  }
+
+  app.post('/api/deployments/:id/deploy', async (req, res) => {
+    try { await startDeploy(req, res, Number(req.params.id)); }
+    catch (e: any) { if (!res.headersSent) res.status(500).json({ error: e.message }); }
   });
 
-  // Create serving endpoint for a deployment
-  app.post('/api/deployments/:id/create-endpoint', async (req, res) => {
-    try {
-      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
-      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
-      const dep = depResult.rows[0];
-
-      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [dep.run_id]);
-      const run = runResult.rows[0];
-      if (!run.model_name || !run.model_version) {
-        res.status(400).json({ error: 'Run has no registered model' }); return;
+  // The features a deployment serves from (registry rows), enriched LIVE from the feature-engineering API
+  // with each online materialization's actual schedule — so "Auto" can be shown as what it resolved to
+  // (e.g. DERIVED cron "0 0 0 * * ?" = daily 00:00 UTC) — plus pipeline state and last materialization.
+  async function deploymentFeaturesLive(req: any, depId: number | string) {
+    const rows = (await db.query(
+      'SELECT * FROM app.deployment_feature WHERE deployment_id = $1 ORDER BY feature_type, feature_full_name', [depId]
+    )).rows;
+    return Promise.all(rows.map(async (r: any) => {
+      if (!r.online_table) return { ...r, schedule: { kind: 'on_request' }, pipeline_state: null };
+      try {
+        const out = await databricksApi(req, 'GET',
+          `feature-engineering/materialized-features?feature_name=${encodeURIComponent(r.feature_full_name)}`, undefined, 'api/2.0');
+        const mf = (out.materialized_features || []).find((m: any) => m.table_name === r.online_table);
+        if (!mf) return { ...r, schedule: null, pipeline_state: 'MISSING' };
+        const cron = mf.cron_schedule_trigger;
+        const schedule = cron
+          ? { kind: 'cron', cron_expression: cron.cron_expression, timezone_id: cron.timezone_id || 'UTC', mode: cron.mode }
+          : mf.table_trigger ? { kind: 'table_trigger' } : null;
+        const last = mf.last_materialization_time || r.last_materialization_time;
+        if (mf.last_materialization_time && mf.last_materialization_time !== r.last_materialization_time) {
+          await db.query('UPDATE app.deployment_feature SET last_materialization_time = $1 WHERE deployment_id = $2 AND feature_full_name = $3',
+            [mf.last_materialization_time, depId, r.feature_full_name]);
+        }
+        return { ...r, last_materialization_time: last, schedule, pipeline_state: mf.pipeline_schedule_state || null };
+      } catch (e: any) {
+        return { ...r, schedule: null, pipeline_state: null, live_error: String(e.message).slice(0, 200) };
       }
+    }));
+  }
 
-      // Check model version status — must be READY before creating endpoint
-      const host = process.env.DATABRICKS_HOST || '';
-      const token = await getToken(req);
-      const mvResp = await fetch(
-        `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      const mvData: any = await mvResp.json();
-      const mvStatus = mvData.model_version?.status;
-      if (mvStatus && mvStatus !== 'READY') {
-        res.status(400).json({ error: `Model version status is ${mvStatus}. Wait for it to become READY before deploying.` });
-        return;
-      }
-
-      const config = dep.endpoint_config || {};
-      const payload = {
-        name: dep.endpoint_name,
-        config: {
-          served_entities: [{
-            entity_name: run.model_name,
-            entity_version: String(run.model_version),
-            workload_size: config.workload_size || 'Small',
-            scale_to_zero_enabled: config.scale_to_zero_enabled !== false,
-          }],
-        },
-      };
-
-      console.log(`[endpoint] Creating: ${dep.endpoint_name} with model ${run.model_name} v${run.model_version}`);
-      const apiResult = await databricksApi(req, 'POST', 'serving-endpoints', payload, 'api/2.0');
-      if (apiResult.error_code) throw new Error(`Endpoint create failed: ${apiResult.message}`);
-
-      await db.query(
-        `UPDATE app.deployment SET endpoint_status='CREATING' WHERE id=$1`,
-        [dep.id]
-      );
-      const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
-      res.json(updated.rows[0]);
-    } catch (e: any) {
-      console.error(`[endpoint] Error: ${e.message}`);
-      res.status(500).json({ error: e.message });
-    }
+  app.get('/api/deployments/:id/features', async (req, res) => {
+    try { res.json(await deploymentFeaturesLive(req, req.params.id)); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+  // Kept for the Refresh button: the read is live now, so refresh = re-read.
+  app.post('/api/deployments/:id/features/refresh', async (req, res) => {
+    try { res.json(await deploymentFeaturesLive(req, req.params.id)); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
   // Check serving endpoint status
@@ -1733,6 +1470,23 @@ appkit.server.extend((app) => {
 
       if (newStatus !== dep.endpoint_status) {
         await db.query('UPDATE app.deployment SET endpoint_status=$1 WHERE id=$2', [newStatus, dep.id]);
+      }
+      // Tables the previous model used are torn down only now that the endpoint serves the new one.
+      if (newStatus === 'READY' && dep.pending_release && Object.keys(dep.pending_release).length > 0 && !releasing.has(dep.id)) {
+        releasing.add(dep.id);
+        const pending = dep.pending_release;
+        // Cleared either way (no retry loop on every status check); failures are surfaced on the card.
+        // Typical failure: "Only the creator can delete" — the pipeline was created by another identity
+        // (e.g. a user via local dev), so the app SP can't remove it.
+        releaseTables(req, dep.project_id, pending)
+          .then((out: any) => {
+            const errs = releaseErrors(out);
+            return db.query('UPDATE app.deployment SET pending_release = NULL, deploy_error = $1 WHERE id = $2',
+              [errs ? `Previous model's online tables not fully removed: ${errs}` : null, dep.id]);
+          })
+          .catch((e: any) => db.query('UPDATE app.deployment SET pending_release = NULL, deploy_error = $1 WHERE id = $2',
+            [`Removing the previous model's online tables failed: ${String(e.message).slice(0, 1500)}`, dep.id]))
+          .finally(() => releasing.delete(dep.id));
       }
       const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
       res.json(updated.rows[0]);
@@ -1848,69 +1602,20 @@ appkit.server.extend((app) => {
     }
   });
 
-  // Stop a deployment's serving endpoint (deletes the endpoint, keeps the deployment record)
-  // Update a deployment's serving endpoint to a different model version
+  // Update model: same flow as Deploy with a different run — features for the new model go online
+  // BEFORE the endpoint switches; tables only the old model used are released once it's READY.
   app.post('/api/deployments/:id/update-endpoint', async (req, res) => {
     try {
       const { run_id } = req.body;
       if (!run_id) { res.status(400).json({ error: 'run_id required' }); return; }
-
-      const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
-      if (depResult.rows.length === 0) { res.status(404).json({ error: 'Deployment not found' }); return; }
-      const dep = depResult.rows[0];
-
-      const runResult = await db.query('SELECT * FROM app.run WHERE id = $1', [run_id]);
-      if (runResult.rows.length === 0) { res.status(404).json({ error: 'Run not found' }); return; }
-      const run = runResult.rows[0];
-      if (!run.model_name || !run.model_version) {
-        res.status(400).json({ error: 'Run has no registered model' }); return;
-      }
-
-      // Check model version is READY
-      const host = process.env.DATABRICKS_HOST || '';
-      const token = await getToken(req);
-      const mvResp = await fetch(
-        `${host}/api/2.0/mlflow/unity-catalog/model-versions/get?name=${encodeURIComponent(run.model_name)}&version=${run.model_version}`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      const mvData: any = await mvResp.json();
-      if (mvData.model_version?.status && mvData.model_version.status !== 'READY') {
-        res.status(400).json({ error: `Model version status is ${mvData.model_version.status}. Wait for READY.` }); return;
-      }
-
-      // A run from a different training spec resolves different features — publish its online tables
-      // first, so the endpoint never serves a model whose features aren't in the online store.
-      const currentRun = (await db.query('SELECT training_spec_id FROM app.run WHERE id = $1', [dep.run_id])).rows[0];
-      if (run.training_spec_id && run.training_spec_id !== currentRun?.training_spec_id) {
-        const { onlineTables } = await publishServingTables(req, dep, run);
-        console.log(`[endpoint] Published ${onlineTables.length} serving tables for spec ${run.training_spec_id}`);
-      }
-
-      // Update the endpoint config with the new model version
-      const config = dep.endpoint_config || {};
-      await databricksApi(req, 'PUT', `serving-endpoints/${encodeURIComponent(dep.endpoint_name)}/config`, {
-        served_entities: [{
-          entity_name: run.model_name,
-          entity_version: String(run.model_version),
-          workload_size: config.workload_size || 'Small',
-          scale_to_zero_enabled: config.scale_to_zero_enabled !== false,
-        }],
-      }, 'api/2.0');
-
-      console.log(`[endpoint] Updated ${dep.endpoint_name} → ${run.model_name} v${run.model_version}`);
-
-      await db.query(
-        `UPDATE app.deployment SET run_id=$1, endpoint_status='CREATING' WHERE id=$2`,
-        [run_id, dep.id]
-      );
-      const updated = await db.query('SELECT * FROM app.deployment WHERE id = $1', [dep.id]);
-      res.json(updated.rows[0]);
+      await startDeploy(req, res, Number(req.params.id), Number(run_id));
     } catch (e: any) {
       console.error(`[endpoint] Update error: ${e.message}`);
-      res.status(500).json({ error: e.message });
+      if (!res.headersSent) res.status(500).json({ error: e.message });
     }
   });
 
+  // Stop: deletes the endpoint but keeps the deployment and its online features (quick restart via Deploy).
   app.post('/api/deployments/:id/stop-endpoint', async (req, res) => {
     try {
       const depResult = await db.query('SELECT * FROM app.deployment WHERE id = $1', [req.params.id]);
@@ -1951,11 +1656,271 @@ appkit.server.extend((app) => {
         }
       }
 
-      await db.query('DELETE FROM app.deployment WHERE id = $1', [req.params.id]);
-      res.json({ ok: true });
+      const rows = (await db.query(
+        'SELECT feature_full_name, online_table FROM app.deployment_feature WHERE deployment_id = $1', [dep.id]
+      )).rows;
+      await db.query('DELETE FROM app.deployment WHERE id = $1', [req.params.id]);  // cascades registry rows
+      const candidates: Record<string, string> = { ...(dep.pending_release || {}) };
+      for (const r of rows) if (r.online_table) candidates[r.feature_full_name] = r.online_table;
+      // Background: the endpoint delete is already requested; nothing else waits on the teardown.
+      releaseTables(req, dep.project_id, candidates)
+        .then((out: any) => { const errs = releaseErrors(out); if (errs) console.error(`[deploy] release after delete incomplete: ${errs}`); })
+        .catch((e: any) => console.error(`[deploy] release after delete failed: ${e.message}`));
+      res.json({ ok: true, releasing: Object.values(candidates) });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // ════════════════════════════════════════════
+  //  BATCH DEPLOYMENTS
+  // ════════════════════════════════════════════
+  // A batch deployment = a persistent, scheduled Databricks job running notebooks/score_batch.py with every
+  // parameter baked in (model + alias, input, timestamp column, output) — it runs without the app. The job is
+  // created by (and runs as) the app SP. Pause state and run history are read live from the Jobs API.
+  const FQN = /^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$/;
+  const ucPath = (fullName: string) => fullName.split('.').map(encodeURIComponent).join('.');
+
+  async function batchJobSettings(req: any, b: any, project: any) {
+    const userName = await getUsername(req);
+    const notebookPath = `/Workspace/Users/${userName}/.mlops/score_batch`;
+    await uploadNotebook(req, path.resolve(import.meta.dirname || '.', '..', 'notebooks', 'score_batch.py'), notebookPath);
+    return {
+      name: `mlops-batch-${project.name}-${b.name}`,
+      max_concurrent_runs: 1,
+      tasks: [{
+        task_key: 'score',
+        notebook_task: {
+          notebook_path: notebookPath,
+          base_parameters: {
+            model_name: b.model_name,
+            model_alias: b.model_alias,
+            input_table: b.input_table || '',
+            input_sql: b.input_sql || '',
+            ts_col: b.ts_col,
+            output_table: b.output_table,
+            batch_deployment_id: String(b.id),
+          },
+        },
+        environment_key: 'Default',
+      }],
+      environments: [{ environment_key: 'Default', spec: { client: '1', dependencies: ['databricks-feature-engineering>=0.18.0'] } }],
+      ...(b.cron_expression ? {
+        schedule: { quartz_cron_expression: b.cron_expression, timezone_id: b.timezone_id || 'UTC', pause_status: b._pause || 'UNPAUSED' },
+      } : {}),
+    };
+  }
+
+  // Columns a query/table produces (works on empty tables).
+  async function describeColumns(req: any, sql: string): Promise<string[]> {
+    const rows = await executeSql(req, `DESCRIBE QUERY ${sql}`);
+    return rows.map((r: any) => r.col_name).filter((c: string) => c && !c.startsWith('#'));
+  }
+
+  // The model's observation-timestamp column and the request fields it expects, from the training spine
+  // of the newest app run registered under this model (EOL columns minus label minus timestamp).
+  async function modelSpine(req: any, projectId: number, modelName: string) {
+    const run = (await db.query(
+      `SELECT * FROM app.run WHERE project_id = $1 AND model_name = $2 AND training_spec_id IS NOT NULL
+       ORDER BY model_version DESC NULLS LAST LIMIT 1`, [projectId, modelName]
+    )).rows[0];
+    if (!run) throw Object.assign(new Error(`No registered run for ${modelName} in this project`), { status: 400 });
+    const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [run.training_spec_id])).rows[0];
+    const eol = (await db.query('SELECT * FROM app.entity_observation_label WHERE id = $1', [spec.eol_id])).rows[0];
+    const tsCol = (eol.timestamp_column || '').trim();
+    if (!tsCol) throw Object.assign(new Error(`EOL "${eol.name}" has no timestamp column`), { status: 400 });
+    const cols = await describeColumns(req, `SELECT * FROM (${eol.sql_definition.trim().replace(/;$/, '')}) AS _eol`);
+    const label = (eol.label_column || '').trim();
+    return { tsCol, required: cols.filter(c => c !== label && c !== tsCol) };
+  }
+
+  function validateBatchBody(b: any) {
+    if (!b.name || !b.model_name || !b.model_alias || !b.output_table) return 'name, model_name, model_alias and output_table are required';
+    if (!b.input_table && !b.input_sql) return 'input_table or input_sql is required';
+    if (b.input_table && !FQN.test(b.input_table)) return 'input_table must be catalog.schema.table';
+    if (!FQN.test(b.output_table)) return 'output_table must be catalog.schema.table';
+    if (b.cron_expression && b.cron_expression.trim().split(/\s+/).length < 6) return 'cron_expression must be a Quartz cron (6-7 fields)';
+    return null;
+  }
+
+  async function checkBatchInput(req: any, projectId: number, b: any) {
+    const { tsCol, required } = await modelSpine(req, projectId, b.model_name);
+    const inputSql = b.input_sql ? b.input_sql.trim().replace(/;$/, '') : `SELECT * FROM ${b.input_table}`;
+    const cols = await describeColumns(req, `SELECT * FROM (${inputSql}) AS _in`);
+    const missing = required.filter(c => !cols.includes(c));
+    if (missing.length) throw Object.assign(new Error(`Input is missing request fields the model needs: ${missing.join(', ')}`), { status: 400 });
+    if (cols.includes(tsCol)) throw Object.assign(new Error(`Input must not contain ${tsCol} — the job sets it to the run time`), { status: 400 });
+    return tsCol;
+  }
+
+  async function batchLive(req: any, b: any) {
+    const live: any = { ...b, paused: null, runs: [], job_error: null };
+    if (!b.job_id) return live;
+    const job = await databricksApi(req, 'GET', `jobs/get?job_id=${b.job_id}`);
+    if (job.error_code) { live.job_error = job.message; return live; }
+    live.paused = job.settings?.schedule ? job.settings.schedule.pause_status === 'PAUSED' : null;
+    const runs = (await databricksApi(req, 'GET', `jobs/runs/list?job_id=${b.job_id}&limit=5&expand_tasks=true`)).runs || [];
+    const host = process.env.DATABRICKS_HOST || '';
+    live.runs = await Promise.all(runs.map(async (r: any) => {
+      const row: any = {
+        run_id: r.run_id, start_time: r.start_time ? new Date(r.start_time).toISOString() : null,
+        state: r.state?.result_state || r.state?.life_cycle_state, trigger: r.trigger,
+        url: `${host}/#job/${b.job_id}/run/${r.run_id}`,
+      };
+      if (r.state?.life_cycle_state === 'TERMINATED' && r.tasks?.[0]?.run_id) {
+        try {
+          const out = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${r.tasks[0].run_id}`);
+          if (out?.notebook_output?.result) {
+            const o = JSON.parse(out.notebook_output.result);
+            row.rows = o.rows; row.model_version = o.model_version; row.scored_at = o.scored_at;
+          }
+          if (out?.error) row.error = String(out.error).slice(0, 500);
+        } catch { /* keep basic row */ }
+      }
+      return row;
+    }));
+    return live;
+  }
+
+  app.get('/api/projects/:projectId/batch-deployments', async (req, res) => {
+    try {
+      const rows = (await db.query('SELECT * FROM app.batch_deployment WHERE project_id = $1 ORDER BY id DESC', [req.params.projectId])).rows;
+      res.json(await Promise.all(rows.map((b: any) => batchLive(req, b))));
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post('/api/projects/:projectId/batch-deployments', async (req, res) => {
+    try {
+      const b = req.body || {};
+      const bad = validateBatchBody(b);
+      if (bad) { res.status(400).json({ error: bad }); return; }
+      const project = await projectOf(Number(req.params.projectId));
+      const tsCol = await checkBatchInput(req, project.id, b);
+      const row = (await db.query(
+        `INSERT INTO app.batch_deployment (project_id, name, model_name, model_alias, input_table, input_sql, ts_col, output_table, cron_expression, timezone_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [project.id, b.name, b.model_name, b.model_alias, b.input_sql ? null : b.input_table, b.input_sql || null, tsCol,
+          b.output_table, b.cron_expression || null, b.timezone_id || 'UTC']
+      )).rows[0];
+      try {
+        const created = await databricksApi(req, 'POST', 'jobs/create', await batchJobSettings(req, row, project));
+        if (created.error_code) throw new Error(`Job create failed: ${created.message}`);
+        await db.query('UPDATE app.batch_deployment SET job_id = $1 WHERE id = $2', [created.job_id, row.id]);
+        row.job_id = created.job_id;
+      } catch (e) {
+        await db.query('DELETE FROM app.batch_deployment WHERE id = $1', [row.id]);
+        throw e;
+      }
+      res.status(201).json(await batchLive(req, row));
+    } catch (e: any) { res.status(e.status || 500).json({ error: e.message }); }
+  });
+
+  // Edit alias / input / output / schedule → jobs/reset with the full new settings (keeps pause state).
+  app.put('/api/batch-deployments/:id', async (req, res) => {
+    try {
+      const cur = (await db.query('SELECT * FROM app.batch_deployment WHERE id = $1', [req.params.id])).rows[0];
+      if (!cur) { res.status(404).json({ error: 'Not found' }); return; }
+      const b = { ...cur, ...req.body, id: cur.id, project_id: cur.project_id, job_id: cur.job_id };
+      if ('input_sql' in req.body && req.body.input_sql) b.input_table = null;
+      if ('input_table' in req.body && req.body.input_table) b.input_sql = null;
+      const bad = validateBatchBody(b);
+      if (bad) { res.status(400).json({ error: bad }); return; }
+      const project = await projectOf(cur.project_id);
+      b.ts_col = await checkBatchInput(req, project.id, b);
+      const live = await batchLive(req, cur);
+      b._pause = live.paused ? 'PAUSED' : 'UNPAUSED';
+      const r = await databricksApi(req, 'POST', 'jobs/reset', { job_id: cur.job_id, new_settings: await batchJobSettings(req, b, project) });
+      if (r.error_code) throw new Error(`Job update failed: ${r.message}`);
+      await db.query(
+        `UPDATE app.batch_deployment SET name=$1, model_alias=$2, input_table=$3, input_sql=$4, ts_col=$5, output_table=$6,
+           cron_expression=$7, timezone_id=$8 WHERE id=$9`,
+        [b.name, b.model_alias, b.input_table || null, b.input_sql || null, b.ts_col, b.output_table, b.cron_expression || null, b.timezone_id || 'UTC', cur.id]
+      );
+      res.json(await batchLive(req, (await db.query('SELECT * FROM app.batch_deployment WHERE id = $1', [cur.id])).rows[0]));
+    } catch (e: any) { res.status(e.status || 500).json({ error: e.message }); }
+  });
+
+  app.post('/api/batch-deployments/:id/run-now', async (req, res) => {
+    try {
+      const b = (await db.query('SELECT * FROM app.batch_deployment WHERE id = $1', [req.params.id])).rows[0];
+      if (!b?.job_id) { res.status(404).json({ error: 'Not found' }); return; }
+      const r = await databricksApi(req, 'POST', 'jobs/run-now', { job_id: b.job_id });
+      if (r.error_code) throw new Error(r.message);
+      res.json({ run_id: r.run_id });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  async function setBatchPause(req: any, res: any, pause: boolean) {
+    try {
+      const b = (await db.query('SELECT * FROM app.batch_deployment WHERE id = $1', [req.params.id])).rows[0];
+      if (!b?.job_id) { res.status(404).json({ error: 'Not found' }); return; }
+      if (!b.cron_expression) { res.status(400).json({ error: 'No schedule to pause' }); return; }
+      const r = await databricksApi(req, 'POST', 'jobs/update', {
+        job_id: b.job_id,
+        new_settings: { schedule: { quartz_cron_expression: b.cron_expression, timezone_id: b.timezone_id || 'UTC', pause_status: pause ? 'PAUSED' : 'UNPAUSED' } },
+      });
+      if (r.error_code) throw new Error(r.message);
+      res.json(await batchLive(req, b));
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  }
+  app.post('/api/batch-deployments/:id/pause', (req, res) => setBatchPause(req, res, true));
+  app.post('/api/batch-deployments/:id/resume', (req, res) => setBatchPause(req, res, false));
+
+  // Latest run's predictions (the newest scored_at slice of the output table).
+  app.get('/api/batch-deployments/:id/preview', async (req, res) => {
+    try {
+      const b = (await db.query('SELECT * FROM app.batch_deployment WHERE id = $1', [req.params.id])).rows[0];
+      if (!b) { res.status(404).json({ error: 'Not found' }); return; }
+      if (!FQN.test(b.output_table)) { res.status(400).json({ error: 'bad output table' }); return; }
+      try {
+        res.json(await executeSql(req,
+          `SELECT * FROM ${b.output_table} WHERE batch_deployment_id = ${Number(b.id)}
+             AND scored_at = (SELECT max(scored_at) FROM ${b.output_table} WHERE batch_deployment_id = ${Number(b.id)}) LIMIT 50`));
+      } catch (e: any) {
+        if (/TABLE_OR_VIEW_NOT_FOUND|not found/i.test(e.message)) { res.json([]); return; }
+        throw e;
+      }
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete('/api/batch-deployments/:id', async (req, res) => {
+    try {
+      const b = (await db.query('SELECT * FROM app.batch_deployment WHERE id = $1', [req.params.id])).rows[0];
+      if (!b) { res.json({ ok: true }); return; }
+      if (b.job_id) {
+        const r = await databricksApi(req, 'POST', 'jobs/delete', { job_id: b.job_id });
+        if (r?.error_code && r.error_code !== 'RESOURCE_DOES_NOT_EXIST') throw new Error(`Job delete failed: ${r.message}`);
+      }
+      await db.query('DELETE FROM app.batch_deployment WHERE id = $1', [b.id]);
+      res.json({ ok: true, output_table_kept: b.output_table });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // UC model aliases + versions (for the batch form), and setting an alias.
+  app.get('/api/models/aliases', async (req, res) => {
+    try {
+      const name = String(req.query.name || '');
+      if (!FQN.test(name)) { res.status(400).json({ error: 'name must be catalog.schema.model' }); return; }
+      const m = await databricksApi(req, 'GET', `unity-catalog/models/${ucPath(name)}?include_aliases=true`);
+      if (m.error_code) throw new Error(m.message);
+      const v = await databricksApi(req, 'GET', `unity-catalog/models/${ucPath(name)}/versions?max_results=100`);
+      res.json({
+        aliases: (m.aliases || []).map((a: any) => ({ alias: a.alias_name, version: a.version_num })),
+        versions: (v.model_versions || []).map((x: any) => x.version).sort((a: number, b: number) => b - a),
+      });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.put('/api/models/aliases', async (req, res) => {
+    try {
+      const { name, alias, version } = req.body || {};
+      if (!FQN.test(name || '') || !/^[A-Za-z0-9_]+$/.test(alias || '') || !version) {
+        res.status(400).json({ error: 'name (catalog.schema.model), alias ([A-Za-z0-9_]+) and version required' }); return;
+      }
+      const r = await databricksApi(req, 'PUT', `unity-catalog/models/${ucPath(name)}/aliases/${encodeURIComponent(alias)}`, { version_num: Number(version) });
+      if (r.error_code) throw new Error(r.message);
+      res.json({ alias: r.alias_name, version: r.version_num });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
   // ════════════════════════════════════════════

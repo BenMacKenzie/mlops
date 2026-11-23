@@ -79,51 +79,6 @@ export interface Run {
   ended_at: string | null;
 }
 
-export interface OnlineTable {
-  id: number;
-  project_id: number;
-  source_table: string;
-  online_table_name: string;
-  primary_key_columns: string[];
-  timeseries_key: string | null;
-  sync_mode: 'triggered' | 'continuous';
-  status: 'NOT_PUBLISHED' | 'PROVISIONING' | 'ONLINE' | 'FAILED';
-  pipeline_id: string | null;
-}
-
-// A Databricks-managed online materialization of a declarative feature, on a schedule.
-export interface MaterializedFeature {
-  id: number;
-  project_id: number;
-  feature_entry_id: number | null;
-  feature_name: string;
-  feature_full_name: string | null;
-  online_table_name: string | null;
-  trigger_type: 'derived' | 'manual_cron' | 'table_trigger';
-  cron_expression: string | null;
-  timezone_id: string | null;
-  resolved_cron: string | null;
-  desired_state: 'ACTIVE' | 'PAUSED';
-  schedule_state: string | null;
-  materialized_feature_id: string | null;
-  job_id: number | null;
-  run_id: number | null;
-  pipeline_id: string | null;
-  status: 'NOT_MATERIALIZED' | 'MATERIALIZING' | 'ACTIVE' | 'PAUSED' | 'FAILED' | 'SERVING';
-  last_materialization_time: string | null;
-  materialize_run_url: string | null;
-  error_message: string | null;
-}
-
-// A declarative feature (aggregation) in a project, with its online materialization (or null).
-export interface DeclarativeFeature {
-  feature_entry_id: number;
-  spec_id: number;
-  spec_name: string;
-  declarative_spec: Record<string, any>;
-  materialized: MaterializedFeature | null;
-}
-
 export interface Deployment {
   id: number;
   project_id: number;
@@ -132,7 +87,71 @@ export interface Deployment {
   endpoint_name: string;
   endpoint_status: 'NOT_CREATED' | 'CREATING' | 'READY' | 'FAILED';
   endpoint_config: Record<string, any> | null;
-  // Online tables the model serves from (null = not yet published)
+  // Online tables the model serves from (null = never deployed)
   serving_tables: string[] | null;
+  // Background Deploy / Update-model flow: FEATURES → ENDPOINT → DONE | FAILED (null = never deployed)
+  deploy_stage: 'FEATURES' | 'ENDPOINT' | 'DONE' | 'FAILED' | null;
+  deploy_error: string | null;
+  // {feature: online_table} the previous model used — torn down once the endpoint is READY
+  pending_release: Record<string, string> | null;
   created_at: string | null;
+}
+
+// A feature an online deployment serves from (registry row). online_table is null for CustomUDF
+// features, which are computed at serving from their upstream features.
+export interface DeploymentFeature {
+  deployment_id: number;
+  feature_full_name: string;
+  feature_type: 'column_selection' | 'aggregation' | 'custom_udf' | string;
+  online_table: string | null;
+  last_materialization_time: string | null;
+  // Live from the feature-engineering API (GET /api/deployments/:id/features)
+  schedule?: FeatureSchedule | null;
+  pipeline_state?: 'ACTIVE' | 'PAUSED' | 'MISSING' | string | null;
+  live_error?: string;
+}
+
+// How an online feature is kept fresh: a cron (mode DERIVED = "Auto", computed by Databricks from the
+// feature's window; MANUAL = user cron), a trigger on source-table change, or computed per request.
+export type FeatureSchedule =
+  | { kind: 'cron'; cron_expression: string; timezone_id: string; mode?: 'DERIVED' | 'MANUAL' | string }
+  | { kind: 'table_trigger' }
+  | { kind: 'on_request' };
+
+// A scheduled batch-inference job (scores input rows with model@alias, appends to output_table).
+export interface BatchRun {
+  run_id: number;
+  start_time: string | null;
+  state: string;                 // SUCCESS | FAILED | RUNNING | PENDING | ...
+  trigger?: string;              // PERIODIC (schedule) | ONE_TIME (run now) | ...
+  url: string;
+  rows?: number;
+  model_version?: string;
+  scored_at?: string;
+  error?: string;
+}
+
+export interface BatchDeployment {
+  id: number;
+  project_id: number;
+  name: string;
+  model_name: string;
+  model_alias: string;
+  input_table: string | null;
+  input_sql: string | null;
+  ts_col: string;
+  output_table: string;
+  cron_expression: string | null;
+  timezone_id: string;
+  job_id: number | null;
+  created_at: string | null;
+  // live from the Jobs API
+  paused: boolean | null;
+  runs: BatchRun[];
+  job_error: string | null;
+}
+
+export interface ModelAliases {
+  aliases: { alias: string; version: number }[];
+  versions: number[];
 }

@@ -37,6 +37,25 @@ resources:
             id: ${var.sql_warehouse_id}
             permission: CAN_USE
 
+  jobs:
+    # Demo data only (not part of the app): appends each day's synthetic transactions (catching up any
+    # missed days) and refreshes `transactions_to_score`, the batch-inference demo input.
+    demo_daily_transactions:
+      name: mlops-demo-daily-transactions
+      schedule:
+        quartz_cron_expression: "0 0 5 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: generate
+          notebook_task:
+            notebook_path: ./demo/generate_daily_transactions.py
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+
 targets:
   default:
     default: true

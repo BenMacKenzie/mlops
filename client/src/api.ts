@@ -1,4 +1,4 @@
-import type { Project, EOL, FeatureEntry, Run, OnlineTable, Deployment, TrainingSpec, DeclarativeFeature, MaterializedFeature } from './types';
+import type { Project, EOL, FeatureEntry, Run, Deployment, TrainingSpec, DeploymentFeature, BatchDeployment, ModelAliases } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -81,40 +81,18 @@ export const deleteRun = (id: number) =>
 export const registerModel = (runId: number) =>
   request<Run>(`/api/runs/${runId}/register-model`, { method: 'POST' });
 
-// ── Online Tables ──
-export const getOnlineTables = (projectId: number) =>
-  request<OnlineTable[]>(`/api/projects/${projectId}/online-tables`);
-export const checkOnlineTableStatus = (id: number) =>
-  request<OnlineTable>(`/api/online-tables/${id}/check-status`, { method: 'POST' });
-export const deleteOnlineTable = (id: number) =>
-  request<{ ok: boolean }>(`/api/online-tables/${id}`, { method: 'DELETE' });
-
-// ── Materialized Features (declarative → online store, on a schedule) ──
-export const getMaterializedFeatures = (projectId: number) =>
-  request<DeclarativeFeature[]>(`/api/projects/${projectId}/materialized-features`);
-export const materializeFeature = (
-  projectId: number,
-  data: { feature_entry_id: number; trigger_type: string; cron_expression?: string | null; timezone_id?: string | null },
-) =>
-  request<MaterializedFeature>(`/api/projects/${projectId}/materialized-features`, { method: 'POST', body: JSON.stringify(data) });
-export const pauseMaterializedFeature = (id: number) =>
-  request<MaterializedFeature>(`/api/materialized-features/${id}/pause`, { method: 'POST' });
-export const resumeMaterializedFeature = (id: number) =>
-  request<MaterializedFeature>(`/api/materialized-features/${id}/resume`, { method: 'POST' });
-export const refreshMaterializedFeature = (id: number) =>
-  request<MaterializedFeature>(`/api/materialized-features/${id}/refresh`, { method: 'POST' });
-export const deleteMaterializedFeature = (id: number) =>
-  request<{ ok: boolean }>(`/api/materialized-features/${id}`, { method: 'DELETE' });
-
 // ── Deployments ──
 export const getDeployments = (projectId: number) =>
   request<Deployment[]>(`/api/projects/${projectId}/deployments`);
 export const createDeployment = (projectId: number, data: { name: string; run_id: number; endpoint_name: string; endpoint_config?: Record<string, any> }) =>
   request<Deployment>(`/api/projects/${projectId}/deployments`, { method: 'POST', body: JSON.stringify(data) });
-export const publishDeploymentTables = (deploymentId: number) =>
-  request<{ published: number }>(`/api/deployments/${deploymentId}/publish-tables`, { method: 'POST' });
-export const createDeploymentEndpoint = (deploymentId: number) =>
-  request<Deployment>(`/api/deployments/${deploymentId}/create-endpoint`, { method: 'POST' });
+// Deploy = put the model's features online (only what's missing) + create/update the endpoint (background).
+export const deployDeployment = (deploymentId: number) =>
+  request<Deployment>(`/api/deployments/${deploymentId}/deploy`, { method: 'POST' });
+export const getDeploymentFeatures = (deploymentId: number) =>
+  request<DeploymentFeature[]>(`/api/deployments/${deploymentId}/features`);
+export const refreshDeploymentFeatures = (deploymentId: number) =>
+  request<DeploymentFeature[]>(`/api/deployments/${deploymentId}/features/refresh`, { method: 'POST' });
 export const checkDeploymentStatus = (deploymentId: number) =>
   request<Deployment>(`/api/deployments/${deploymentId}/check-status`, { method: 'POST' });
 export const getDeploymentSamples = (deploymentId: number) =>
@@ -139,3 +117,30 @@ export const databricksGet = (path: string, params?: Record<string, string>) => 
 };
 export const databricksPost = (path: string, body: any) =>
   request<any>(`/api/databricks/${path}`, { method: 'POST', body: JSON.stringify(body) });
+
+// ── Batch deployments ──
+export type BatchDeploymentInput = {
+  name: string; model_name: string; model_alias: string;
+  input_table?: string | null; input_sql?: string | null; output_table: string;
+  cron_expression?: string | null; timezone_id?: string;
+};
+export const getBatchDeployments = (projectId: number) =>
+  request<BatchDeployment[]>(`/api/projects/${projectId}/batch-deployments`);
+export const createBatchDeployment = (projectId: number, data: BatchDeploymentInput) =>
+  request<BatchDeployment>(`/api/projects/${projectId}/batch-deployments`, { method: 'POST', body: JSON.stringify(data) });
+export const updateBatchDeployment = (id: number, data: Partial<BatchDeploymentInput>) =>
+  request<BatchDeployment>(`/api/batch-deployments/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const runBatchNow = (id: number) =>
+  request<{ run_id: number }>(`/api/batch-deployments/${id}/run-now`, { method: 'POST' });
+export const pauseBatch = (id: number) =>
+  request<BatchDeployment>(`/api/batch-deployments/${id}/pause`, { method: 'POST' });
+export const resumeBatch = (id: number) =>
+  request<BatchDeployment>(`/api/batch-deployments/${id}/resume`, { method: 'POST' });
+export const previewBatch = (id: number) =>
+  request<Record<string, any>[]>(`/api/batch-deployments/${id}/preview`);
+export const deleteBatchDeployment = (id: number) =>
+  request<{ ok: boolean }>(`/api/batch-deployments/${id}`, { method: 'DELETE' });
+export const getModelAliases = (name: string) =>
+  request<ModelAliases>(`/api/models/aliases?name=${encodeURIComponent(name)}`);
+export const setModelAlias = (name: string, alias: string, version: number) =>
+  request<{ alias: string; version: number }>(`/api/models/aliases`, { method: 'PUT', body: JSON.stringify({ name, alias, version }) });
