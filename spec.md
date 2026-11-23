@@ -607,6 +607,12 @@ in **Key Design Decisions** above. Git history has the full trail.
 - Declarative feature specs stored as JSONB (beta API; flexibility > normalization).
 - Custom routes via `appkit.server.extend()` (there is no `configure` callback).
 
+**Deletion (2026-11-23, ca0d6a8):**
+- Deleting a training spec removes everything it produced: each run's UC model version (+ aliases), MLflow run (soft-delete), persisted tables, training job; then the spec's UC features that nothing else uses (no other spec defines the name in the same catalog.schema, not in `app.deployment_feature`, no surviving feature depends on it, no materializations), UDFs before their upstreams. Per-run Delete does the same for one run.
+- Blocked server-side while training, while an online deployment uses a run, while any endpoint serves the version, or while a batch deployment's alias resolves to it. Tables shared with other specs' runs (pre-10-14 fixed names) are kept. Partial failure keeps the row → retry.
+- `deployment.run_id` FK is NO ACTION (was CASCADE — deleting a run silently dropped its deployment and orphaned the endpoint).
+- UC feature delete is NOT creator-only (deleted an SP-created feature with Ben's creds); MaterializedFeature delete still is.
+
 **Jobs / notebooks:**
 - Serverless jobs need `databricks-feature-engineering` in the environment dependencies spec.
 - App-managed notebooks are uploaded via the Workspace Import API (`/api/2.0/workspace/import`) before each run — strip the `/Workspace` prefix for the API call, use `format: SOURCE`.
