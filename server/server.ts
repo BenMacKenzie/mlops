@@ -195,6 +195,9 @@ async function executeSql(req: any, sql: string): Promise<any[]> {
   return rows;
 }
 
+// UC feature name for a spec entry / column (the Feature View bridge's naming rule).
+const fvName = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
+
 // Helper: strip .py extension from notebook path
 function stripPyExt(p: string): string {
   return p.endsWith('.py') ? p.slice(0, -3) : p;
@@ -556,14 +559,7 @@ appkit.server.extend((app) => {
     }
   });
 
-  app.delete('/api/training-specs/:id', async (req, res) => {
-    try {
-      await db.query('DELETE FROM app.training_spec WHERE id = $1', [req.params.id]);
-      res.json({ ok: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+  // DELETE /api/training-specs/:id (+ delete-plan) lives with RUN DELETION below — it deletes every run's assets.
 
   // Copy a training spec with all feature entries.
   // Body can override any of: name, eol_id, task_type, split_strategy, split_method, split_config, parameters, excluded_features
@@ -715,6 +711,23 @@ appkit.server.extend((app) => {
     }
   });
 
+  // UC feature names the FV bridge gives a spec's entries (must match buildFvEntries). Includes the hidden
+  // column_selection upstreams of custom UDF inputs, so it's a (safe) superset of what a spec creates.
+  function specFeatureNames(entries: any[]): Set<string> {
+    const names = new Set<string>();
+    for (const e of entries) {
+      if (e.feature_type === 'lookup' && e.table_name) for (const col of (e.feature_names || [])) names.add(fvName(col));
+      else if (e.feature_type === 'declarative' && e.declarative_spec) {
+        const ds = e.declarative_spec;
+        names.add(ds.name || fvName(`${ds.function}_${ds.input}_${ds.time_window?.window_duration || ''}`));
+      } else if (e.feature_type === 'on_demand' && e.function_name) {
+        names.add(fvName(e.output_name || e.function_name.split('.').pop()));
+        for (const col of Object.values(e.input_bindings || {})) names.add(fvName(col as string));
+      }
+    }
+    return names;
+  }
+
   // ── Feature View bridge ──────────────────────────────────────────────
   // Translate a spec's feature_entry rows (lookup/on_demand/declarative) into the declarative
   // schema the FV notebooks consume (column_selection / aggregation / custom_udf), so specs built
@@ -725,7 +738,7 @@ appkit.server.extend((app) => {
     if (!tsCol) {
       throw new Error(`EOL "${eol.name}" has no timestamp column — the Feature View API needs an observation timestamp (e.g. transaction_ts) selected in the spine.`);
     }
-    const fname = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'feature';
+    const fname = fvName;
 
     // Pre-fetch columns + entity for each distinct lookup table (to resolve custom_udf inputs).
     const lookupTables = new Map<string, { entity: string[]; columns: Set<string> }>();
@@ -956,14 +969,7 @@ appkit.server.extend((app) => {
   // ════════════════════════════════════════════
   //  RUNS (shared by training-spec runs: delete / unregister)
   // ════════════════════════════════════════════
-  app.delete('/api/runs/:id', async (req, res) => {
-    try {
-      await db.query('DELETE FROM app.run WHERE id = $1', [req.params.id]);
-      res.json({ ok: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+  // DELETE /api/runs/:id + GET /api/runs/:id/delete-plan live after the deployment helpers (RUN DELETION).
 
   // Clear model registration from a run (so it can be re-registered)
   app.post('/api/runs/:id/unregister', async (req, res) => {
@@ -1897,6 +1903,282 @@ appkit.server.extend((app) => {
   });
 
   // UC model aliases + versions (for the batch form), and setting an alias.
+  // ════════════════════════════════════════════
+  //  RUN DELETION — a run and every asset it owns
+  // ════════════════════════════════════════════
+  // A run owns: its UC model version (+ any aliases on it), its MLflow run, its persisted
+  // train/eval/test tables, and its training job (every launch creates a fresh job). UC features are
+  // shared by name across specs, so they're never touched. Deletion is BLOCKED while the run is still
+  // training or anything serves it: an online deployment on the run, any endpoint serving the version
+  // (covers an in-flight model swap), or a batch deployment whose alias resolves to the version.
+  // Partial failures keep the run row (with what's left) so Delete can be retried; "already gone" = done.
+  type RunAsset = { kind: 'alias' | 'model_version' | 'mlflow_run' | 'table' | 'job'; name: string };
+  const isGone = (r: any) => r?.error_code === 'RESOURCE_DOES_NOT_EXIST' || r?.error_code === 'NOT_FOUND'
+    || /does not exist|not found/i.test(r?.message || '');
+
+  // `deleting` = every run being deleted together (a spec delete), so tables shared only among them are dropped.
+  async function runDeletePlan(req: any, run: any, deleting: number[] = [run.id]): Promise<{ assets: RunAsset[]; blockers: string[]; kept: string[] }> {
+    const blockers: string[] = [];
+    const assets: RunAsset[] = [];
+    if (run.status === 'RUNNING' || (run.status === 'PENDING' && run.run_id)) {
+      blockers.push('Run is still training — wait for it to finish (or cancel the job), then Check status.');
+    }
+    if ([...deploying].length) {
+      const busy = (await db.query('SELECT name FROM app.deployment WHERE id = ANY($1::bigint[])', [[...deploying]])).rows;
+      if (busy.length) blockers.push(`A deploy is in progress (${busy.map((b: any) => `"${b.name}"`).join(', ')}) — retry when it finishes.`);
+    }
+    for (const d of (await db.query('SELECT name, endpoint_name FROM app.deployment WHERE run_id = $1', [run.id])).rows) {
+      blockers.push(`Online deployment "${d.name}" (endpoint ${d.endpoint_name}) uses this run.`);
+    }
+
+    const version = run.model_name && run.model_version ? Number(run.model_version) : null;
+    if (version) {
+      // Live endpoint check: catches an endpoint still serving (or switching to) this version.
+      const deps = (await db.query(
+        `SELECT name, endpoint_name FROM app.deployment WHERE run_id <> $1 AND endpoint_status <> 'NOT_CREATED'`, [run.id]
+      )).rows;
+      for (const d of deps) {
+        const ep = await databricksApi(req, 'GET', `serving-endpoints/${encodeURIComponent(d.endpoint_name)}`, undefined, 'api/2.0').catch(() => null);
+        if (!ep || isGone(ep)) continue;
+        const ents = [...(ep.config?.served_entities || []), ...(ep.pending_config?.served_entities || [])];
+        if (ents.some((s: any) => s.entity_name === run.model_name && String(s.entity_version) === String(version))) {
+          blockers.push(`Endpoint ${d.endpoint_name} ("${d.name}") is still serving ${run.model_name} v${version}.`);
+        }
+      }
+      // Batch deployments resolve their alias every run — block if one currently lands on this version.
+      const v = await databricksApi(req, 'GET', `unity-catalog/models/${ucPath(run.model_name)}/versions/${version}?include_aliases=true`);
+      const versionAliases: string[] = v?.error_code ? [] : (v.aliases || []).map((a: any) => a.alias_name);
+      for (const b of (await db.query('SELECT name, model_alias FROM app.batch_deployment WHERE model_name = $1', [run.model_name])).rows) {
+        if (versionAliases.includes(b.model_alias)) {
+          blockers.push(`Batch deployment "${b.name}" scores ${run.model_name}@${b.model_alias}, which points at v${version} — repoint the alias or delete the batch deployment.`);
+        }
+      }
+      if (v?.error_code && !isGone(v)) blockers.push(`Couldn't read ${run.model_name} v${version}: ${v.message}`);
+      for (const a of versionAliases) assets.push({ kind: 'alias', name: `${run.model_name}@${a}` });
+      if (!v?.error_code) assets.push({ kind: 'model_version', name: `${run.model_name} v${version}` });
+    }
+    if (run.mlflow_run_id) assets.push({ kind: 'mlflow_run', name: run.mlflow_run_id });
+    // Pre-Oct-14 runs reused fixed table names (e.g. cc_fraud_pos_1_train) — drop a table only with its LAST run.
+    const kept: string[] = [];
+    for (const t of new Set([run.training_table, run.eval_table, run.test_table].filter(Boolean))) {
+      const others = (await db.query(
+        `SELECT id FROM app.run WHERE NOT (id = ANY($1::bigint[])) AND $2 IN (training_table, eval_table, test_table) ORDER BY id`, [deleting, t]
+      )).rows.map((r: any) => r.id);
+      if (others.length) kept.push(`${t} (also used by run ${others.join(', ')})`);
+      else assets.push({ kind: 'table', name: t as string });
+    }
+    if (run.job_id) assets.push({ kind: 'job', name: String(run.job_id) });
+    return { assets, blockers, kept };
+  }
+
+  // Delete one asset; returns an error message, or null when deleted / already gone.
+  async function deleteRunAsset(req: any, run: any, a: RunAsset): Promise<string | null> {
+    let r: any;
+    if (a.kind === 'alias') {
+      const alias = a.name.split('@').pop()!;
+      r = await databricksApi(req, 'DELETE', `unity-catalog/models/${ucPath(run.model_name)}/aliases/${encodeURIComponent(alias)}`);
+    } else if (a.kind === 'model_version') {
+      r = await databricksApi(req, 'DELETE', `unity-catalog/models/${ucPath(run.model_name)}/versions/${run.model_version}`);
+    } else if (a.kind === 'mlflow_run') {
+      r = await databricksApi(req, 'POST', 'mlflow/runs/delete', { run_id: a.name }, 'api/2.0');
+    } else if (a.kind === 'job') {
+      r = await databricksApi(req, 'POST', 'jobs/delete', { job_id: Number(a.name) });
+    } else {
+      if (!FQN.test(a.name)) return `refusing to drop unexpected table name ${a.name}`;
+      try { await executeSql(req, `DROP TABLE IF EXISTS ${a.name.split('.').map(p => `\`${p}\``).join('.')}`); return null; }
+      catch (e: any) { return e.message; }
+    }
+    return r?.error_code && !isGone(r) ? (r.message || r.error_code) : null;
+  }
+
+  // Delete a run's assets, then its row. On any failure the row is kept (minus what's gone) with an
+  // error_message, so Delete can be retried. Returns the failures ([] = fully deleted).
+  async function deleteRunWithAssets(req: any, run: any, assets: RunAsset[]): Promise<string[]> {
+    // Aliases before the version; the version before the MLflow run it came from.
+    const failed: string[] = [];
+    const failedKinds = new Set<RunAsset['kind']>();
+    for (const a of assets) {
+      if (a.kind === 'model_version' && failedKinds.has('alias')) { failed.push(`${a.name}: skipped (alias delete failed)`); failedKinds.add(a.kind); continue; }
+      const err = await deleteRunAsset(req, run, a);
+      if (err) { failed.push(`${a.kind} ${a.name}: ${err}`); failedKinds.add(a.kind); }
+      console.log(`[run-delete] run ${run.id} ${a.kind} ${a.name}: ${err || 'deleted'}`);
+    }
+    if (!failed.length) {
+      await db.query('DELETE FROM app.run WHERE id = $1', [run.id]);
+      return failed;
+    }
+    // Keep the row so Delete can be retried; forget what's gone so the retry skips it.
+    const dropped = new Set(assets.filter(a => a.kind === 'table').map(a => a.name));
+    const tablesLeft = (t: string | null) => (t && (!dropped.has(t) || failed.some(f => f.startsWith(`table ${t}:`))) ? t : null);
+    await db.query(
+      `UPDATE app.run SET
+         model_name = CASE WHEN $2 THEN model_name ELSE NULL END,
+         model_version = CASE WHEN $2 THEN model_version ELSE NULL END,
+         model_uri = CASE WHEN $2 THEN model_uri ELSE NULL END,
+         mlflow_run_id = CASE WHEN $3 THEN mlflow_run_id ELSE NULL END,
+         job_id = CASE WHEN $4 THEN job_id ELSE NULL END,
+         training_table = $5, eval_table = $6, test_table = $7,
+         error_message = $8
+       WHERE id = $1`,
+      [run.id, failedKinds.has('model_version') || failedKinds.has('alias'), failedKinds.has('mlflow_run'), failedKinds.has('job'),
+       tablesLeft(run.training_table), tablesLeft(run.eval_table), tablesLeft(run.test_table),
+       `Delete incomplete — ${failed.join('; ')}`.slice(0, 4000)]
+    );
+    return failed;
+  }
+
+  app.get('/api/runs/:id/delete-plan', async (req, res) => {
+    try {
+      const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.id])).rows[0];
+      if (!run) { res.status(404).json({ error: 'Run not found' }); return; }
+      res.json(await runDeletePlan(req, run));
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete('/api/runs/:id', async (req, res) => {
+    try {
+      const run = (await db.query('SELECT * FROM app.run WHERE id = $1', [req.params.id])).rows[0];
+      if (!run) { res.json({ ok: true }); return; }
+      const { assets, blockers } = await runDeletePlan(req, run);  // shared tables aren't in assets → kept
+      if (blockers.length) { res.status(409).json({ error: `Can't delete run ${run.id}:\n• ${blockers.join('\n• ')}`, blockers }); return; }
+
+      const failed = await deleteRunWithAssets(req, run, assets);
+      if (!failed.length) { res.json({ ok: true, deleted: assets }); return; }
+      res.status(500).json({ error: `Some assets couldn't be deleted (run kept so you can retry):\n• ${failed.join('\n• ')}`, failed });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+
+  // Delete a training spec and everything it produced: every run's assets (see runDeletePlan), the runs,
+  // its UC features nothing else uses (specFeaturePlan), and the spec + its feature entries. Blocked while any run is
+  // deployed/serving/training. Tables also used by OTHER specs' runs are kept; EOLs are shared and never touched.
+  async function specDeletePlan(req: any, specId: string) {
+    const spec = (await db.query('SELECT * FROM app.training_spec WHERE id = $1', [specId])).rows[0];
+    if (!spec) return null;
+    const runs = (await db.query('SELECT * FROM app.run WHERE training_spec_id = $1 ORDER BY id', [spec.id])).rows;
+    const ids = runs.map((r: any) => Number(r.id));
+    const blockers = new Set<string>();
+    const kept = new Set<string>();
+    const plans: { run: any; assets: RunAsset[] }[] = [];
+    for (const run of runs) {
+      const p = await runDeletePlan(req, run, ids);
+      for (const b of p.blockers) blockers.add(b.startsWith('A deploy is in progress') ? b : `Run ${run.id}: ${b}`);
+      for (const k of p.kept) kept.add(k);
+      plans.push({ run, assets: p.assets });
+    }
+    // Dedupe for display (shared tables appear under several runs).
+    const seen = new Set<string>();
+    const assets = plans.flatMap(p => p.assets).filter(a => !seen.has(`${a.kind}:${a.name}`) && !!seen.add(`${a.kind}:${a.name}`));
+    const features = await specFeaturePlan(req, spec);
+    return { spec, runs: ids, plans, assets, blockers: [...blockers], kept: [...kept], features };
+  }
+
+  // Which of the spec's UC features can go: only those no other spec defines (by name, any project in the same
+  // catalog.schema), no online deployment registry references, no surviving UC feature depends on, and that have
+  // no materializations (those belong to deployments). Ordered dependents-first (custom UDFs before upstreams).
+  async function specFeaturePlan(req: any, spec: any): Promise<{ delete: string[]; keep: string[] }> {
+    const project = (await db.query('SELECT catalog, schema FROM app.project WHERE id = $1', [spec.project_id])).rows[0];
+    const ns = `${project.catalog}.${project.schema}`;
+    const entries = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1', [spec.id])).rows;
+    const mine = [...specFeatureNames(entries)].map(n => `${ns}.${n}`);
+    if (!mine.length) return { delete: [], keep: [] };
+
+    // Every UC feature in the namespace (ListFeatures pages ≤ 50).
+    const uc = new Map<string, any>();
+    let token = '';
+    do {
+      const r = await databricksApi(req, 'GET', `feature-engineering/features?catalog_name=${encodeURIComponent(project.catalog)}&schema_name=${encodeURIComponent(project.schema)}&page_size=50${token ? `&page_token=${encodeURIComponent(token)}` : ''}`, undefined, 'api/2.0');
+      if (r?.error_code) throw new Error(`Listing UC features in ${ns}: ${r.message}`);
+      for (const f of r.features || []) uc.set(f.full_name, f);
+      token = r.next_page_token || '';
+    } while (token);
+
+    const usedByOtherSpecs = new Map<string, string[]>();
+    const others = (await db.query(
+      `SELECT s.id, s.name, p.catalog, p.schema FROM app.training_spec s JOIN app.project p ON p.id = s.project_id WHERE s.id <> $1`, [spec.id]
+    )).rows.filter((o: any) => `${o.catalog}.${o.schema}` === ns);
+    for (const o of others) {
+      const oe = (await db.query('SELECT * FROM app.feature_entry WHERE training_spec_id = $1', [o.id])).rows;
+      for (const n of specFeatureNames(oe)) {
+        const full = `${ns}.${n}`;
+        usedByOtherSpecs.set(full, [...(usedByOtherSpecs.get(full) || []), `"${o.name}"`]);
+      }
+    }
+    const inRegistry = new Set((await db.query(
+      'SELECT DISTINCT feature_full_name FROM app.deployment_feature WHERE feature_full_name = ANY($1)', [mine]
+    )).rows.map((r: any) => r.feature_full_name));
+
+    const keep: string[] = [];
+    const candidates = new Set<string>();
+    for (const full of mine) {
+      if (!uc.has(full)) continue;  // never created (or already gone)
+      const why = usedByOtherSpecs.get(full)?.length ? `used by spec ${usedByOtherSpecs.get(full)!.join(', ')}`
+        : inRegistry.has(full) ? 'served by an online deployment' : null;
+      if (why) keep.push(`${full} (${why})`); else candidates.add(full);
+    }
+    // Materializations belong to deployments — never tear them down from here.
+    for (const full of [...candidates]) {
+      const m = await databricksApi(req, 'GET', `feature-engineering/materialized-features?feature_name=${encodeURIComponent(full)}`, undefined, 'api/2.0');
+      const n = m?.error_code ? -1 : (m.materialized_features || []).length;
+      if (n !== 0) { candidates.delete(full); keep.push(`${full} (${n < 0 ? `couldn't check materializations: ${m.message}` : 'has materializations'})`); }
+    }
+    // Upstreams of a surviving feature stay (e.g. customer_zip under another spec's UDF); repeat to a fixed point.
+    const deps = (f: any): string[] => (f?.source?.feature_view_source?.feature_references || []).map((x: any) => x.feature);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [full, f] of uc) {
+        if (candidates.has(full)) continue;
+        for (const d of deps(f)) if (candidates.delete(d)) { keep.push(`${d} (input to ${full})`); changed = true; }
+      }
+    }
+    // Dependents first: a feature that others in the delete set depend on goes last.
+    const order: string[] = [];
+    const left = new Set(candidates);
+    while (left.size) {
+      // Emit features nothing still-pending depends on; a cycle (shouldn't happen) is emitted as-is.
+      const ready = [...left].filter(x => ![...left].some(y => y !== x && deps(uc.get(y)).includes(x)));
+      for (const x of (ready.length ? ready : [...left])) { order.push(x); left.delete(x); }
+    }
+    return { delete: order, keep };
+  }
+
+  app.get('/api/training-specs/:id/delete-plan', async (req, res) => {
+    try {
+      const p = await specDeletePlan(req, req.params.id);
+      if (!p) { res.status(404).json({ error: 'Training spec not found' }); return; }
+      res.json({ runs: p.runs, assets: p.assets, blockers: p.blockers, kept: p.kept, features: p.features });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete('/api/training-specs/:id', async (req, res) => {
+    try {
+      const p = await specDeletePlan(req, req.params.id);
+      if (!p) { res.json({ ok: true }); return; }
+      if (p.blockers.length) {
+        res.status(409).json({ error: `Can't delete spec "${p.spec.name}":\n• ${p.blockers.join('\n• ')}`, blockers: p.blockers }); return;
+      }
+      const failed: string[] = [];
+      for (const { run, assets } of p.plans) {
+        for (const f of await deleteRunWithAssets(req, run, assets)) failed.push(`run ${run.id} ${f}`);
+      }
+      // UC features only once every run (and so every model logged against them) is gone.
+      if (!failed.length) {
+        for (const full of p.features.delete) {
+          const r = await databricksApi(req, 'DELETE', `feature-engineering/features/${encodeURIComponent(full)}`, undefined, 'api/2.0');
+          const err = r?.error_code && !isGone(r) ? (r.message || r.error_code) : null;
+          console.log(`[spec-delete] spec ${p.spec.id} feature ${full}: ${err || 'deleted'}`);
+          if (err) failed.push(`feature ${full}: ${err}`);
+        }
+      }
+      if (failed.length) {
+        res.status(500).json({ error: `Some assets couldn't be deleted (spec kept so you can retry):\n• ${failed.join('\n• ')}`, failed }); return;
+      }
+      await db.query('DELETE FROM app.training_spec WHERE id = $1', [p.spec.id]);  // cascades feature entries
+      console.log(`[spec-delete] spec ${p.spec.id} "${p.spec.name}": ${p.runs.length} runs, ${p.assets.length} assets deleted`);
+      res.json({ ok: true, runs: p.runs, deleted: p.assets, features: p.features.delete });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
   app.get('/api/models/aliases', async (req, res) => {
     try {
       const name = String(req.query.name || '');

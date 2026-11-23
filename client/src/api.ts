@@ -42,8 +42,12 @@ export const createTrainingSpec = (projectId: number, data: Partial<TrainingSpec
   request<TrainingSpec>(`/api/projects/${projectId}/training-specs`, { method: 'POST', body: JSON.stringify(data) });
 export const updateTrainingSpec = (id: number, data: Partial<TrainingSpec>) =>
   request<TrainingSpec>(`/api/training-specs/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+// Deletes the spec + its runs + every run's assets (model versions/aliases, MLflow runs, tables, jobs) + UC features
+// nothing else uses. 409 if blocked.
 export const deleteTrainingSpec = (id: number) =>
   request<{ ok: boolean }>(`/api/training-specs/${id}`, { method: 'DELETE' });
+export const getTrainingSpecDeletePlan = (id: number) =>
+  request<{ runs: number[]; assets: RunAsset[]; blockers: string[]; kept: string[]; features: { delete: string[]; keep: string[] } }>(`/api/training-specs/${id}/delete-plan`);
 export const copyTrainingSpec = (id: number, overrides?: Partial<TrainingSpec>) =>
   request<TrainingSpec>(`/api/training-specs/${id}/copy`, { method: 'POST', body: JSON.stringify(overrides || {}) });
 export const createTrainingSpecEntry = (specId: number, data: any) =>
@@ -76,6 +80,11 @@ export const copyEOL = (id: number, name?: string) =>
   request<EOL>(`/api/eols/${id}/copy`, { method: 'POST', body: JSON.stringify({ name }) });
 
 // ── Runs (shared) ──
+export type RunAsset = { kind: 'alias' | 'model_version' | 'mlflow_run' | 'table' | 'job'; name: string };
+// What deleting a run would remove, and anything (deployments, a live training job) blocking it.
+export const getRunDeletePlan = (id: number) =>
+  request<{ assets: RunAsset[]; blockers: string[]; kept: string[] }>(`/api/runs/${id}/delete-plan`);
+// Deletes the run AND its assets (model version + aliases, MLflow run, tables, job). 409 if blocked.
 export const deleteRun = (id: number) =>
   request<{ ok: boolean }>(`/api/runs/${id}`, { method: 'DELETE' });
 export const registerModel = (runId: number) =>

@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS app.deployment (
 -- Online tables a deployment's model resolves features from (set by publish-tables;
 -- NULL = not yet published, [] = published, nothing to serve from the online store).
 ALTER TABLE app.deployment ADD COLUMN IF NOT EXISTS serving_tables TEXT[];
+-- A deployed run must never vanish under its deployment (it used to CASCADE, silently dropping the
+-- deployment row and orphaning the endpoint). NO ACTION (checked at end of statement) still lets a
+-- project delete remove both rows, but a spec/run delete fails while a deployment references the run.
+DO $$
+DECLARE c record;
+BEGIN
+  FOR c IN SELECT conname FROM pg_constraint
+           WHERE conrelid = 'app.deployment'::regclass AND contype = 'f'
+             AND confrelid = 'app.run'::regclass AND confdeltype <> 'a'  -- 'a' = NO ACTION (already migrated)
+  LOOP
+    EXECUTE format('ALTER TABLE app.deployment DROP CONSTRAINT %I', c.conname);
+  END LOOP;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'app.deployment'::regclass AND contype = 'f'
+                 AND confrelid = 'app.run'::regclass) THEN
+    ALTER TABLE app.deployment ADD CONSTRAINT deployment_run_id_fkey FOREIGN KEY (run_id) REFERENCES app.run(id);
+  END IF;
+END $$;
 -- Online deployments own getting their model's features online (Deploy). deploy_stage tracks the
 -- background flow FEATURES → ENDPOINT → DONE | FAILED; pending_release = {feature: online_table} the
 -- previous model used, torn down once the endpoint is READY on the new version.

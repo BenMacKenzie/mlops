@@ -1089,6 +1089,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
   const [eolExpandedFor, setEolExpandedFor] = useState<number | null>(null);
   const [registerError, setRegisterError] = useState('');
   const [registeringId, setRegisteringId] = useState<number | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<number | null>(null);
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1203,6 +1204,39 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
       await reload();
     } catch (e: any) { setRegisterError(e.message); }
     finally { setRegisteringId(null); }
+  };
+
+  const assetLabel: Record<api.RunAsset['kind'], string> = {
+    alias: 'Model alias', model_version: 'Model version', mlflow_run: 'MLflow run', table: 'Table', job: 'Training job',
+  };
+  const describeAssets = (assets: api.RunAsset[], kept: string[]) =>
+    (assets.length ? assets.map(a => `• ${assetLabel[a.kind]}: ${a.name}`).join('\n') : '• (no Databricks assets — app records only)')
+    + (kept.length ? `\n\nKept (shared with other runs):\n${kept.map(k => `• ${k}`).join('\n')}` : '');
+
+  // Delete a training spec, all of its runs, and everything those runs produced.
+  const [deletingSpecId, setDeletingSpecId] = useState<number | null>(null);
+  const deleteSpec = async (spec: TrainingSpec) => {
+    setDeletingSpecId(spec.id);
+    try {
+      const { runs: runIds, assets, blockers, kept, features } = await api.getTrainingSpecDeletePlan(spec.id);
+      if (blockers.length) { alert(`Can't delete spec "${spec.name}":\n\n• ${blockers.join('\n• ')}`); return; }
+      const runsLine = runIds.length ? `${runIds.length} run${runIds.length === 1 ? '' : 's'} (${runIds.join(', ')}) and their assets:` : 'No runs.';
+      if (!confirm(`Delete training spec "${spec.name}"?\n\n${runsLine}\n${runIds.length ? describeAssets(assets, kept) : ''}${features.delete.length ? `\n\nUC features (used by nothing else):\n${features.delete.map(f => `• ${f}`).join('\n')}` : ''}${features.keep.length ? `\n\nUC features kept:\n${features.keep.map(f => `• ${f}`).join('\n')}` : ''}\n\nThe EOL is shared and kept. This can't be undone (MLflow runs are soft-deleted for 30 days).`)) return;
+      await api.deleteTrainingSpec(spec.id);
+    } catch (e: any) { alert(`Delete failed: ${e.message}`); }
+    finally { setDeletingSpecId(null); await reload(); }
+  };
+
+  // Delete a run and everything it owns. Blocked (server-side too) while it's deployed or training.
+  const deleteRun = async (runId: number) => {
+    setDeletingRunId(runId);
+    try {
+      const { assets, blockers, kept } = await api.getRunDeletePlan(runId);
+      if (blockers.length) { alert(`Can't delete run ${runId}:\n\n• ${blockers.join('\n• ')}`); return; }
+      if (!confirm(`Delete run ${runId} and all of its assets?\n\n${describeAssets(assets, kept)}\n\nThis can't be undone (MLflow runs are soft-deleted for 30 days).`)) return;
+      await api.deleteRun(runId);
+    } catch (e: any) { alert(`Delete failed: ${e.message}`); }
+    finally { setDeletingRunId(null); await reload(); }
   };
 
   const host = runs[0]?.databricks_run_url?.match(/^https?:\/\/[^/]+/)?.[0] || '';
@@ -1352,7 +1386,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                     <button onClick={() => launchRun(spec.id)} className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">Run</button>
                   )}
                   <button onClick={() => startCopy(spec)} className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded hover:bg-gray-200">Copy</button>
-                  {!isLocked && <button onClick={() => api.deleteTrainingSpec(spec.id).then(reload)} className="text-red-500 text-sm">Delete</button>}
+                  <button onClick={() => deleteSpec(spec)} disabled={deletingSpecId === spec.id} className="text-red-500 text-sm disabled:text-gray-400">{deletingSpecId === spec.id ? 'Deleting…' : 'Delete'}</button>
                 </div>
               </div>
 
@@ -1449,7 +1483,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
                                 ] as [string | null, string][]).filter(([t]) => t).map(([t, label]) => (
                                   <a key={label} href={`${host}/explore/data/${t!.split('.').join('/')}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline" title={t!}>{label}</a>
                                 ))}
-                                <button onClick={() => api.deleteRun(r.id).then(reload)} className="text-red-500 hover:underline">Delete</button>
+                                <button onClick={() => deleteRun(r.id)} disabled={deletingRunId === r.id} className="text-red-500 hover:underline disabled:text-gray-400">{deletingRunId === r.id ? 'Deleting…' : 'Delete'}</button>
                               </td>
                             </tr>
                           ))}
