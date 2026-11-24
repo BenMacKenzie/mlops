@@ -28,7 +28,9 @@ Synthetic credit-card-fraud dataset created 2026-09-29 to exercise the full app 
 model name e.g. `cc_fraud`.
 
 **EOL (spine):**
-- SQL: `SELECT transaction_id, customer_id, merchant_id, transaction_ts, amount, pos_entry_mode, security_code, is_fraud FROM serverless_stable_77rg2n_catalog.credit_card_fraud_demo.transactions`
+- SQL: `SELECT customer_id, merchant_id, transaction_ts, amount, pos_entry_mode, security_code, is_fraud FROM serverless_stable_77rg2n_catalog.credit_card_fraud_demo.transactions`
+  (the app's EOLs add `WHERE pos_entry_mode = 1` for "card present" and `= 0` for "card not present"). Leave
+  `transaction_id` out: any spine column that isn't an entity, the timestamp or the label becomes a model feature.
 - Label column: `is_fraud`
 - Entity columns: `customer_id`, `merchant_id`
 - Timestamp column: `transaction_ts`
