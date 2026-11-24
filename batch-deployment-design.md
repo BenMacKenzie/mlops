@@ -115,7 +115,7 @@ the app. Shipped as a plain file (no notebook header).
 
 ## Demo data (BUILT 2026-11-20)
 
-- `demo/generate_daily_transactions.py`, bundle job **`mlops-demo-daily-transactions`** (daily 05:00 UTC,
+- `examples/credit_card_fraud/generate_daily_transactions.py`, bundle job **`mlops-demo-daily-transactions`** (daily 05:00 UTC,
   job 912042967128619). Appends each day's synthetic transactions to `transactions`, catching up any missed
   days (idempotent), and overwrites **`transactions_to_score`** with the newest day's transactions — request
   fields only (`transaction_id, customer_id, merchant_id, amount, pos_entry_mode, security_code`).

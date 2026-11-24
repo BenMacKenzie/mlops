@@ -49,7 +49,7 @@ resources:
       tasks:
         - task_key: generate
           notebook_task:
-            notebook_path: ./demo/generate_daily_transactions.py
+            notebook_path: ./examples/credit_card_fraud/generate_daily_transactions.py
           environment_key: default
       environments:
         - environment_key: default
