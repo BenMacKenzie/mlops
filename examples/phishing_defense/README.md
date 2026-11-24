@@ -63,8 +63,11 @@ lookup 0.51. The recipient lookup changes who gets targeted, not the label.
 **Project:** catalog `serverless_stable_77rg2n_catalog`, schema `phishing_defense_demo`, model e.g. `phishing`.
 
 **EOL:**
-- SQL: `SELECT email_id, recipient_id, sender_domain, event_ts, subject_has_urgency, num_links, num_attachments, has_html_form, reply_to_mismatch, spf_result, dkim_result, dmarc_result, is_phishing FROM serverless_stable_77rg2n_catalog.phishing_defense_demo.emails`
+- SQL: `SELECT recipient_id, sender_domain, event_ts, subject_has_urgency, num_links, num_attachments, has_html_form, reply_to_mismatch, spf_result, dkim_result, dmarc_result, is_phishing FROM serverless_stable_77rg2n_catalog.phishing_defense_demo.emails`
 - Label `is_phishing`, entity columns `recipient_id`, `sender_domain`, timestamp `event_ts`
+- Entity columns and the timestamp are lookup / join keys; training drops them before fitting. Leave
+  `email_id` out of the EOL: any other spine column becomes a model feature, and a per-row ID is pure noise
+  (if you keep it, exclude it under Training Features).
 
 **Feature entries:**
 1. Lookup `sender_domain_features`, key `sender_domain`: `domain_age_days`, `registrar_risk_score`,
