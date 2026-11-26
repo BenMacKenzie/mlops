@@ -1821,8 +1821,28 @@ appkit.server.extend((app) => {
     if (!tsCol) throw Object.assign(new Error(`EOL "${eol.name}" has no timestamp column`), { status: 400 });
     const cols = await describeColumns(req, `SELECT * FROM (${eol.sql_definition.trim().replace(/;$/, '')}) AS _eol`);
     const label = (eol.label_column || '').trim();
-    return { tsCol, required: cols.filter(c => c !== label && c !== tsCol) };
+    const ents: string[] = Array.isArray(eol.entity_columns) ? eol.entity_columns
+      : String(eol.entity_columns || '').replace(/^\{|\}$/g, '').split(',').map((x: string) => x.trim()).filter(Boolean);
+    const required = cols.filter(c => c !== label && c !== tsCol);
+    return {
+      tsCol, required, label,
+      entity_columns: required.filter(c => ents.includes(c)),
+      request_fields: required.filter(c => !ents.includes(c)),
+      eol_name: eol.name, spec_name: spec.name, model_version: run.model_version,
+    };
   }
+
+  // What a batch input must provide for a model: entity keys + request fields (the training EOL's columns minus
+  // label and timestamp). The timestamp is set to the run time by the job, so the input must not carry it.
+  app.get('/api/projects/:projectId/batch-requirements', async (req, res) => {
+    try {
+      const model = String(req.query.model || '');
+      if (!model) { res.status(400).json({ error: 'model required' }); return; }
+      const m = await modelSpine(req, Number(req.params.projectId), model);
+      res.json({ ts_col: m.tsCol, label: m.label, entity_columns: m.entity_columns, request_fields: m.request_fields,
+        eol_name: m.eol_name, spec_name: m.spec_name, model_version: m.model_version });
+    } catch (e: any) { res.status(e.status || 500).json({ error: e.message }); }
+  });
 
   function validateBatchBody(b: any) {
     if (!b.name || !b.model_name || !b.model_alias || !b.output_table) return 'name, model_name, model_alias and output_table are required';

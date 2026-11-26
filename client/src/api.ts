@@ -155,6 +155,12 @@ export const previewBatch = (id: number) =>
   request<Record<string, any>[]>(`/api/batch-deployments/${id}/preview`);
 export const deleteBatchDeployment = (id: number) =>
   request<{ ok: boolean }>(`/api/batch-deployments/${id}`, { method: 'DELETE' });
+export type BatchRequirements = {
+  ts_col: string; label: string; entity_columns: string[]; request_fields: string[];
+  eol_name: string; spec_name: string; model_version: number | null;
+};
+export const getBatchRequirements = (projectId: number, model: string) =>
+  request<BatchRequirements>(`/api/projects/${projectId}/batch-requirements?model=${encodeURIComponent(model)}`);
 export const getModelAliases = (name: string) =>
   request<ModelAliases>(`/api/models/aliases?name=${encodeURIComponent(name)}`);
 export const setModelAlias = (name: string, alias: string, version: number) =>

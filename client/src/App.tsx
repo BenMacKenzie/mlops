@@ -2084,7 +2084,7 @@ function DeploymentTab({ projectId, eols, trainingSpecs, runs }: {
 
 type ScheduleMode = 'none' | 'daily' | 'cron';
 const emptyBatchForm = {
-  name: '', model_name: '', model_alias: '', input_mode: 'table' as 'table' | 'sql', input_table: '', input_sql: '',
+  name: '', model_name: '', model_alias: '', input_mode: 'source' as 'source' | 'sql', input_table: '', input_sql: '',
   output_table: '', schedule: 'daily' as ScheduleMode, daily_time: '06:00', cron_expression: '', timezone_id: 'UTC',
 };
 
@@ -2163,6 +2163,116 @@ function BatchPreview({ id }: { id: number }) {
   );
 }
 
+// Builds the batch input SQL around a source table: each column the model needs (entity keys + request fields)
+// is mapped to a source column (same name by default); extra columns can be passed through to the output
+// (e.g. an email_id to join predictions back); the model's timestamp column is never selected.
+const qid = (c: string) => `\`${c.replace(/`/g, '``')}\``;
+function BatchSourceBuilder({ project, reqs, onSql }: {
+  project: Project; reqs: api.BatchRequirements; onSql: (sql: string, table: string) => void;
+}) {
+  const [catalogs, setCatalogs] = useState<string[]>([]);
+  const [schemas, setSchemas] = useState<string[]>([]);
+  const [tables, setTables] = useState<string[]>([]);
+  const [cat, setCat] = useState(project.catalog);
+  const [sch, setSch] = useState(project.schema);
+  const [tbl, setTbl] = useState('');
+  const [cols, setCols] = useState<{ name: string; type: string }[]>([]);
+  const [mapping, setMapping] = useState<Record<string, string>>({});
+  const [extras, setExtras] = useState<string[]>([]);
+  const [filter, setFilter] = useState('');
+  const needed = [...reqs.entity_columns, ...reqs.request_fields];
+
+  useEffect(() => { api.getCatalogs().then(setCatalogs).catch(() => setCatalogs([])); }, []);
+  useEffect(() => { if (cat) api.getSchemas(cat).then(setSchemas).catch(() => setSchemas([])); }, [cat]);
+  useEffect(() => { setTables([]); if (cat && sch) api.getTables(cat, sch).then(setTables).catch(() => setTables([])); }, [cat, sch]);
+  useEffect(() => {
+    setCols([]); setMapping({}); setExtras([]);
+    if (!cat || !sch || !tbl) return;
+    api.getColumns(cat, sch, tbl).then((c) => {
+      setCols(c);
+      const names = new Set(c.map((x) => x.name));
+      setMapping(Object.fromEntries(needed.map((n) => [n, names.has(n) ? n : ''])));
+      // Pass through other id-like columns by default (handy to join predictions back to the source row).
+      setExtras(c.map((x) => x.name).filter((n) => !needed.includes(n) && n !== reqs.ts_col && n !== reqs.label && /(^id$|_id$)/i.test(n)));
+    }).catch(() => setCols([]));
+  }, [cat, sch, tbl]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fqn = tbl ? `${cat}.${sch}.${tbl}` : '';
+  const missing = needed.filter((n) => !mapping[n]);
+  const sql = !fqn || missing.length ? '' : [
+    'SELECT ' + [
+      ...needed.map((n) => (mapping[n] === n ? qid(n) : `${qid(mapping[n])} AS ${qid(n)}`)),
+      ...extras.filter((e) => !needed.includes(e)).map(qid),
+    ].join(', '),
+    `FROM ${fqn}`,
+    ...(filter.trim() ? [`WHERE ${filter.trim()}`] : []),
+  ].join('\n');
+  useEffect(() => { onSql(sql, fqn); }, [sql, fqn]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const extraCandidates = cols.filter((c) => !needed.includes(c.name) && c.name !== reqs.ts_col && c.name !== reqs.label);
+  const sel = 'w-full px-2 py-1.5 border rounded text-sm';
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-3 gap-2">
+        <select className={sel} value={cat} onChange={(e) => { setCat(e.target.value); setSch(''); setTbl(''); }}>
+          <option value="">Catalog...</option>{catalogs.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <select className={sel} value={sch} onChange={(e) => { setSch(e.target.value); setTbl(''); }} disabled={!cat}>
+          <option value="">Schema...</option>{schemas.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <select className={sel} value={tbl} onChange={(e) => setTbl(e.target.value)} disabled={!sch}>
+          <option value="">Source table...</option>{tables.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+      {tbl && cols.length > 0 && (
+        <>
+          <table className="w-full text-xs border rounded">
+            <thead className="bg-gray-50"><tr>
+              <th className="px-2 py-1 text-left font-medium">Model needs</th><th className="px-2 py-1 text-left font-medium">Kind</th>
+              <th className="px-2 py-1 text-left font-medium">← Source column</th></tr></thead>
+            <tbody className="divide-y">{needed.map((n) => (
+              <tr key={n}>
+                <td className="px-2 py-1 font-mono">{n}</td>
+                <td className="px-2 py-1 text-gray-500">{reqs.entity_columns.includes(n) ? 'entity key' : 'request field'}</td>
+                <td className="px-2 py-1">
+                  <select className={`px-1 py-0.5 border rounded font-mono ${mapping[n] ? '' : 'border-red-400 bg-red-50'}`} value={mapping[n] || ''}
+                    onChange={(e) => setMapping({ ...mapping, [n]: e.target.value })}>
+                    <option value="">— missing —</option>
+                    {cols.filter((c) => c.name !== reqs.ts_col).map((c) => <option key={c.name} value={c.name}>{c.name} ({c.type})</option>)}
+                  </select>
+                </td>
+              </tr>
+            ))}</tbody>
+          </table>
+          {extraCandidates.length > 0 && (
+            <div className="text-xs">
+              <span className="font-medium">Pass through to the output</span> <span className="text-gray-400">(not used by the model)</span>:
+              <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1">{extraCandidates.map((c) => (
+                <label key={c.name} className="flex items-center gap-1 cursor-pointer">
+                  <input type="checkbox" checked={extras.includes(c.name)}
+                    onChange={() => setExtras(extras.includes(c.name) ? extras.filter((x) => x !== c.name) : [...extras, c.name])} />
+                  <span className="font-mono">{c.name}</span>
+                </label>
+              ))}</div>
+            </div>
+          )}
+          {cols.some((c) => c.name === reqs.ts_col) && (
+            <div className="text-xs text-gray-500">The source's <span className="font-mono">{reqs.ts_col}</span> is left out — the job sets it to the run time.</div>
+          )}
+          <div>
+            <label className="block text-xs font-medium mb-1">Filter (optional WHERE clause)</label>
+            <input className="w-full px-2 py-1.5 border rounded font-mono text-xs" value={filter} onChange={(e) => setFilter(e.target.value)}
+              placeholder={`e.g. ${reqs.ts_col} >= current_date() - INTERVAL 1 DAY`} />
+          </div>
+          {missing.length > 0
+            ? <div className="text-xs text-red-600">Map every column the model needs ({missing.join(', ')} missing).</div>
+            : <pre className="p-2 bg-gray-50 rounded text-xs font-mono whitespace-pre-wrap">{sql}</pre>}
+        </>
+      )}
+    </div>
+  );
+}
+
 function BatchTab({ projectId, project, runs }: { projectId: number; project: Project; runs: Run[] }) {
   const [items, setItems] = useState<BatchDeployment[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2186,6 +2296,13 @@ function BatchTab({ projectId, project, runs }: { projectId: number; project: Pr
   }, [active, load]);
 
   const models = [...new Set(runs.filter(r => r.model_name && r.model_version).map(r => r.model_name as string))];
+  const [reqs, setReqs] = useState<api.BatchRequirements | null>(null);
+  const [reqsError, setReqsError] = useState('');
+  useEffect(() => {
+    setReqs(null); setReqsError('');
+    if (!showForm || !form.model_name) return;
+    api.getBatchRequirements(projectId, form.model_name).then(setReqs).catch((e) => setReqsError(e.message));
+  }, [showForm, form.model_name, projectId]);
 
   const openForm = () => {
     setForm({ ...emptyBatchForm, model_name: models[0] || '' });
@@ -2197,8 +2314,8 @@ function BatchTab({ projectId, project, runs }: { projectId: number; project: Pr
     try {
       await api.createBatchDeployment(projectId, {
         name: form.name, model_name: form.model_name, model_alias: form.model_alias,
-        input_table: form.input_mode === 'table' ? form.input_table : null,
-        input_sql: form.input_mode === 'sql' ? form.input_sql : null,
+        input_table: null,
+        input_sql: form.input_sql,
         output_table: form.output_table || `${project.catalog}.${project.schema}.${form.name}_predictions`,
         cron_expression: scheduleToCron(form), timezone_id: form.timezone_id || 'UTC',
       });
@@ -2256,22 +2373,36 @@ function BatchTab({ projectId, project, runs }: { projectId: number; project: Pr
             </div>
           </div>
 
+          {reqsError && <div className="text-sm text-red-600 bg-red-50 p-2 rounded">{reqsError}</div>}
+          {reqs && (
+            <div className="text-sm bg-gray-50 border rounded p-3 space-y-1">
+              <div className="font-medium">What the input must provide <span className="font-normal text-xs text-gray-500">
+                (from EOL “{reqs.eol_name}”, spec “{reqs.spec_name}”{reqs.model_version ? `, v${reqs.model_version}` : ''})</span></div>
+              <div><span className="text-gray-500">Entity keys</span> (features are looked up / aggregated by these):{' '}
+                <span className="font-mono">{reqs.entity_columns.join(', ') || '—'}</span></div>
+              <div><span className="text-gray-500">Request fields</span> (values the requesting system sends):{' '}
+                <span className="font-mono">{reqs.request_fields.join(', ') || 'none'}</span></div>
+              <div className="text-xs text-gray-500">One row per thing to score. Don't include <span className="font-mono">{reqs.ts_col}</span> or
+                {' '}<span className="font-mono">{reqs.label}</span>: features are computed as of the run time. Any other columns pass through to the output.</div>
+            </div>
+          )}
+
           <div>
             <label className="block text-sm font-medium mb-1">
-              Input — request fields to score
+              Input
               <span className="ml-3 font-normal text-xs">
-                <label className="mr-3"><input type="radio" checked={form.input_mode === 'table'} onChange={() => setForm({ ...form, input_mode: 'table' })} /> table</label>
-                <label><input type="radio" checked={form.input_mode === 'sql'} onChange={() => setForm({ ...form, input_mode: 'sql' })} /> SQL</label>
+                <label className="mr-3"><input type="radio" checked={form.input_mode === 'source'} onChange={() => setForm({ ...form, input_mode: 'source' })} /> build from a source table</label>
+                <label><input type="radio" checked={form.input_mode === 'sql'} onChange={() => setForm({ ...form, input_mode: 'sql' })} /> write SQL</label>
               </span>
             </label>
-            {form.input_mode === 'table' ? (
-              <input className="w-full px-3 py-2 border rounded font-mono text-sm" value={form.input_table}
-                placeholder={`${project.catalog}.${project.schema}.transactions_to_score`} onChange={e => setForm({ ...form, input_table: e.target.value.trim() })} />
+            {form.input_mode === 'source' ? (
+              reqs ? <BatchSourceBuilder project={project} reqs={reqs} onSql={(sql, table) => setForm(f => ({ ...f, input_sql: sql, input_table: table }))} />
+                : <div className="text-xs text-gray-400">{form.model_name ? 'Loading model requirements…' : 'Pick a model first'}</div>
             ) : (
-              <textarea className="w-full px-3 py-2 border rounded font-mono text-sm" rows={3} value={form.input_sql}
-                placeholder="SELECT customer_id, merchant_id, amount, ... FROM ..." onChange={e => setForm({ ...form, input_sql: e.target.value })} />
+              <textarea className="w-full px-3 py-2 border rounded font-mono text-sm" rows={4} value={form.input_sql}
+                placeholder={reqs ? `SELECT ${[...reqs.entity_columns, ...reqs.request_fields].join(', ')} FROM ...` : 'SELECT ... FROM ...'}
+                onChange={e => setForm({ ...form, input_sql: e.target.value })} />
             )}
-            <div className="text-xs text-gray-500 mt-1">Must contain every request field the model was trained with, and <b>not</b> its timestamp column (set to the run time).</div>
           </div>
 
           <div className="grid grid-cols-3 gap-3">
@@ -2308,7 +2439,7 @@ function BatchTab({ projectId, project, runs }: { projectId: number; project: Pr
           </div>
 
           <div className="flex gap-2">
-            <button onClick={submit} disabled={saving || !form.name || !form.model_name || !form.model_alias || !(form.input_mode === 'table' ? form.input_table : form.input_sql)}
+            <button onClick={submit} disabled={saving || !form.name || !form.model_name || !form.model_alias || !form.input_sql.trim()}
               className="px-4 py-2 bg-green-600 text-white rounded text-sm disabled:opacity-50">{saving ? 'Creating job…' : 'Create'}</button>
             <button onClick={() => setShowForm(false)} className="px-4 py-2 bg-gray-200 rounded text-sm">Cancel</button>
           </div>
@@ -2331,7 +2462,7 @@ function BatchTab({ projectId, project, runs }: { projectId: number; project: Pr
                     Model: <span className="font-mono">{b.model_name.split('.').pop()}@{b.model_alias}</span>
                     {lastOk?.model_version && <span> (last run used v{lastOk.model_version})</span>}
                   </div>
-                  <div className="text-gray-500">Input: <span className="font-mono">{b.input_table || 'SQL query'}</span>
+                  <div className="text-gray-500">Input: <span className="font-mono">{b.input_table || (b.input_sql?.match(/\bFROM\s+([\w`.]+)/i)?.[1]?.replace(/`/g, '') ?? 'SQL query')}</span>
                     <span className="text-gray-400"> · {b.ts_col} = run time</span></div>
                   <div className="text-gray-500">Output: <span className="font-mono">{b.output_table}</span></div>
                   <div className="text-gray-500">
