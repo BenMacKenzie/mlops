@@ -268,7 +268,8 @@ function EOLForm({ projectId, initial, onSaved, onCancel }: {
     : !form.label_column ? 'a label column' : !form.timestamp_column ? 'a timestamp column' : entityList.length === 0 ? 'at least one entity column' : '';
 
   const submit = async () => {
-    await api.createEOL(projectId, { ...form, entity_columns: entityList } as any);
+    try { await api.createEOL(projectId, { ...form, entity_columns: entityList } as any); }
+    catch (e: any) { setDetectError(e.message); return; }
     onSaved();
   };
 

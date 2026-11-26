@@ -418,7 +418,7 @@ appkit.server.extend((app) => {
   // EOL column detection — the columns an EOL query produces, plus a suggested label, timestamp and
   // entity columns. Everything else in an EOL is a request field (sent by the caller at scoring time).
   //   timestamp: the only TIMESTAMP/DATE column (or the one named *_ts/*_time/*timestamp/*_at)
-  //   label:     the only column named label/target/y/is_*
+  //   label:     a column named label/target/y/is_* (the last one, if several)
   //   entity:    *_id / id columns, or a column that names a table in a source schema
   //              (sender_domain ↔ sender_domain_features, customer_id ↔ customer_features)
   app.post('/api/sql/columns', async (req, res) => {
@@ -435,7 +435,8 @@ appkit.server.extend((app) => {
       const timestamp_column = tsCands.length === 1 ? tsCands[0].name : tsNamed.length === 1 ? tsNamed[0].name : '';
 
       const labelCands = columns.filter(c => c.name !== timestamp_column && /^(label|target|y|is_.+)$/i.test(c.name));
-      const label_column = labelCands.length === 1 ? labelCands[0].name : '';
+      // Several candidates (e.g. is_vip, is_fraud) → the last one selected; labels conventionally come last.
+      const label_column = labelCands.length ? labelCands[labelCands.length - 1].name : '';
 
       // Table names in the schemas the query reads from (FQN references only).
       const schemas = new Set<string>();
@@ -466,6 +467,20 @@ appkit.server.extend((app) => {
   // ════════════════════════════════════════════
   //  ENTITY OBSERVATION LABELS (EOLs)
   // ════════════════════════════════════════════
+
+  // An EOL needs a label, a timestamp and at least one entity column, all produced by its SQL.
+  async function validateEol(req: any, b: any): Promise<string | null> {
+    const ents = Array.isArray(b.entity_columns) ? b.entity_columns.filter(Boolean) : [];
+    if (!String(b.name || '').trim()) return 'name is required';
+    if (!String(b.sql_definition || '').trim()) return 'sql_definition is required';
+    if (!String(b.label_column || '').trim()) return 'An EOL needs a label column';
+    if (!String(b.timestamp_column || '').trim()) return 'An EOL needs a timestamp column';
+    if (ents.length === 0) return 'An EOL needs at least one entity column';
+    const cols = await describeColumns(req, `SELECT * FROM (${String(b.sql_definition).trim().replace(/;$/, '')}) AS _eol`);
+    const absent = [b.label_column, b.timestamp_column, ...ents].filter((c: string) => !cols.includes(c));
+    if (absent.length) return `Not in the EOL SQL output: ${absent.join(', ')}`;
+    return null;
+  }
   app.get('/api/projects/:projectId/eols', async (req, res) => {
     try {
       const result = await db.query(
@@ -480,6 +495,8 @@ appkit.server.extend((app) => {
 
   app.post('/api/projects/:projectId/eols', async (req, res) => {
     try {
+      const invalid = await validateEol(req, req.body);
+      if (invalid) { res.status(400).json({ error: invalid }); return; }
       const { name, sql_definition, label_column, entity_columns, timestamp_column } = req.body;
       const result = await db.query(
         `INSERT INTO app.entity_observation_label (project_id, name, sql_definition, label_column, entity_columns, timestamp_column)
@@ -494,6 +511,8 @@ appkit.server.extend((app) => {
 
   app.put('/api/eols/:id', async (req, res) => {
     try {
+      const invalid = await validateEol(req, req.body);
+      if (invalid) { res.status(400).json({ error: invalid }); return; }
       const { name, sql_definition, label_column, entity_columns, timestamp_column } = req.body;
       const result = await db.query(
         `UPDATE app.entity_observation_label SET name=$1, sql_definition=$2, label_column=$3, entity_columns=$4, timestamp_column=$5
