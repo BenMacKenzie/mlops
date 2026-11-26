@@ -175,6 +175,12 @@ async function uploadNotebook(req: any, localPath: string, workspacePath: string
 }
 
 // Helper: execute SQL statement on the warehouse and return rows
+// UC registered-model names can't contain spaces, periods, slashes or control characters, and UC lowercases
+// them anyway: "Email Phishing Detector" → "email_phishing_detector".
+function ucModelName(name: string): string {
+  return String(name || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
 async function executeSql(req: any, sql: string): Promise<any[]> {
   const host = process.env.DATABRICKS_HOST || '';
   const token = await getToken(req);
@@ -237,7 +243,7 @@ appkit.server.extend((app) => {
       const result = await db.query(
         `INSERT INTO app.project (name, description, catalog, schema, model_name, git_url, notebook_path, training_notebook, evaluation_notebook)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [name, description, catalog, schema, model_name || name, git_url || '', notebook_path || '', training_notebook || '', evaluation_notebook || '']
+        [name, description, catalog, schema, ucModelName(model_name || name), git_url || '', notebook_path || '', training_notebook || '', evaluation_notebook || '']
       );
       res.status(201).json(result.rows[0]);
     } catch (e: any) {
@@ -251,7 +257,7 @@ appkit.server.extend((app) => {
       const result = await db.query(
         `UPDATE app.project SET name=$1, description=$2, catalog=$3, schema=$4, model_name=$5, git_url=$6, notebook_path=$7, training_notebook=$8, evaluation_notebook=$9
          WHERE id=$10 RETURNING *`,
-        [name, description, catalog, schema, model_name || name, git_url || '', notebook_path || '', training_notebook || '', evaluation_notebook || '', req.params.id]
+        [name, description, catalog, schema, ucModelName(model_name || name), git_url || '', notebook_path || '', training_notebook || '', evaluation_notebook || '', req.params.id]
       );
       if (result.rows.length === 0) { res.status(404).json({ error: 'Not found' }); return; }
       res.json(result.rows[0]);
@@ -1143,7 +1149,7 @@ appkit.server.extend((app) => {
       if (!run.mlflow_run_id) { res.status(400).json({ error: 'Run has no MLflow run ID' }); return; }
 
       const project = (await db.query('SELECT * FROM app.project WHERE id = $1', [run.project_id])).rows[0];
-      const modelName = project.model_name || project.name;
+      const modelName = ucModelName(project.model_name || project.name);
       const fullModelName = `${project.catalog}.${project.schema}.${modelName}`;
 
       // Upload the register_model notebook to the workspace
@@ -1200,7 +1206,11 @@ appkit.server.extend((app) => {
           res.json(updated.rows[0]);
           return;
         } else if (['TERMINATED', 'INTERNAL_ERROR', 'SKIPPED'].includes(lifeCycleState)) {
-          const errMsg = jobRun.state?.state_message || resultState || 'Unknown error';
+          let errMsg = jobRun.state?.state_message || resultState || 'Unknown error';
+          try {  // the job state only says "Workload failed" — surface the notebook's actual error
+            const out = await databricksApi(req, 'GET', `jobs/runs/get-output?run_id=${jobRun.tasks?.[0]?.run_id || jobRunId}`);
+            if (out?.error) errMsg = String(out.error).slice(0, 1000);
+          } catch { /* keep the state message */ }
           // Clear partial model info
           await db.query(
             `UPDATE app.run SET model_name=NULL, model_uri=NULL WHERE id=$1`,

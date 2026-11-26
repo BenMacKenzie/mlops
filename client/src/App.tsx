@@ -85,7 +85,7 @@ function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
             <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">description</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
             <div><label className="block text-sm font-medium text-gray-700 mb-1">catalog</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.catalog} onChange={(e) => setForm({ ...form, catalog: e.target.value })} placeholder="catalog name" /></div>
             <div><label className="block text-sm font-medium text-gray-700 mb-1">schema</label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.schema} onChange={(e) => setForm({ ...form, schema: e.target.value })} /></div>
-            <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">model name <span className="text-xs text-gray-400">(for UC model registry — defaults to project name)</span></label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.model_name} onChange={(e) => setForm({ ...form, model_name: e.target.value })} placeholder={form.name || 'project name'} /></div>
+            <div className="col-span-2"><label className="block text-sm font-medium text-gray-700 mb-1">model name <span className="text-xs text-gray-400">(for UC model registry — defaults to project name)</span></label><input className="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={form.model_name} onChange={(e) => setForm({ ...form, model_name: e.target.value })} placeholder={(form.name || 'project name').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')} /></div>
           </div>
           <div className="mt-3 flex gap-2">
             <button onClick={submit} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">Create</button>
@@ -193,7 +193,7 @@ function OverviewTab({ project, eols, trainingSpecs, specRuns }: {
         <dl className="space-y-2 text-sm">
           <div><dt className="text-gray-500">Catalog</dt><dd className="font-mono">{project.catalog}</dd></div>
           <div><dt className="text-gray-500">Schema</dt><dd className="font-mono">{project.schema}</dd></div>
-          <div><dt className="text-gray-500">Model Name</dt><dd className="font-mono">{project.model_name || project.name}</dd></div>
+          <div><dt className="text-gray-500">Model Name</dt><dd className="font-mono">{(project.model_name || project.name).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')}</dd></div>
         </dl>
       </div>
       <div className="bg-white p-4 rounded-lg shadow">
@@ -1318,7 +1318,12 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
       if (blockers.length) { alert(`Can't delete run ${runId}:\n\n• ${blockers.join('\n• ')}`); return; }
       if (!confirm(`Delete run ${runId} and all of its assets?\n\n${describeAssets(assets, kept)}\n\nThis can't be undone (MLflow runs are soft-deleted for 30 days).`)) return;
       await api.deleteRun(runId);
-    } catch (e: any) { alert(`Delete failed: ${e.message}`); }
+    } catch (e: any) {
+      // A proxy error (e.g. 502 during a session refresh) can come back while the server is still deleting —
+      // give it a moment, then reload so the list reflects what actually happened.
+      alert(`Delete may not have completed: ${e.message}\n\nThe list will refresh in a few seconds.`);
+      setTimeout(() => { reload(); }, 4000);
+    }
     finally { setDeletingRunId(null); await reload(); }
   };
 
