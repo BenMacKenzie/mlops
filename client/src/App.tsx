@@ -136,7 +136,7 @@ function ProjectsList({ navigate }: { navigate: (p: Page) => void }) {
 function ProjectDetail({ projectId, tab, navigate }: { projectId: number; tab: string; navigate: (p: Page) => void }) {
   const [project, setProject] = useState<Project | null>(null);
   const [eols, setEols] = useState<EOL[]>([]);
-  const [trainingSpecs, setTrainingSpecs] = useState<(TrainingSpec & { run_count: number })[]>([]);
+  const [trainingSpecs, setTrainingSpecs] = useState<(TrainingSpec & { run_count: number; locked?: boolean })[]>([]);
   const [specRuns, setSpecRuns] = useState<Run[]>([]);
 
   const load = useCallback(async () => {
@@ -219,6 +219,38 @@ function EOLForm({ projectId, initial, onSaved, onCancel }: {
   const [preview, setPreview] = useState<{ rows: any[]; count: number } | null>(null);
   const [previewError, setPreviewError] = useState('');
   const [previewing, setPreviewing] = useState(false);
+  // Columns the SQL produces; null until detected. The SQL comes first — label, timestamp and entity
+  // columns are picked from its output (auto-suggested), and every other column is a request field.
+  const [cols, setCols] = useState<{ name: string; type: string }[] | null>(null);
+  const [detectedSql, setDetectedSql] = useState('');
+  const [detecting, setDetecting] = useState(false);
+  const [detectError, setDetectError] = useState('');
+
+  const entityList = form.entity_columns.split(',').map((s) => s.trim()).filter(Boolean);
+
+  const detect = async (sql: string, applySuggestions: boolean) => {
+    if (!sql.trim()) return;
+    setDetecting(true); setDetectError('');
+    try {
+      const r = await api.detectEolColumns(sql);
+      setCols(r.columns); setDetectedSql(sql);
+      const names = new Set(r.columns.map((c) => c.name));
+      setForm((f) => {
+        const keep = (v: string) => (v && names.has(v) ? v : '');
+        const keptEntities = f.entity_columns.split(',').map((s) => s.trim()).filter((c) => names.has(c));
+        return applySuggestions ? {
+          ...f,
+          label_column: r.suggested.label_column || keep(f.label_column),
+          timestamp_column: r.suggested.timestamp_column || keep(f.timestamp_column),
+          entity_columns: (r.suggested.entity_columns.length ? r.suggested.entity_columns : keptEntities).join(', '),
+        } : { ...f, label_column: keep(f.label_column), timestamp_column: keep(f.timestamp_column), entity_columns: keptEntities.join(', ') };
+      });
+    } catch (e: any) { setDetectError(e.message); setCols(null); }
+    setDetecting(false);
+  };
+
+  // Copying an EOL: load its columns but keep its choices.
+  useEffect(() => { if (initial?.sql_definition) detect(initial.sql_definition, false); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const runPreview = async (sql: string) => {
     setPreviewing(true); setPreviewError(''); setPreview(null);
@@ -226,28 +258,76 @@ function EOLForm({ projectId, initial, onSaved, onCancel }: {
     setPreviewing(false);
   };
 
+  const stale = cols !== null && detectedSql !== form.sql_definition;
+  const toggleEntity = (c: string) => setForm((f) => {
+    const cur = f.entity_columns.split(',').map((s) => s.trim()).filter(Boolean);
+    return { ...f, entity_columns: (cur.includes(c) ? cur.filter((x) => x !== c) : [...cur, c]).join(', ') };
+  });
+  const requestFields = (cols || []).filter((c) => c.name !== form.label_column && c.name !== form.timestamp_column && !entityList.includes(c.name));
+  const missing = !form.name.trim() ? 'a name' : !cols || stale ? 'detected columns (click Detect columns)'
+    : !form.label_column ? 'a label column' : !form.timestamp_column ? 'a timestamp column' : entityList.length === 0 ? 'at least one entity column' : '';
+
   const submit = async () => {
-    await api.createEOL(projectId, {
-      ...form,
-      entity_columns: form.entity_columns.split(',').map((s) => s.trim()).filter(Boolean),
-    } as any);
+    await api.createEOL(projectId, { ...form, entity_columns: entityList } as any);
     onSaved();
   };
+
+  const colLabel = (c: { name: string; type: string }) => `${c.name} (${c.type})`;
 
   return (
     <div className="mb-4 p-4 border rounded-lg bg-white shadow">
       <div className="grid grid-cols-2 gap-3">
-        <div><label className="block text-sm font-medium mb-1">Name</label><input className="w-full px-3 py-2 border rounded" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-        <div><label className="block text-sm font-medium mb-1">Label Column</label><input className="w-full px-3 py-2 border rounded" value={form.label_column} onChange={(e) => setForm({ ...form, label_column: e.target.value })} /></div>
-        <div><label className="block text-sm font-medium mb-1">Entity Columns (comma-separated)</label><input className="w-full px-3 py-2 border rounded" value={form.entity_columns} onChange={(e) => setForm({ ...form, entity_columns: e.target.value })} /></div>
-        <div><label className="block text-sm font-medium mb-1">Timestamp Column</label><input className="w-full px-3 py-2 border rounded" value={form.timestamp_column} onChange={(e) => setForm({ ...form, timestamp_column: e.target.value })} /></div>
+        <div className="col-span-2"><label className="block text-sm font-medium mb-1">Name</label><input className="w-full px-3 py-2 border rounded" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
         <div className="col-span-2">
           <label className="block text-sm font-medium mb-1">SQL Definition</label>
-          <textarea className="w-full px-3 py-2 border rounded font-mono text-sm h-32" value={form.sql_definition} onChange={(e) => setForm({ ...form, sql_definition: e.target.value })} />
-          <button onClick={() => runPreview(form.sql_definition)} disabled={previewing || !form.sql_definition}
-            className="mt-1 px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 disabled:bg-gray-300"
-          >{previewing ? 'Running...' : 'Preview SQL'}</button>
+          <textarea className="w-full px-3 py-2 border rounded font-mono text-sm h-32" value={form.sql_definition}
+            onChange={(e) => setForm({ ...form, sql_definition: e.target.value })}
+            onBlur={() => { if (form.sql_definition.trim() && form.sql_definition !== detectedSql) detect(form.sql_definition, true); }}
+            placeholder="SELECT entity keys, observation timestamp, label, and any request fields FROM ..." />
+          <div className="mt-1 flex gap-2">
+            <button onClick={() => detect(form.sql_definition, true)} disabled={detecting || !form.sql_definition.trim()}
+              className="px-3 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:bg-gray-300"
+            >{detecting ? 'Detecting...' : 'Detect columns'}</button>
+            <button onClick={() => runPreview(form.sql_definition)} disabled={previewing || !form.sql_definition}
+              className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 disabled:bg-gray-300"
+            >{previewing ? 'Running...' : 'Preview SQL'}</button>
+            {stale && <span className="text-xs text-amber-600 self-center">SQL changed — detect columns again</span>}
+          </div>
         </div>
+        {detectError && <div className="col-span-2 text-sm text-red-500 bg-red-50 p-2 rounded">{detectError}</div>}
+        {cols && (
+          <>
+            <div>
+              <label className="block text-sm font-medium mb-1">Label Column</label>
+              <select className="w-full px-3 py-2 border rounded text-sm" value={form.label_column} onChange={(e) => setForm({ ...form, label_column: e.target.value })}>
+                <option value="">Select...</option>
+                {cols.map((c) => <option key={c.name} value={c.name}>{colLabel(c)}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Timestamp Column</label>
+              <select className="w-full px-3 py-2 border rounded text-sm" value={form.timestamp_column} onChange={(e) => setForm({ ...form, timestamp_column: e.target.value })}>
+                <option value="">Select...</option>
+                {cols.filter((c) => c.name !== form.label_column).map((c) => <option key={c.name} value={c.name}>{colLabel(c)}</option>)}
+              </select>
+            </div>
+            <div className="col-span-2">
+              <label className="block text-sm font-medium mb-1">Entity Columns <span className="text-gray-400 font-normal">(lookup / group-by keys)</span></label>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 border rounded p-2">
+                {cols.filter((c) => c.name !== form.label_column && c.name !== form.timestamp_column).map((c) => (
+                  <label key={c.name} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                    <input type="checkbox" checked={entityList.includes(c.name)} onChange={() => toggleEntity(c.name)} />
+                    <span className="font-mono text-xs">{c.name}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="col-span-2 text-xs text-gray-600 bg-gray-50 p-2 rounded">
+              <span className="font-medium">Request fields</span> (sent by the requesting system at scoring time; model features unless excluded in the training spec):{' '}
+              {requestFields.length ? <span className="font-mono">{requestFields.map((c) => c.name).join(', ')}</span> : <span className="text-gray-400">none</span>}
+            </div>
+          </>
+        )}
         {previewError && <div className="col-span-2 text-sm text-red-500 bg-red-50 p-2 rounded">{previewError}</div>}
         {preview && (
           <div className="col-span-2 max-h-48 overflow-auto border rounded">
@@ -266,8 +346,9 @@ function EOLForm({ projectId, initial, onSaved, onCancel }: {
         )}
       </div>
       <div className="mt-3 flex gap-2">
-        <button onClick={submit} className="px-4 py-2 bg-green-600 text-white rounded text-sm">Save</button>
+        <button onClick={submit} disabled={!!missing} className="px-4 py-2 bg-green-600 text-white rounded text-sm disabled:bg-gray-300">Save</button>
         <button onClick={onCancel} className="px-4 py-2 bg-gray-200 rounded text-sm">Cancel</button>
+        {missing && <span className="text-xs text-gray-500 self-center">Needs {missing}</span>}
       </div>
     </div>
   );
@@ -353,7 +434,7 @@ function EOLsTab({ projectId, eols, reload }: { projectId: number; eols: EOL[]; 
 
 // ── Feature Summary — global include/exclude across all entries ──
 function FeatureSummary({ spec, onChanged, locked }: {
-  spec: TrainingSpec & { run_count: number };
+  spec: TrainingSpec & { run_count: number; locked?: boolean };
   onChanged: () => void;
   locked: boolean;
 }) {
@@ -828,10 +909,11 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
       }
       if (form.selectedLookupKeys.length === 0) { alert('Select at least one entity (group-by) key'); return; }
       if (!form.timestamp_lookup_key) { alert('Select a timestamp column — aggregations require a timeseries column'); return; }
+      if (form.declarative_window_type === 'sliding' && !form.declarative_slide_duration.trim()) { alert('Enter a slide duration for the sliding window (e.g. 1d)'); return; }
       const safeName = form.declarative_name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
       if (!safeName) { alert('Enter a feature name'); return; }
       const windowSpec: Record<string, any> = { type: form.declarative_window_type, window_duration: form.declarative_window_duration };
-      if (form.declarative_window_type === 'sliding' && form.declarative_slide_duration) windowSpec.slide_duration = form.declarative_slide_duration;
+      if (form.declarative_window_type === 'sliding') windowSpec.slide_duration = form.declarative_slide_duration.trim();
       onSave({
         feature_type: 'declarative',
         table_name: `${fullName}.${form.table}`,
@@ -1079,7 +1161,7 @@ function FeatureEntryEditor({ mode, featureType, entry, eolId, eols, allEntries,
 //  TRAINING SPEC TAB
 // ════════════════════════════════════════════
 function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
-  projectId: number; eols: EOL[]; specs: (TrainingSpec & { run_count: number })[]; runs: Run[]; reload: () => void;
+  projectId: number; eols: EOL[]; specs: (TrainingSpec & { run_count: number; locked?: boolean })[]; runs: Run[]; reload: () => void;
 }) {
   const [showForm, setShowForm] = useState(false);
   const [copyingFromId, setCopyingFromId] = useState<number | null>(null);
@@ -1167,7 +1249,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
     reload();
   };
 
-  const startCopy = (spec: TrainingSpec & { run_count: number }) => {
+  const startCopy = (spec: TrainingSpec & { run_count: number; locked?: boolean }) => {
     setCopyingFromId(spec.id);
     setForm({
       name: `${spec.name} (copy)`,
@@ -1334,7 +1416,7 @@ function TrainingSpecTab({ projectId, eols, specs, runs, reload }: {
         {specs.map(spec => {
           const eol = eols.find(e => e.id === spec.eol_id);
           const isExpanded = expandedId === spec.id;
-          const isLocked = spec.run_count > 0;
+          const isLocked = spec.locked ?? spec.run_count > 0;
           const specRuns = runs.filter(r => r.training_spec_id === spec.id);
 
           return (

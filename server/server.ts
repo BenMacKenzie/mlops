@@ -364,7 +364,11 @@ appkit.server.extend((app) => {
       const table = req.query.table as string;
       if (!catalog || !schema || !table) { res.status(400).json({ error: 'catalog, schema, and table required' }); return; }
       const rows = await executeSql(req, `DESCRIBE TABLE ${catalog}.${schema}.${table}`);
-      res.json(rows.map((r: any) => ({ name: r.col_name, type: r.data_type })));
+      // DESCRIBE TABLE appends metadata sections ("# Clustering Information", "# Partition Information",
+      // "# col_name") after a blank row, repeating the clustering/partition columns — keep only the leading
+      // block of real columns.
+      const end = rows.findIndex((r: any) => !r.col_name || String(r.col_name).startsWith('#'));
+      res.json((end === -1 ? rows : rows.slice(0, end)).map((r: any) => ({ name: r.col_name, type: r.data_type })));
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -406,6 +410,54 @@ appkit.server.extend((app) => {
       const safeSql = sql.trim().replace(/;$/, '');
       const rows = await executeSql(req, `${safeSql} LIMIT 100`);
       res.json({ rows, count: rows.length });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // EOL column detection — the columns an EOL query produces, plus a suggested label, timestamp and
+  // entity columns. Everything else in an EOL is a request field (sent by the caller at scoring time).
+  //   timestamp: the only TIMESTAMP/DATE column (or the one named *_ts/*_time/*timestamp/*_at)
+  //   label:     the only column named label/target/y/is_*
+  //   entity:    *_id / id columns, or a column that names a table in a source schema
+  //              (sender_domain ↔ sender_domain_features, customer_id ↔ customer_features)
+  app.post('/api/sql/columns', async (req, res) => {
+    try {
+      const sql = String(req.body.sql || '').trim().replace(/;$/, '');
+      if (!sql) { res.status(400).json({ error: 'sql required' }); return; }
+      const described = await executeSql(req, `DESCRIBE QUERY SELECT * FROM (${sql}) AS _eol`);
+      const columns: { name: string; type: string }[] = described
+        .filter((r: any) => r.col_name && !String(r.col_name).startsWith('#'))
+        .map((r: any) => ({ name: r.col_name, type: String(r.data_type || '').toLowerCase() }));
+
+      const tsCands = columns.filter(c => /^(timestamp|timestamp_ntz|date)$/.test(c.type));
+      const tsNamed = tsCands.filter(c => /(_ts|_time|timestamp|_at|_date)$/i.test(c.name));
+      const timestamp_column = tsCands.length === 1 ? tsCands[0].name : tsNamed.length === 1 ? tsNamed[0].name : '';
+
+      const labelCands = columns.filter(c => c.name !== timestamp_column && /^(label|target|y|is_.+)$/i.test(c.name));
+      const label_column = labelCands.length === 1 ? labelCands[0].name : '';
+
+      // Table names in the schemas the query reads from (FQN references only).
+      const schemas = new Set<string>();
+      for (const m of sql.replace(/`/g, '').matchAll(/\b(\w+)\.(\w+)\.(\w+)\b/g)) schemas.add(`${m[1]}.${m[2]}`);
+      const tableNames: string[] = [];
+      for (const s of schemas) {
+        const [cat, sch] = s.split('.');
+        try {
+          const rows = await executeSql(req, `SELECT table_name FROM ${cat}.information_schema.tables WHERE table_schema = '${sch}'`);
+          tableNames.push(...rows.map((r: any) => String(r.table_name).toLowerCase()));
+        } catch { /* no access to information_schema — fall back to the name rule */ }
+      }
+      const namesTable = (col: string) => {
+        const c = col.toLowerCase(), stem = c.replace(/_id$/, '');
+        return tableNames.some(t => t.startsWith(`${c}_`) || (stem !== c && t.startsWith(`${stem}_`)));
+      };
+      const entity_columns = columns
+        .filter(c => c.name !== timestamp_column && c.name !== label_column)
+        .filter(c => /(^id$|_id$)/i.test(c.name) || namesTable(c.name))
+        .map(c => c.name);
+
+      res.json({ columns, suggested: { label_column, timestamp_column, entity_columns } });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -500,7 +552,7 @@ appkit.server.extend((app) => {
           'SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1',
           [spec.id]
         );
-        specs.push({ ...spec, entries: entries.rows, run_count: parseInt(runCount.rows[0].count) });
+        specs.push({ ...spec, entries: entries.rows, run_count: parseInt(runCount.rows[0].count), locked: await specLocked(spec.id) });
       }
       res.json(specs);
     } catch (e: any) {
@@ -526,12 +578,18 @@ appkit.server.extend((app) => {
     }
   });
 
+  // A spec is locked once a run has succeeded (its model/tables must stay traceable to it) or while one is
+  // in flight (the run would otherwise succeed against a spec that has since changed). Failed runs don't lock.
+  async function specLocked(specId: number | string): Promise<boolean> {
+    const r = await db.query(`SELECT 1 FROM app.run WHERE training_spec_id = $1 AND status <> 'FAILED' LIMIT 1`, [specId]);
+    return r.rows.length > 0;
+  }
+
   app.put('/api/training-specs/:id', async (req, res) => {
     try {
-      // Lock check: reject edits if spec has runs
-      const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [req.params.id]);
-      if (parseInt(runCount.rows[0].count) > 0) {
-        res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
+      // Lock check: reject edits once a run succeeded / is in flight
+      if (await specLocked(req.params.id)) {
+        res.status(400).json({ error: 'Training spec is locked — it has a successful or in-progress run. Copy it to make changes.' }); return;
       }
       const jsonCols = new Set(['split_config', 'parameters']);
       const allowed = ['eol_id', 'name', 'task_type', 'split_strategy', 'split_method', 'split_config', 'parameters', 'excluded_features'];
@@ -607,9 +665,8 @@ appkit.server.extend((app) => {
   app.post('/api/training-specs/:specId/entries', async (req, res) => {
     try {
       // Lock check
-      const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [req.params.specId]);
-      if (parseInt(runCount.rows[0].count) > 0) {
-        res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
+      if (await specLocked(req.params.specId)) {
+        res.status(400).json({ error: 'Training spec is locked — it has a successful or in-progress run. Copy it to make changes.' }); return;
       }
       const {
         feature_type, table_name, feature_names, lookup_key,
@@ -638,9 +695,8 @@ appkit.server.extend((app) => {
       const entry = await db.query('SELECT training_spec_id FROM app.feature_entry WHERE id = $1', [req.params.id]);
       if (entry.rows.length === 0) { res.status(404).json({ error: 'Entry not found' }); return; }
       if (entry.rows[0].training_spec_id) {
-        const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [entry.rows[0].training_spec_id]);
-        if (parseInt(runCount.rows[0].count) > 0) {
-          res.status(400).json({ error: 'Training spec is locked — it has runs. Copy it to make changes.' }); return;
+        if (await specLocked(entry.rows[0].training_spec_id)) {
+          res.status(400).json({ error: 'Training spec is locked — it has a successful or in-progress run. Copy it to make changes.' }); return;
         }
       }
       const {
@@ -671,9 +727,8 @@ appkit.server.extend((app) => {
       // Check lock via the entry's parent spec
       const entry = await db.query('SELECT training_spec_id FROM app.feature_entry WHERE id = $1', [req.params.id]);
       if (entry.rows.length > 0 && entry.rows[0].training_spec_id) {
-        const runCount = await db.query('SELECT COUNT(*) as count FROM app.run WHERE training_spec_id = $1', [entry.rows[0].training_spec_id]);
-        if (parseInt(runCount.rows[0].count) > 0) {
-          res.status(400).json({ error: 'Training spec is locked — it has runs.' }); return;
+        if (await specLocked(entry.rows[0].training_spec_id)) {
+          res.status(400).json({ error: 'Training spec is locked — it has a successful or in-progress run. Copy it to make changes.' }); return;
         }
       }
       await db.query('DELETE FROM app.feature_entry WHERE id = $1', [req.params.id]);

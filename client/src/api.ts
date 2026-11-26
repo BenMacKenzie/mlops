@@ -32,12 +32,18 @@ export const getFunctions = (catalog: string, schema: string) =>
   request<string[]>(`/api/uc/functions?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`);
 export const getFunctionParams = (catalog: string, schema: string, functionName: string) =>
   request<{ name: string; type: string }[]>(`/api/uc/function-params?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&function=${encodeURIComponent(functionName)}`);
+export type EolColumns = {
+  columns: { name: string; type: string }[];
+  suggested: { label_column: string; timestamp_column: string; entity_columns: string[] };
+};
+export const detectEolColumns = (sql: string) =>
+  request<EolColumns>('/api/sql/columns', { method: 'POST', body: JSON.stringify({ sql }) });
 export const previewSql = (sql: string) =>
   request<{ rows: any[]; count: number }>('/api/sql/preview', { method: 'POST', body: JSON.stringify({ sql }) });
 
 // ── Training Specs ──
 export const getTrainingSpecs = (projectId: number) =>
-  request<(TrainingSpec & { run_count: number })[]>(`/api/projects/${projectId}/training-specs`);
+  request<(TrainingSpec & { run_count: number; locked?: boolean })[]>(`/api/projects/${projectId}/training-specs`);
 export const createTrainingSpec = (projectId: number, data: Partial<TrainingSpec>) =>
   request<TrainingSpec>(`/api/projects/${projectId}/training-specs`, { method: 'POST', body: JSON.stringify(data) });
 export const updateTrainingSpec = (id: number, data: Partial<TrainingSpec>) =>

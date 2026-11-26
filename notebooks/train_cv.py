@@ -123,6 +123,8 @@ def _window(w):
     if kind == "tumbling":
         return TumblingWindow(window_duration=dur)
     if kind == "sliding":
+        if not w.get("slide_duration"):
+            raise ValueError("Sliding window has no slide_duration — edit the feature and set a slide (e.g. 1d)")
         return SlidingWindow(window_duration=dur, slide_duration=_parse_duration(w["slide_duration"]))
     if kind == "continuous":
         return RollingWindow(window_duration=dur)
